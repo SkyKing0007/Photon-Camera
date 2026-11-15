@@ -1,0 +1,616 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932LkrSmoothWhite.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932LkrSmoothWhite.kt
+index a2a878ac6debed1b1946471959e518a3d2e77280..c4601b72a8a478e297ba63ee58b66e97ee404d6e 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932LkrSmoothWhite.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932LkrSmoothWhite.kt
+@@ -1,10 +1,15 @@
+ package com.hinnka.mycamera.processor
+ 
+-/** IRIS_26936_B_SRON_SENSOR_GUIDED_WHITE_ROLLOFF.
+- * LKR B/ON finishing only. Keep original reference Bayer clipping binary;
+- * blend to neutral for plausible near-white or independently multi-channel
+- * clipped cores, but do not erase highly saturated yellow/orange materials.
+- * Preserve all native LKR math and downstream color-space ownership.
++/** IRIS_26934_B_SRON_RAWLENS_VISUAL_WHITE_FADE.
++ * LKR-only (Experiment B, Super Res ON) finishing shader.
++ * RawLens 2.2.86 rcd_final.glsl uses a per-channel 0.70..0.99 smoothstep,
++ * whose MAX drives the fade to camera neutral. Unlike rejected 26932/26933
++ * probes, never veto a visibly clipped highlight due to its distorted color.
++ * The shared WB-safe scale maps that rule into Iris's TEMPORARY WB domain;
++ * the existing inverse-WB is fused after the single neutralization.
++ * The original binary Bayer clipping texture is independent, never modified,
++ * and may only accelerate the fade in reconstructed/near-clipped cores.
++ * No LKR, Lab, B-OFF, gainmap, tone, DNG, Night, or A-mode changes.
+  */
+ internal object GlesIris26932LkrSmoothWhite {
+     val shader = """
+@@ -45,31 +50,20 @@ internal object GlesIris26932LkrSmoothWhite {
+             vec3 preLab=max(texelFetch(uPreLabWbRgb,p,0).rgb,vec3(0.0));
+             vec3 postLab=max(original.rgb,vec3(0.0));
+ 
+-            /* IRIS_26936_B_ON_COLOR_PRESERVING_WHITE_ROLLOFF
+-             * 26934's max-of-three-channel 0.70..0.99 trigger turned yellow
+-             * leaves into white before the sensor had clipped their blue
+-             * channel. The smoothness of a scalar curve does not establish
+-             * spatially correct material boundaries. Preserve real hue when
+-             * the third channel witnesses a saturated COLOR, not white.
+-             * These samples are already in the temporary WB domain; our
+-             * shared neutral and the existing inverse WB remain paired. */
++            // RawLens's actual finishing rule: ANY channel approaching the
++            // white ceiling can start the 0.70..0.99 fade. A pink/magenta
++            // clipped highlight has no trustworthy chromaticity: do not
++            // multiply by minimum-channel, neutral-ratio, or third-channel
++            // tests, which kept those very pixels pink in 26932/26933.
+             vec3 gains=max(uAmazeWb,vec3(0.0001));
+             float sharedWhite=max(min(gains.r,min(gains.g,gains.b)),0.0001);
+             vec3 visualRgb=max(preLab,postLab)/sharedWhite;
+-            float peak=max(visualRgb.r,max(visualRgb.g,visualRgb.b));
+-            float second=max(min(visualRgb.r,visualRgb.g),
+-                min(max(visualRgb.r,visualRgb.g),visualRgb.b));
+-            float third=min(visualRgb.r,min(visualRgb.g,visualRgb.b));
+-            float balanced=smoothstep(0.42,0.72,third/max(peak,0.0001));
+-            float visibleShoulder=smoothstep(0.72,1.02,second) *
+-                smoothstep(0.74,1.08,peak) * balanced;
++            vec3 whiteCurve=smoothstep(vec3(0.70),vec3(0.99),visualRgb);
++            float visualFade=max(whiteCurve.r,max(whiteCurve.g,whiteCurve.b));
+ 
+-            /* Native LKR selected-reference clipping remains the original
+-             * BINARY R16F mask. Sample ORIGINAL physical CFA sites (not
+-             * pseudo-CFA at 50 MP), interpolate only clipping confidence,
+-             * and require independent chromatic support before neutralizing.
+-             * Fully clipped R/G/B physically has no usable color: it may
+-             * fade to white even when the solved RGB is falsely magenta. */
++            // Native selected-reference hard-clip evidence also protects
++            // LKR cores whose solved radiance fell below the visual ceiling.
++            // It never GATES the smooth shoulder and never changes the mask.
+             ivec2 sensorP=clamp(p/2,ivec2(0),uSize/2-ivec2(1));
+             float coverage=(4.0*clipAt(sensorP)+
+                 clipAt(sensorP+ivec2(-1,0))+clipAt(sensorP+ivec2(1,0))+
+@@ -80,20 +74,19 @@ internal object GlesIris26932LkrSmoothWhite {
+             vec3 phaseSupport=mix(
+                 mix(phaseColorClipAt(cell),phaseColorClipAt(cell+ivec2(1,0)),t.x),
+                 mix(phaseColorClipAt(cell+ivec2(0,1)),phaseColorClipAt(cell+ivec2(1,1)),t.x),t.y);
+-            float allColors=min(phaseSupport.r,min(phaseSupport.g,phaseSupport.b));
+-            float greenAndColor=min(phaseSupport.g,max(phaseSupport.r,phaseSupport.b));
+-            float physicalWhite=max(smoothstep(0.12,0.70,allColors),
+-                0.65*balanced*smoothstep(0.20,0.82,greenAndColor));
+-            float sensorFade=smoothstep(0.12,0.82,coverage)*physicalWhite*
+-                smoothstep(0.60,0.94,peak);
+-            float fade=clamp(max(visibleShoulder,sensorFade),0.0,1.0);
++            float physicalEvidence=max(phaseSupport.r,max(phaseSupport.g,phaseSupport.b));
++            float peak=max(visualRgb.r,max(visualRgb.g,visualRgb.b));
++            float clipFade=smoothstep(0.08,0.26,min(coverage,max(physicalEvidence,coverage))) *
++                smoothstep(0.55,0.78,peak);
++            float fade=clamp(max(visualFade,clipFade),0.0,1.0);
+ 
+-            /* Never darken original luminance at the color/white boundary.
+-             * Remove the forced constant sharedWhite plateau of 26934:
+-             * only blend channels toward the local observed bright channel. */
+-            float localPeak=max(max(preLab.r,max(preLab.g,preLab.b)),
++            // Use one achromatic value in temporary WB RGB, then invert WB
++            // once so Iris's calibrated camera-to-display transform retains
++            // its white point. Never repaint individual channels separately.
++            float peakWb=max(max(preLab.r,max(preLab.g,preLab.b)),
+                 max(postLab.r,max(postLab.g,postLab.b)));
+-            vec3 corrected=mix(original.rgb,vec3(localPeak),fade);
++            float whiteTarget=max(peakWb,sharedWhite);
++            vec3 corrected=mix(original.rgb,vec3(whiteTarget),fade);
+             oRgb=vec4(corrected*uInverseAmazeWb,original.a);
+         }
+     """.trimIndent()
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index f11b994e28c6585b4f32cb10fea14ab19dc88de7..49b6f47f942721a3091afb615965f335ce18baf2 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -12446,26 +12446,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+         try {
+         processExecutor.execute(() -> {
+-            /* IRIS_26936_B_ON_CPU_QOS: keep CPU work submitting native
+-             * Vulkan tiles below the camera preview/UI priority while LKR
+-             * runs. This does not change T, steps, workers, tile geometry,
+-             * noise fits, or any serialized output pixels. It is a CPU
+-             * scheduling hint; it cannot itself preempt queued Vulkan work. */
+-            final int iris26936Tid = android.os.Process.myTid();
+-            int iris26936OriginalNice = 0;
+-            boolean iris26936PriorityChanged = false;
+-            if (iris26935Relay != null) {
+-                try {
+-                    iris26936OriginalNice = android.os.Process.getThreadPriority(iris26936Tid);
+-                    android.os.Process.setThreadPriority(iris26936Tid,
+-                            android.os.Process.THREAD_PRIORITY_DEFAULT + 4);
+-                    iris26936PriorityChanged = true;
+-                    Log.i(TAG, "IRIS_26936_B_ON_CPU_QOS originalNice="
+-                            + iris26936OriginalNice + " requestedNice=4 nativeWorkUnchanged=true");
+-                } catch (RuntimeException priorityError) {
+-                    Log.w(TAG, "IRIS_26936_B_ON_CPU_QOS_UNAVAILABLE", priorityError);
+-                }
+-            }
+             try {
+                 mBackgroundHandler.post(this::unlockFocus);
+                 MotionMetrics.begin(
+@@ -12486,14 +12466,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 if (iris26935Relay != null) iris26935Relay.onProcessingError(message);
+                 else cameraEventsListener.onProcessingError(message);
+             } finally {
+-                if (iris26936PriorityChanged) {
+-                    try {
+-                        android.os.Process.setThreadPriority(iris26936Tid,
+-                                iris26936OriginalNice);
+-                    } catch (RuntimeException restoreError) {
+-                        Log.w(TAG, "IRIS_26936_B_ON_CPU_QOS_RESTORE_UNAVAILABLE", restoreError);
+-                    }
+-                }
+                 if (iris26935Relay != null) iris26935Relay.finishIfMissing();
+                 com.particlesdevs.photoncamera.util.MotionTrace.finish(
+                         iris26486ShotId,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index e9b31ba91629c67df9672fd247602930bf91d692..d19c05d0eaa7e9a215f5f1d79569c6b44ed93fbd 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1302,19 +1302,9 @@ public final class MotionV2Render extends Node {
+         IrisMotionSettings.Snapshot iris26630Tone = pipeline.motionV2ToneSettingsSnapshot;
+         final float iris26824FrozenInputSaturation = basePipeline.mParameters.motionV2Active
+                 && iris26630Tone != null ? iris26630Tone.saturation : 1.0f;
+-        /* IRIS_26936_B_OFF_SAT_102_ONLY: the B/SR-OFF user setting 1.00
+-         * now means 1.02 rather than 1.07. Preserve A, A+B, Night, LKR B/ON,
+-         * and all per-lens user slider multipliers. This path feeds SDR tone. */
+-        final boolean iris26936BOffSaturation = basePipeline.mParameters.motionV2Active
+-                && basePipeline.mParameters.iris26906ExperimentBSelected
+-                && !basePipeline.mParameters.motionV2SuperResOutputEnabled
+-                && !basePipeline.mParameters.irisNightActive
+-                && !basePipeline.mParameters.iris26903NightB;
+-        final float iris26936SaturationScale = iris26936BOffSaturation ? 1.02f
+-                : IRIS_26824_MOTION_SATURATION_SCALE;
+         float iris26630MotionSaturation = iris26824FrozenInputSaturation;
+         if (basePipeline.mParameters.motionV2Active) {
+-            iris26630MotionSaturation *= iris26936SaturationScale;
++            iris26630MotionSaturation *= IRIS_26824_MOTION_SATURATION_SCALE;
+         }
+         iris26630MotionSaturation = Math.max(0.0f, Math.min(2.0f, iris26630MotionSaturation));
+         GLTexture iris26799ClassMask = null;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java
+index f3b87d930f7ef95010eb8112e7e5320ff950ed9e..41ede0ca0c40d396b96dc8ecd5767b292912135c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java
+@@ -359,13 +359,7 @@ public final class Iris26876BGpuFinalRenderer {
+             final boolean iris26932BOn = params.iris26906ExperimentBSelected
+                     && params.motionV2SuperResOutputEnabled
+                     && !params.irisNightActive && !params.iris26903NightB;
+-            /* IRIS_26936_B_OFF_SAT_102_ONLY: native 50MP/SDR/UHDR GPU
+-             * encoder must agree with MotionV2Render's B OFF-only scale. */
+-            final boolean iris26936BOffSaturation = params.iris26906ExperimentBSelected
+-                    && !params.motionV2SuperResOutputEnabled
+-                    && !params.irisNightActive && !params.iris26903NightB;
+             final float sat=tone.saturation*(iris26932BOn ? 1.00f :
+-                iris26936BOffSaturation ? 1.02f :
+                 MotionV2Render.IRIS_26824_MOTION_SATURATION_SCALE);
+             uniform1f(program,"uSaturation",Math.max(0f,Math.min(2f,sat)));
+             uniform1i(program,"uIris26932BOnTone",iris26932BOn ? 1 : 0);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/GLPreview.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/GLPreview.java
+index 2a77976435d980927b7061e4172692705d06d3f0..a234e09dd9da5d3eb9692563502fa21321188dff 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/GLPreview.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/GLPreview.java
+@@ -10,10 +10,6 @@ import android.graphics.Matrix;
+ import android.graphics.Point;
+ import android.graphics.SurfaceTexture;
+ import android.opengl.GLSurfaceView;
+-import javax.microedition.khronos.egl.EGL10;
+-import javax.microedition.khronos.egl.EGLConfig;
+-import javax.microedition.khronos.egl.EGLContext;
+-import javax.microedition.khronos.egl.EGLDisplay;
+ import android.os.Handler;
+ import android.os.Looper;
+ import android.util.AttributeSet;
+@@ -56,53 +52,6 @@ public class GLPreview extends GLSurfaceView {
+         mRenderer = new MainRenderer(this);
+ 
+         setEGLContextClientVersion(2);
+-        /* IRIS_26936_PREVIEW_GPU_QOS: Adreno shares graphics and Vulkan
+-         * compute hardware. Prefer the well-defined EGL_IMG_context_priority
+-         * HIGH level when the driver advertises it, with an exact legacy ES2
+-         * fallback if unavailable/rejected. No EGL ownership is transferred
+-         * and no LKR native/solver binaries are modified. Context priority
+-         * is a DRIVER HINT, never a guaranteed preemption contract. */
+-        setEGLContextFactory(new GLSurfaceView.EGLContextFactory() {
+-            private final int EGL_CONTEXT_CLIENT_VERSION = 0x3098;
+-            private final int EGL_CONTEXT_PRIORITY_LEVEL_IMG = 0x3100;
+-            private final int EGL_CONTEXT_PRIORITY_HIGH_IMG = 0x3101;
+-            @Override public EGLContext createContext(EGL10 egl, EGLDisplay display,
+-                                                       EGLConfig config) {
+-                int[] ordinary = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL10.EGL_NONE};
+-                String extensions = egl.eglQueryString(display, EGL10.EGL_EXTENSIONS);
+-                boolean prioritySupported = extensions != null
+-                        && java.util.Arrays.asList(extensions.split(" "))
+-                            .contains("EGL_IMG_context_priority");
+-                if (prioritySupported) {
+-                    int[] preferred = {EGL_CONTEXT_CLIENT_VERSION, 2,
+-                            EGL_CONTEXT_PRIORITY_LEVEL_IMG, EGL_CONTEXT_PRIORITY_HIGH_IMG,
+-                            EGL10.EGL_NONE};
+-                    EGLContext preferredContext = egl.eglCreateContext(
+-                            display, config, EGL10.EGL_NO_CONTEXT, preferred);
+-                    if (preferredContext != null
+-                            && preferredContext != EGL10.EGL_NO_CONTEXT) {
+-                        Log.i("GLPreview", "IRIS_26936_EGL_PREVIEW_PRIORITY=HIGH_IMG "
+-                                + "driverHintOnly=true");
+-                        return preferredContext;
+-                    }
+-                    Log.w("GLPreview", "IRIS_26936_EGL_PRIORITY_REJECTED err="
+-                            + Integer.toHexString(egl.eglGetError()) + " legacyFallback=true");
+-                }
+-                EGLContext context = egl.eglCreateContext(
+-                        display, config, EGL10.EGL_NO_CONTEXT, ordinary);
+-                Log.i("GLPreview", "IRIS_26936_EGL_PREVIEW_PRIORITY="
+-                        + (prioritySupported ? "FALLBACK_NORMAL" : "UNSUPPORTED_NORMAL")
+-                        + " legacyContext=" + (context != null));
+-                return context;
+-            }
+-            @Override public void destroyContext(EGL10 egl, EGLDisplay display,
+-                                                  EGLContext context) {
+-                if (!egl.eglDestroyContext(display, context)) {
+-                    Log.w("GLPreview", "IRIS_26936_EGL_CONTEXT_DESTROY_FAILED err="
+-                            + Integer.toHexString(egl.eglGetError()));
+-                }
+-            }
+-        });
+         setRenderer(mRenderer);
+         // Keep redrawing the latest preview texture while the unified
+         // sensor request uses a slow Motion exposure.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+index e2f0bf87f6a03bd12fd581125178fc6576e0e47f..aed6a1abcf2ee654dcc01702e05672815015ef7b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+@@ -79,26 +79,6 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+     private long mIris26935LastFrameNs;
+     private long mIris26935LastMeasuredTimestamp;
+     private int mIris26935FrameCount;
+-    /* IRIS_26936_B_ON_NONBLOCKING_PROBE
+-     * Two GLES3 PBOs + fences live exclusively on this GLSurfaceView GL
+-     * thread. Never map a buffer until its GPU fence is signaled; never
+-     * apply a previous sensor timestamp's stripe phase to the displayed
+-     * preview frame. Under measured flicker / low-light, keep the original
+-     * synchronous EXACT-frame probe and compensation, unchanged. */
+-    private static final int IRIS_26936_PROBE_BYTES =
+-            4 * Iris26872PreviewStripe.WIDTH * Iris26872PreviewStripe.HEIGHT;
+-    private final int[] mIris26936Pbo = new int[2];
+-    private final long[] mIris26936Fence = new long[2];
+-    private final long[] mIris26936PendingTimestamp = new long[2];
+-    private int mIris26936WriteCursor;
+-    private boolean mIris26936AsyncReady;
+-    private boolean mIris26936AsyncUnsupported;
+-    private boolean mIris26936AsyncThisFrame;
+-    private int mIris26936Submitted;
+-    private int mIris26936Completed;
+-    private int mIris26936Backpressure;
+-    private long mIris26936LastCompletedTimestamp;
+-    private long mIris26936WorstSubmitNs;
+ 
+     private final GLPreview mView;
+ 
+@@ -134,7 +114,6 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+         boolean iris26872Eligible = iris26872Controller != null
+                 && iris26872Controller.iris26872BPreviewStripeEligible();
+         if (iris26872Eligible != mIris26872LastEligible) {
+-            iris26936DisposeAsyncProbe();
+             mIris26872Stripe.reset();
+             mIris26911Preview.reset();
+             mIris26872LastEligible = iris26872Eligible;
+@@ -155,40 +134,36 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+             mIris26935ProbeSkipBudget = 0;
+             mIris26935LastProbeWaitNs = 0L;
+             mIris26935LastFrameNs = 0L;
+-            iris26936DisposeAsyncProbe();
+             Log.i("MainRenderer", "IRIS_26935_PREVIEW_B_ON_LKR busy=" + iris26935Busy);
+         }
+         if (iris26872Eligible && iris26553FrameTimestamp > 0L) {
+-            /* IRIS_26936_B_ON_NONBLOCKING_PROBE: use bounded async GPU
+-             * readback ONLY during B/ON LKR while the scene is not low-light
+-             * and no stripe compensation is active. If a late async sample
+-             * detects flicker, return to exact-frame synchronous sampling
+-             * immediately; never present stale phase coefficients. */
+-            final boolean iris26936LowLight = iris26872Controller.iris26911DarkPreviewEvidence();
+-            final boolean iris26936StripeActive = mIris26872Stripe.params()[3] > 0.0f;
+-            mIris26936AsyncThisFrame = false;
+-            final boolean iris26936AllowAsync = iris26935Busy && !iris26936LowLight
+-                    && !iris26936StripeActive && !mIris26872ProbeDisabled;
+-            if (iris26936AllowAsync) {
+-                mIris26936AsyncThisFrame = iris26936ProbeAsync(iris26553FrameTimestamp);
+-            }
+-            if (!mIris26936AsyncThisFrame) {
+-                if (mIris26936AsyncReady) iris26936DisposeAsyncProbe();
++            /* Read every frame unless a real preceding readback stalled. During
++             * a slow LKR interval skip at most two probe frames, always keep
++             * exact Camera2 exposure/flicker result lookups below untouched. */
++            final boolean iris26935LowLightEvidence = iris26872Controller.iris26911DarkPreviewEvidence();
++            /* Never coalesce a frame while stripe compensation is active.
++             * Full-rate synchronized probe remains mandatory under detected flicker. */
++            final boolean iris26935StripeInactive = mIris26872Stripe.params()[3] <= 0.0f;
++            final boolean iris26935Skip = iris26935Busy && !iris26935LowLightEvidence
++                    && iris26935StripeInactive && mIris26935ProbeSkipBudget > 0;
++            if (iris26935Skip) {
++                mIris26935ProbeSkipBudget--;
++            } else {
+                 long iris26935Start = System.nanoTime();
+                 iris26872Probe(iris26553FrameTimestamp);
+                 mIris26935LastMeasuredTimestamp = iris26553FrameTimestamp;
+-                mIris26935LastProbeWaitNs = System.nanoTime() - iris26935Start;
+-                if (iris26935Busy && mIris26935LastProbeWaitNs > 12_000_000L) {
++                long iris26935Elapsed = System.nanoTime() - iris26935Start;
++                if (iris26935Busy && !iris26935LowLightEvidence && iris26935StripeInactive
++                        && !mIris26872ProbeDisabled && iris26935Elapsed > 12_000_000L) {
++                    mIris26935ProbeSkipBudget = iris26935Elapsed > 32_000_000L ? 2 : 1;
+                     mIris26935SlowReadbackEvents++;
+-                    if (mIris26935SlowReadbackEvents == 1
+-                            || mIris26935SlowReadbackEvents % 120 == 0) {
+-                        Log.i("MainRenderer", "IRIS_26936_SYNC_PROTECTED_PROBE_WAIT_NS="
+-                                + mIris26935LastProbeWaitNs + " lowLight=" + iris26936LowLight
+-                                + " stripeActive=" + iris26936StripeActive);
++                    if (mIris26935SlowReadbackEvents == 1 || mIris26935SlowReadbackEvents % 120 == 0) {
++                        Log.i("MainRenderer", "IRIS_26935_PREVIEW_PROBE_WALL_WAIT_NS="
++                                + iris26935Elapsed + " skipBound=" + mIris26935ProbeSkipBudget
++                                + " sampleTimestamp=" + iris26553FrameTimestamp);
+                     }
+                 }
+-            } else {
+-                mIris26935LastProbeWaitNs = 0L;
++                mIris26935LastProbeWaitNs = iris26935Elapsed;
+             }
+             mIris26935FrameCount++;
+             if (iris26935Busy && mIris26935FrameCount % 120 == 0) {
+@@ -216,10 +191,10 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+         /* A missed GPU probe cannot apply prior-frame stripe phase to the
+          * new frame: neutral strength, not stale anti-stripe/exposure evidence. */
+         final boolean iris26935UnmeasuredFrame = iris26935Busy
++                && mIris26935LastProbeWaitNs > 12_000_000L
++                && mIris26935ProbeSkipBudget >= 0
+                 && iris26553FrameTimestamp > 0L
+                 && iris26553FrameTimestamp != mIris26935LastMeasuredTimestamp;
+-        /* Async probes are deliberately delayed: their measured flicker
+-         * coefficients NEVER apply to another displayed sensor timestamp. */
+         GLES20.glUniform4f(mIris26872StripeUniform, iris26872Stripe[0], iris26872Stripe[1],
+                 iris26872Stripe[2], iris26872Eligible && !iris26935UnmeasuredFrame
+                         ? iris26872Stripe[3] : 0f);
+@@ -295,7 +270,9 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+     private int iris26662ReferencePreviewGain;
+     private int iris26678FlickerParams;
+ 
+-    private void iris26872ProbeDraw() {
++    private void iris26872Probe(long timestampNs) {
++        if (mIris26872ProbeDisabled || mIris26872ProbeProgram == 0 || mIris26872ProbeFbo == 0)
++            return;
+         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, mIris26872ProbeFbo);
+         GLES20.glViewport(0, 0, Iris26872PreviewStripe.WIDTH, Iris26872PreviewStripe.HEIGHT);
+         GLES20.glUseProgram(mIris26872ProbeProgram);
+@@ -305,24 +282,14 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, hTex[0]);
+         GLES20.glUniform1i(mIris26872ProbeSampler, 0);
+         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+-    }
+-
+-    private void iris26872ProbeRestore() {
+-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+-        GLES20.glViewport(0, 0, mIris26872ViewportW, mIris26872ViewportH);
+-        GLES20.glUseProgram(mIris26553PreviewProgram);
+-    }
+-
+-    private void iris26872Probe(long timestampNs) {
+-        if (mIris26872ProbeDisabled || mIris26872ProbeProgram == 0 || mIris26872ProbeFbo == 0)
+-            return;
+-        iris26872ProbeDraw();
+         mIris26872ProbeReadback.rewind();
+         GLES20.glReadPixels(0, 0, Iris26872PreviewStripe.WIDTH,
+                 Iris26872PreviewStripe.HEIGHT, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE,
+                 mIris26872ProbeReadback);
+         int error = GLES20.glGetError();
+-        iris26872ProbeRestore();
++        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
++        GLES20.glViewport(0, 0, mIris26872ViewportW, mIris26872ViewportH);
++        GLES20.glUseProgram(mIris26553PreviewProgram);
+         if (error != GLES20.GL_NO_ERROR) {
+             mIris26872ProbeDisabled = true;
+             mIris26872Stripe.reset();
+@@ -339,179 +306,6 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+         }
+     }
+ 
+-    /* A completed PBO read is consumed on the original GL thread under its
+-     * original sensor timestamp. EGL context recreation clears these handles;
+-     * no GL call is issued from the Camera2/processExecutor/main threads. */
+-    private void iris26936DisposeAsyncProbe() {
+-        for (int i = 0; i < 2; i++) {
+-            if (mIris26936Fence[i] != 0L) {
+-                GLES30.glDeleteSync(mIris26936Fence[i]);
+-                mIris26936Fence[i] = 0L;
+-            }
+-            mIris26936PendingTimestamp[i] = 0L;
+-        }
+-        if (mIris26936AsyncReady) {
+-            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+-            GLES30.glDeleteBuffers(2, mIris26936Pbo, 0);
+-        }
+-        Arrays.fill(mIris26936Pbo, 0);
+-        mIris26936AsyncReady = false;
+-        mIris26936WriteCursor = 0;
+-        mIris26936AsyncThisFrame = false;
+-        mIris26936LastCompletedTimestamp = 0L;
+-    }
+-
+-    private boolean iris26936InitAsyncProbe() {
+-        if (mIris26936AsyncUnsupported || mIris26872ProbeDisabled) return false;
+-        if (mIris26936AsyncReady) return true;
+-        String version = GLES20.glGetString(GLES20.GL_VERSION);
+-        // This feature requires an ACTUAL GLES 3.x EGL context, not just a
+-        // GLES3-capable phone. On unknown contexts use proven sync behavior.
+-        if (version == null || !version.startsWith("OpenGL ES 3.")) {
+-            mIris26936AsyncUnsupported = true;
+-            Log.w("MainRenderer", "IRIS_26936_ASYNC_UNSUPPORTED eglVersion=" + version);
+-            return false;
+-        }
+-        GLES30.glGenBuffers(2, mIris26936Pbo, 0);
+-        boolean valid = mIris26936Pbo[0] != 0 && mIris26936Pbo[1] != 0;
+-        if (valid) {
+-            for (int pbo : mIris26936Pbo) {
+-                GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, pbo);
+-                GLES30.glBufferData(GLES30.GL_PIXEL_PACK_BUFFER,
+-                        IRIS_26936_PROBE_BYTES, null, GLES30.GL_STREAM_READ);
+-            }
+-            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+-            valid = GLES20.glGetError() == GLES20.GL_NO_ERROR;
+-        }
+-        if (!valid) {
+-            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+-            GLES30.glDeleteBuffers(2, mIris26936Pbo, 0);
+-            Arrays.fill(mIris26936Pbo, 0);
+-            mIris26936AsyncUnsupported = true;
+-            Log.w("MainRenderer", "IRIS_26936_ASYNC_UNSUPPORTED PBO allocation failed");
+-            return false;
+-        }
+-        mIris26936AsyncReady = true;
+-        Log.i("MainRenderer", "IRIS_26936_ASYNC_PBO_READY originalFrameTimestamps=true "
+-                + "stripeActiveAndLowLightRemainSynchronous=true twoBuffers=2");
+-        return true;
+-    }
+-
+-    private boolean iris26936DrainCompletedProbe(long currentTimestamp) {
+-        for (int checks = 0; checks < 2; checks++) {
+-            int oldest = -1;
+-            for (int i = 0; i < 2; i++) {
+-                if (mIris26936Fence[i] != 0L
+-                        && (oldest == -1 || mIris26936PendingTimestamp[i]
+-                            < mIris26936PendingTimestamp[oldest])) oldest = i;
+-            }
+-            if (oldest == -1) return true;
+-            int ready = GLES30.glClientWaitSync(mIris26936Fence[oldest], 0, 0L);
+-            if (ready == GLES30.GL_TIMEOUT_EXPIRED) return true;
+-            if (ready != GLES30.GL_ALREADY_SIGNALED
+-                    && ready != GLES30.GL_CONDITION_SATISFIED) {
+-                Log.w("MainRenderer", "IRIS_26936_PBO_SYNC_FAILED code=" + ready);
+-                mIris26936AsyncUnsupported = true;
+-                return false;
+-            }
+-            final long ownedTimestamp = mIris26936PendingTimestamp[oldest];
+-            boolean valid = currentTimestamp > 0L && ownedTimestamp > 0L
+-                    && currentTimestamp >= ownedTimestamp
+-                    && currentTimestamp - ownedTimestamp <= 250_000_000L;
+-            if (valid) {
+-                GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, mIris26936Pbo[oldest]);
+-                java.nio.Buffer mapped = GLES30.glMapBufferRange(
+-                        GLES30.GL_PIXEL_PACK_BUFFER, 0, IRIS_26936_PROBE_BYTES,
+-                        GLES30.GL_MAP_READ_BIT);
+-                if (!(mapped instanceof ByteBuffer)) {
+-                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+-                    mIris26936AsyncUnsupported = true;
+-                    return false;
+-                }
+-                ByteBuffer buffer = (ByteBuffer) mapped;
+-                buffer.position(0);
+-                buffer.limit(IRIS_26936_PROBE_BYTES);
+-                mIris26872ProbeReadback.clear();
+-                mIris26872ProbeReadback.put(buffer);
+-                mIris26872ProbeReadback.rewind();
+-                boolean unmapped = GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER);
+-                GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+-                if (!unmapped || GLES20.glGetError() != GLES20.GL_NO_ERROR) {
+-                    mIris26936AsyncUnsupported = true;
+-                    return false;
+-                }
+-                mIris26911Preview.sample(mIris26872ProbeReadback, ownedTimestamp);
+-                mIris26872Stripe.consume(mIris26872ProbeReadback, ownedTimestamp);
+-                mIris26936LastCompletedTimestamp = ownedTimestamp;
+-                mIris26936Completed++;
+-            } else {
+-                // A late result cannot supply a guessed current-frame stripe
+-                // phase or low-light exposure; expire it without consumption.
+-                mIris26872Stripe.reset();
+-            }
+-            GLES30.glDeleteSync(mIris26936Fence[oldest]);
+-            mIris26936Fence[oldest] = 0L;
+-            mIris26936PendingTimestamp[oldest] = 0L;
+-        }
+-        return true;
+-    }
+-
+-    private boolean iris26936ProbeAsync(long timestampNs) {
+-        if (!iris26936InitAsyncProbe()) return false;
+-        if (!iris26936DrainCompletedProbe(timestampNs)) {
+-            iris26936DisposeAsyncProbe();
+-            return false; // fail closed to original synchronous sampling
+-        }
+-        if (mIris26872Stripe.params()[3] > 0.0f) {
+-            iris26936DisposeAsyncProbe();
+-            return false; // flicker detected from a timestamp-owned async sample
+-        }
+-        int slot = -1;
+-        for (int i = 0; i < 2; i++) {
+-            int candidate = (mIris26936WriteCursor + i) % 2;
+-            if (mIris26936Fence[candidate] == 0L) {slot = candidate;break;}
+-        }
+-        if (slot == -1) {
+-            ++mIris26936Backpressure;
+-            // Skip an unmeasured frame instead of blocking preview on Vulkan.
+-            return true;
+-        }
+-        long begin = System.nanoTime();
+-        iris26872ProbeDraw();
+-        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, mIris26936Pbo[slot]);
+-        GLES30.glReadPixels(0, 0, Iris26872PreviewStripe.WIDTH,
+-                Iris26872PreviewStripe.HEIGHT, GLES20.GL_RGBA,
+-                GLES20.GL_UNSIGNED_BYTE, 0);
+-        long fence = GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+-        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0);
+-        iris26872ProbeRestore();
+-        int error = GLES20.glGetError();
+-        if (error != GLES20.GL_NO_ERROR || fence == 0L) {
+-            if (fence != 0L) GLES30.glDeleteSync(fence);
+-            mIris26936AsyncUnsupported = true;
+-            iris26936DisposeAsyncProbe();
+-            Log.w("MainRenderer", "IRIS_26936_ASYNC_PBO_FAILED err=0x"
+-                    + Integer.toHexString(error));
+-            return false;
+-        }
+-        mIris26936Fence[slot] = fence;
+-        mIris26936PendingTimestamp[slot] = timestampNs;
+-        mIris26936WriteCursor = (slot + 1) % 2;
+-        mIris26936Submitted++;
+-        GLES20.glFlush(); // nonblocking GPU submission, NOT glFinish
+-        long submitNs = System.nanoTime() - begin;
+-        mIris26936WorstSubmitNs = Math.max(mIris26936WorstSubmitNs,submitNs);
+-        if (mIris26936Submitted == 1 || mIris26936Submitted % 120 == 0) {
+-            Log.i("MainRenderer", "IRIS_26936_ASYNC_PROBE submitted=" + mIris26936Submitted
+-                    + " consumed=" + mIris26936Completed
+-                    + " backpressure=" + mIris26936Backpressure
+-                    + " submitWallNs=" + submitNs
+-                    + " worstSubmitNs=" + mIris26936WorstSubmitNs
+-                    + " lastOwnedTs=" + mIris26936LastCompletedTimestamp);
+-        }
+-        return true;
+-    }
+-
+     private void iris26872CreateProbe() {
+         String vs = "in vec2 vPosition; void main(){gl_Position=vec4(vPosition,0.0,1.0);}";
+         String fs = "#extension GL_OES_EGL_image_external_essl3 : require\n"
+@@ -566,14 +360,6 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+     }
+     @Override
+     public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+-        Arrays.fill(mIris26936Pbo, 0);
+-        Arrays.fill(mIris26936Fence, 0L);
+-        Arrays.fill(mIris26936PendingTimestamp, 0L);
+-        mIris26936AsyncReady = false;
+-        mIris26936AsyncUnsupported = false;
+-        mIris26936AsyncThisFrame = false;
+-        mIris26936WriteCursor = 0;
+-        mIris26935LastBusy = false;
+         initTex();
+         mSTexture = new SurfaceTexture(hTex[0]);
+         mSTexture.setOnFrameAvailableListener(this);
+diff --git a/app/version.properties b/app/version.properties
+index 00cc4b720ab4abf841fd25d9a595a2f3c881dbbb..283dae7734d8b6474dff08fbdabd06afaf36e925 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726936
+-VERSION_BUILD=26936
++VERSION_NAME=0.9726935
++VERSION_BUILD=26935
