@@ -1,0 +1,352 @@
+diff --git a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+index 69f09d6fbf2ca8fc56c50816f6db6dacd9554cbf..9927b275df66246fc7f3522d9c0522f2d62899d3 100644
+--- a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+@@ -24,7 +24,8 @@ thread_local Iris26923NoiseReceipt iris26923Noise{};
+ } // namespace
+ void runRealRawrFromFrozenDirectNormals(
+     const FrozenDirectBRequest& request, amaze::CommandSubmissionOwner& inheritedUploads,
+-    const ConsumePinnedRawrGpuResult& consume) {
++    const ConsumePinnedRawrGpuResult& consume,
++    rawr::raw_gpu_pipeline::AndroidBurstCoordinator* bOffReusable) {
+     if(!request.physical||!request.device||!request.inheritedQueue||
+        request.width<32u||request.height<32u||(request.width&1u)||(request.height&1u)||
+        request.localCfa>3u||request.referenceIndex>=request.normals.size()||
+@@ -231,7 +232,7 @@ void runRealRawrFromFrozenDirectNormals(
+     };
+     try {
+         try {
+-            runRealPinnedRawrB(merge,wrappedConsume);
++            runRealPinnedRawrB(merge,wrappedConsume,bOffReusable);
+         } catch(const std::exception& error) {
+             // A larger resident input set can starve HDRq's ~845MiB scratch
+             // arena even though the input images themselves allocated. Retry
+@@ -275,7 +276,7 @@ void runRealRawrFromFrozenDirectNormals(
+             __android_log_print(ANDROID_LOG_WARN,"Iris26873",
+                 "B_RESIDENT_SCRATCH_FALLBACK normals=%zu why=%s",
+                 raw.size(),error.what());
+-            runRealPinnedRawrB(merge,wrappedConsume); // exact math, all frames
++            runRealPinnedRawrB(merge,wrappedConsume,bOffReusable); // exact math, all frames
+         }
+         const double uploadWallMs=std::chrono::duration<double,std::milli>(now()-uploadBegin).count();
+         __android_log_print(ANDROID_LOG_INFO,"Iris26873",
+diff --git a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.hpp b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.hpp
+index 8b3897c960cd2a5c4d15da1740ce574cf5796513..80044a0b0f01a6268577d1e4d3c9f40c16eed508 100644
+--- a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.hpp
++++ b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.hpp
+@@ -30,5 +30,6 @@ struct FrozenDirectBRequest final {
+ // synchronous call. JNI must not free the source between stage and GPU fence.
+ void runRealRawrFromFrozenDirectNormals(
+     const FrozenDirectBRequest&, amaze::CommandSubmissionOwner& inheritedUploads,
+-    const ConsumePinnedRawrGpuResult& consumeGpuBeforeScratchRelease);
++    const ConsumePinnedRawrGpuResult& consumeGpuBeforeScratchRelease,
++    rawr::raw_gpu_pipeline::AndroidBurstCoordinator* bOffReusable = nullptr);
+ } // namespace iris26864
+diff --git a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+index 31da6e82968dcce78ee69fb5708857796907e328..65e1ba766b61b49fd200d40b587b8513384cc321 100644
+--- a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
++++ b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+@@ -18,6 +18,9 @@
+ #include <vector>
+ #include <cstring>
+ #include <limits>
++#include <memory>
++#include <mutex>
++#include <exception>
+ 
+ namespace {
+ struct Iris26864LscGpu final {
+@@ -109,6 +112,58 @@ struct Iris26887WaitedWitnessArenaRetire {
+         }
+     }
+ };
++// IRIS_26940_PHOTO_B_SR_OFF_EXCLUSIVE_GPU_CACHE.
++// No shared RAWR singleton: ON, Night, A, A+B and Spektra never borrow
++// this VkDevice or coordinator. The large HDRq arena is always released by
++// the merge owner after its synchronous consumer finishes.
++struct Iris26940BOffGpuCache final {
++    std::mutex mutex;
++    std::unique_ptr<amaze::VulkanDeviceOwner> device;
++    std::unique_ptr<rawr::raw_gpu_pipeline::AndroidBurstCoordinator> coordinator;
++    uint64_t lens = 0;
++    uint32_t width = 0, height = 0, localCfa = 0;
++    void clear() noexcept {
++        if (device && vkQueueWaitIdle(device->queue()) != VK_SUCCESS) {
++            // Unresolved GPU commands: never free potentially live buffers.
++            (void)coordinator.release();
++            (void)device.release();
++        } else {
++            coordinator.reset();
++            device.reset();
++        }
++        lens = 0;
++        width = height = localCfa = 0;
++    }
++    ~Iris26940BOffGpuCache() {
++        std::lock_guard<std::mutex> lock(mutex);
++        clear();
++    }
++    void select(uint64_t wantedLens, uint32_t w, uint32_t h, uint32_t cfa) {
++        if (device && coordinator && lens == wantedLens &&
++            width == w && height == h && localCfa == cfa) return;
++        clear(); // camera/lens/geometry changes never inherit stale handles.
++        device = std::make_unique<amaze::VulkanDeviceOwner>();
++        coordinator = std::make_unique<rawr::raw_gpu_pipeline::AndroidBurstCoordinator>();
++        lens = wantedLens;
++        width = w;
++        height = h;
++        localCfa = cfa;
++    }
++};
++Iris26940BOffGpuCache& iris26940BOffCache() {
++    static Iris26940BOffGpuCache cache;
++    return cache;
++}
++struct Iris26940CacheFailureGuard final {
++    Iris26940BOffGpuCache* cache;
++    int exceptionsAtEntry;
++    explicit Iris26940CacheFailureGuard(Iris26940BOffGpuCache* c)
++        : cache(c), exceptionsAtEntry(std::uncaught_exceptions()) {}
++    ~Iris26940CacheFailureGuard() noexcept {
++        if (cache && std::uncaught_exceptions() > exceptionsAtEntry)
++            cache->clear(); // GPU queue-idle proof or conservative quarantine.
++    }
++};
+ std::vector<float> iris26864ReadFloats(JNIEnv* e,jfloatArray v){
+     if(!v)return {};
+     const jsize n=e->GetArrayLength(v);
+@@ -175,10 +230,29 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+     const uint32_t outHeight=uint32_t(rawHeight)*(sr?2u:1u);
+     if(outWidth>16384u||outHeight>16384u)
+         throw std::invalid_argument("26864 native B output exceeds physical GPU dimension");
+-    amaze::VulkanDeviceOwner device;
+-    const auto ctx=device.context();
++    // Eligible only after immutable Java Photo B, non-Night, Super Res OFF
++    // and lens-relative zoom <1.10 routing. Other modes keep exact per-shot
++    // ownership, without reading or modifying this cache.
++    const bool useBOffCache = (!sr && photoBOffOnly == JNI_TRUE);
++    Iris26940BOffGpuCache* bOffCache = useBOffCache ? &iris26940BOffCache() : nullptr;
++    std::unique_lock<std::mutex> bOffCacheLock;
++    if (bOffCache) bOffCacheLock = std::unique_lock<std::mutex>(bOffCache->mutex);
++    Iris26940CacheFailureGuard bOffFailure(bOffCache);
++    std::unique_ptr<amaze::VulkanDeviceOwner> oneShotDevice;
++    amaze::VulkanDeviceOwner* activeDevice = nullptr;
++    if (bOffCache) {
++        const uint32_t cfaForReuse = uint32_t(physicalCfa) ^
++             (uint32_t(cropX) & 1u) ^ ((uint32_t(cropY) & 1u) << 1u);
++        bOffCache->select(uint64_t(physicalLensIdentity),uint32_t(rawWidth),
++                          uint32_t(rawHeight),cfaForReuse);
++        activeDevice = bOffCache->device.get();
++    } else {
++        oneShotDevice = std::make_unique<amaze::VulkanDeviceOwner>();
++        activeDevice = oneShotDevice.get();
++    }
++    const auto ctx=activeDevice->context();
+     amaze::CommandSubmissionOwner commands(ctx.physicalDevice,ctx.device,
+-                                            device.queue(),ctx.queueFamilyIndex);
++                                            activeDevice->queue(),ctx.queueFamilyIndex);
+     amaze::PipelineConfig config{};
+     config.width=outWidth;config.height=outHeight;
+     const uint32_t localCfa=uint32_t(physicalCfa)^(uint32_t(cropX)&1u)^
+@@ -206,7 +280,7 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+     });
+     Iris26864LscGpu lsc(ctx.physicalDevice,ctx.device,lensVec);
+     iris26864::FrozenDirectBRequest req{};
+-    req.physical=ctx.physicalDevice;req.device=ctx.device;req.inheritedQueue=device.queue();
++    req.physical=ctx.physicalDevice;req.device=ctx.device;req.inheritedQueue=activeDevice->queue();
+     req.queueFamily=ctx.queueFamilyIndex;req.width=uint32_t(rawWidth);
+     req.height=uint32_t(rawHeight);req.localCfa=localCfa;
+     req.referenceIndex=uint32_t(referenceIndex);
+@@ -268,7 +342,7 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+     // Independent optional arena: partial allocation failure frees all
+     // witness resources and cannot retain 48 MiB needed by AMaZE/JPEG.
+     std::unique_ptr<iris26864::VulkanImageArena,
+-        Iris26887WaitedWitnessArenaRetire> bOffArena(nullptr,{device.queue()});
++        Iris26887WaitedWitnessArenaRetire> bOffArena(nullptr,{activeDevice->queue()});
+     bool bOffWitnessAllocated=false;
+     // A full RGB witness needs at least two physical observations of each
+     // Bayer channel. No 48-MiB allocation on flat, ambiguous or short bursts
+@@ -289,15 +363,15 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+     // quarantine its pipeline until the inherited queue is actually idle.
+     std::unique_ptr<iris26864::VulkanKernelExecutor,
+         Iris26880WaitedVulkanRetire<iris26864::VulkanKernelExecutor>>
+-        bOnChromaEvidence(nullptr,{device.queue()});
++        bOnChromaEvidence(nullptr,{activeDevice->queue()});
+     if(sr) bOnChromaEvidence.reset(
+         iris26864::makeRealWronskiChromaGuide(ctx.device).release());
+     // B OFF four independent source-of-truth compute kernels. Each separate
+     // descriptor set remains owned through CommandSubmissionOwner's fence.
+     using BOffKernel=std::unique_ptr<iris26864::VulkanKernelExecutor,
+         Iris26880WaitedVulkanRetire<iris26864::VulkanKernelExecutor>>;
+-    BOffKernel bOffTile(nullptr,{device.queue()}),bOffAcc(nullptr,{device.queue()}),
+-               bOffFinish(nullptr,{device.queue()}),bOffReconcile(nullptr,{device.queue()});
++    BOffKernel bOffTile(nullptr,{activeDevice->queue()}),bOffAcc(nullptr,{activeDevice->queue()}),
++               bOffFinish(nullptr,{activeDevice->queue()}),bOffReconcile(nullptr,{activeDevice->queue()});
+     auto clipShader=iris26864::makeRealSensorClipToGlBridge(ctx.device);
+     // Capture scope is the GPU lifetime. The real RAWR original tiled wavelet
+     // and its final copy descriptor/pipeline are created before command record
+@@ -305,10 +379,10 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+     // Not enabled for HDRq (Super Res OFF) or any other experiment.
+     std::unique_ptr<raw_denoise::DenoisePipeline,
+         Iris26880WaitedVulkanRetire<raw_denoise::DenoisePipeline>>
+-        bWavelet(nullptr,{device.queue()});
++        bWavelet(nullptr,{activeDevice->queue()});
+     std::unique_ptr<iris26864::VulkanKernelExecutor,
+         Iris26880WaitedVulkanRetire<iris26864::VulkanKernelExecutor>>
+-        bWaveletCopy(nullptr,{device.queue()});
++        bWaveletCopy(nullptr,{activeDevice->queue()});
+     bool publishedClip=false;
+     // This callback executes while RAWR still owns the exact completed GPU
+     // merge scratch. The B engines cannot return an alias of inherited A RGB.
+@@ -801,7 +875,7 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+         ScopedNativeFd glFence=exportVulkanFenceToGl(ctx.device,release.semaphore);
+         waitCurrentGlOnVulkanFence(std::move(glFence));
+         publishedClip=true;
+-    });
++    }, bOffCache ? bOffCache->coordinator.get() : nullptr);
+     if(!publishedClip)throw std::runtime_error("26864 original sensor clip not GPU-generated/GL-published");
+     // IRIS_26898_B_GL_AHB_EXACT_ROLE_RECEIPT: no math or allocation change.
+     GlBufferImage glRgb(rgbAhb.get(), "B_HDRQ_RGB");
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+index 03862e4b0bbca9ea322ab14051f30c6e9e743f76..2606a44213d0422befc04fbf578804bdcb02a29b 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+@@ -5,6 +5,8 @@
+  * separate, pinned vendor build-copy include root. */
+ namespace rawr::raw_gpu_pipeline {
+ extern thread_local std::optional<std::array<float,8>> iris26912BOffNoiseOverride;
++// Owned by Iris's B-only shadow executor, not the pinned RAWR vendor sources.
++extern thread_local bool iris26940BOffHdrqPipelineInit;
+ }
+ #include <cmath>
+ #include <limits>
+@@ -66,10 +68,13 @@ void checkFrozen(const RealRawrRunRequest& r) {
+ }
+ } // namespace
+ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
+-                        const ConsumePinnedRawrGpuResult& consume) {
++                        const ConsumePinnedRawrGpuResult& consume,
++                        rawr::raw_gpu_pipeline::AndroidBurstCoordinator* bOffReusable) {
+     checkFrozen(frozen);
+     if(!consume) throw std::invalid_argument("26864 missing actual GPU output consumer");
+     const bool sr=frozen.algorithm==RealBEngine::WronskiTrue2x;
++    if (sr && bOffReusable)
++        throw std::invalid_argument("26940 B OFF cache cannot enter Wronski");
+     rawr::raw_merge_wronski_gpu::Config wronski{};
+     wronski.cfa=static_cast<rawr::raw_merge_wronski_gpu::CfaPattern>(frozen.effectiveCfa);
+     // Original Wronski RAW-burst fitting remains the fallback. Only an explicitly
+@@ -136,14 +141,31 @@ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
+     // coordinator alive until an explicit queue-idle proof has settled every
+     // possible submission, rather than letting stack unwinding release its
+     // arena and command pool before the frozen uploader's outer catch runs.
+-    auto coordinator = std::make_unique<AndroidBurstCoordinator>();
++    std::unique_ptr<AndroidBurstCoordinator> perCapture;
++    if (!bOffReusable) perCapture = std::make_unique<AndroidBurstCoordinator>();
++    AndroidBurstCoordinator* coordinator = bOffReusable ? bOffReusable : perCapture.get();
+     auto inheritedSubmit=[queue=frozen.inheritedQueue](const VkSubmitInfo& si,VkFence fence){
+         if(vkQueueSubmit(queue,1u,&si,fence)!=VK_SUCCESS)
+             throw std::runtime_error("26864 actual RAWR GPU queue submission failed");
+     };
+-    coordinator->initialize(frozen.physical,frozen.device,frozen.queueFamily,
+-        inheritedSubmit,frozen.width,frozen.height,sr?2.f:1.f,{},
+-        alignment,wronski,sr?MergeAlgorithm::Wronski:MergeAlgorithm::HdrPlusFrequency,hdrq);
++    // Only a borrowed, Photo B SR OFF coordinator may omit Wronski-only
++    // Vulkan pipelines. A fresh Wronski or Night coordinator remains exact.
++    struct BOffInitScope {
++        bool previous;
++        explicit BOffInitScope(bool enable)
++            : previous(rawr::raw_gpu_pipeline::iris26940BOffHdrqPipelineInit) {
++            rawr::raw_gpu_pipeline::iris26940BOffHdrqPipelineInit = enable;
++        }
++        ~BOffInitScope() {
++            rawr::raw_gpu_pipeline::iris26940BOffHdrqPipelineInit = previous;
++        }
++    };
++    {
++        BOffInitScope initScope(bOffReusable != nullptr);
++        coordinator->initialize(frozen.physical,frozen.device,frozen.queueFamily,
++            inheritedSubmit,frozen.width,frozen.height,sr?2.f:1.f,{},
++            alignment,wronski,sr?MergeAlgorithm::Wronski:MergeAlgorithm::HdrPlusFrequency,hdrq);
++    }
+     std::vector<BurstFrame> upstream;
+     upstream.reserve(frozen.normals.size());
+     for(const auto& f:frozen.normals) {
+@@ -204,6 +226,9 @@ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
+                 throw std::runtime_error("26864 HDR+ Higher quality must provide native CFA output");
+         }
+         consume(result,frozen); // synchronous AMaZE/clip/LSC/JPEG boundary
++        // Keep only the small B OFF pipeline and command infrastructure.
++        // ~845 MiB scratch must NOT persist across modes or camera sessions.
++        if (bOffReusable) coordinator->releaseScratch();
+     } catch (...) {
+         const VkResult idle = vkQueueWaitIdle(frozen.inheritedQueue);
+         if (idle != VK_SUCCESS) {
+@@ -211,7 +236,9 @@ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
+             // destructor would free images/buffers while the submitted work
+             // might still refer to them. Quarantine exactly that instance.
+             // The outer two-slot owner independently quarantines its inputs.
+-            (void)coordinator.release();
++            if (!bOffReusable) (void)perCapture.release();
++            // Borrowed resources are quarantined by the outer B OFF JNI
++            // cache guard together with their owning device on failure.
+         }
+         throw; // Never publish a partial B image or use an A/Camera2 fallback.
+     }
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
+index a02c4af79c2c03f01436953f257088bf6f6fe60c..80cb5c8cdb0f8efd1acb0a7b305302318f7bd4b6 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
+@@ -54,5 +54,6 @@ using ConsumePinnedRawrGpuResult = std::function<void(
+ // upstream Vulkan arena is alive. Exceptions always abort JPEG publication.
+ // The caller is responsible for input's last fence and GLES handoff fences.
+ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
+-                        const ConsumePinnedRawrGpuResult& consume);
++                        const ConsumePinnedRawrGpuResult& consume,
++                        rawr::raw_gpu_pipeline::AndroidBurstCoordinator* bOffReusable = nullptr);
+ }
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp
+index fc367ddd2333a68791cff0282777fd2aa017d2ca..91d38a3ef140707942ab0b984ae458fa31d7cfd5 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp
+@@ -116,6 +116,9 @@
+ #include "mf_support_accumulate_prod.h"
+ #include "mf_support_accumulate_trace.h"
+ namespace rawr::raw_gpu_pipeline {
++// Opt-in is set only while initializing a borrowed Photo B HDR+ coordinator.
++// Wronski, Night and every other user initialize the full unchanged table.
++thread_local bool iris26940BOffHdrqPipelineInit = false;
+ namespace {
+ struct B {
+     uint32_t n;
+@@ -552,6 +555,11 @@ void VulkanExecutor::initialize(VkDevice d, bool wantTrace) {
+     device_ = d;
+     trace_ = wantTrace;
+     for (size_t i = 0; i < specs.size(); ++i) {
++        // Frequency HDR+ dispatches NoiseEstimate plus the entire Hdrp/Hdrq
++        // range. The other 23 Wronski-only shaders are never used here.
++        if (iris26940BOffHdrqPipelineInit &&
++            i != static_cast<size_t>(ShaderId::NoiseEstimate) &&
++            i < static_cast<size_t>(ShaderId::HdrpPrepare)) continue;
+         const auto& s = specs[i];
+         auto& p = programs_[i];
+         std::vector<VkDescriptorSetLayoutBinding> bs;
+@@ -616,6 +624,8 @@ void VulkanExecutor::record(VkCommandBuffer cmd, ShaderId id, const DispatchBind
+     if (i >= specs.size()) throw std::invalid_argument("multiframe executor: invalid shader");
+     const auto& s = specs[i];
+     auto& p = programs_[i];
++    if (!p.pool || !p.dsl || !p.layout || !p.prod)
++        throw std::logic_error("26940 attempted uninitialized shader dispatch");
+     bool useTrace = tr && tr->buffer;
+     if (useTrace && !trace_) throw std::logic_error("multiframe executor: trace pipeline not initialized");
+     for (const auto expected : s.b) {
+diff --git a/app/version.properties b/app/version.properties
+index 6424cc4aa43c6304b181797863bf524aebeee517..67481655111c6db065e6b4bae12ae80a69f5ca56 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726939
+-VERSION_BUILD=26939
++VERSION_NAME=0.9726940
++VERSION_BUILD=26940
