@@ -20,7 +20,7 @@ REQUIRED={
 }
 ADDED=set() # previously compiled shutter, preview, original native libraries are PROTECTED
 STAGE1_FILES=[
- 'README_PHOTON_26938_V1.md','26938_LOCAL_VERIFICATION.txt','26938_COMMIT_MESSAGE.txt',
+ 'README_PHOTON_26938_V2.md','26938_LOCAL_VERIFICATION.txt','26938_COMMIT_MESSAGE.txt',
  'build_26938_incremental.py','test_26938_source.py','test_26938_guard_host.py',
  'test_26938_highlight_math.py','test_26938_shader_contract.py',
  'test_26938_patch_proof.py','test_26938_sealed_negatives.py','test_26938_workflow_refs.py',
@@ -30,8 +30,8 @@ STAGE1_FILES=[
  '26938_PROTECTED_SOURCE.sha256','26938_CHANGED_RUNTIME_ALLOWLIST.txt',
  '26938_ADDED_RUNTIME_PATHS.txt','26938_DELETED_RUNTIME_PATHS.txt',
  '26938_EXPECTED_ACTION_EXECUTABLES.txt',
- '26938_V1_STAGE_1_UPLOAD_PATHS.txt','26938_V1_STAGE_2_UPLOAD_PATHS.txt',
- '26938_V1_STAGE_3_UPLOAD_PATHS.txt',
+ '26938_V2_STAGE_1_UPLOAD_PATHS.txt','26938_V2_STAGE_2_UPLOAD_PATHS.txt',
+ '26938_V2_STAGE_3_UPLOAD_PATHS.txt',
 ]
 
 def fail(msg):raise RuntimeError('26938 BLOCKED: '+str(msg))
@@ -85,7 +85,7 @@ def seal():
  wf='.github/workflows/build-26938-change-aware.yml';tr='TRIGGER_26938.txt'
  need=set(STAGE1_FILES)|{wf,tr}|{'handoff_payload_26938/'+p for p in ch|ad}
  if set(sealed)!=need:fail('missing/unlisted handoff paths '+str(sorted(need-set(sealed)))+' extras '+str(sorted(set(sealed)-need)))
- stages=[(R/f'26938_V1_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
+ stages=[(R/f'26938_V2_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
  if stages[0]!=sorted((set(sealed)|{'26938_HANDOFF_HASHES.sha256'})-{wf,tr}) or stages[1]!=[wf] or stages[2]!=[tr]:fail('three-stage upload scope invalid')
  staged={p.relative_to(R/'handoff_payload_26938').as_posix() for p in (R/'handoff_payload_26938').rglob('*') if p.is_file()}
  if staged!=ch|ad:fail('missing/unused overlay files '+str(staged))

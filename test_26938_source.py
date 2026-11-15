@@ -21,7 +21,7 @@ def main():
   'float rawLensWhite=max(whiteCurve.r,max(whiteCurve.g,whiteCurve.b));',
   'vec3 sensorRgb=medianRgb/wb;',
   'float clippedPink=wrongMagenta*max(rbEvidence,greenEvidence);',
-  'float fade=clamp(max(allEvidence,clippedPink,',
+  'float fade=clamp(max(max(allEvidence,clippedPink),',
   'vec3 corrected=mix(medianRgb,vec3(luma),fade);',
   'oRgb=vec4(corrected,original.a);'):
   if s.count(flag)!=1:fail('single source white owner missing or duplicated '+flag)

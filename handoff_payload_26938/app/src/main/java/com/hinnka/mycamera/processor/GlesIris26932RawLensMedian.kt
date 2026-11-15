@@ -106,7 +106,7 @@ internal object GlesIris26932RawLensMedian {
             // High-chroma genuine yellow/red/cyan cannot be declared white
             // by brightness alone; physically clipped pink cores remain safe.
             float nearNeutral=1.0-smoothstep(0.11,0.29,chromaSpan);
-            float fade=clamp(max(allEvidence,clippedPink,
+            float fade=clamp(max(max(allEvidence,clippedPink),
                 nearNeutral*rawLensWhite),0.0,1.0);
 
             // Camera's measured neutral-white direction is (1/WB.r,

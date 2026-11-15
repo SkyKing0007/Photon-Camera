@@ -23,12 +23,59 @@ def get(kind,live):
   s=textwrap.dedent(s[markers[0].end():].split('""".trimIndent()',1)[0]).strip()+'\n'
  return s
 
+
+# Fail-closed local parser for GLSL builtins with fixed argument counts.
+# The prior 26938 V1 shader wrongly used max(a,b,c); the full GitHub
+# compiler rejected it, but our old local contract checked only strings.
+# This check catches it before packaging even without installed glslang.
+_GLSL_ARG_COUNTS={
+    'max':2, 'min':2, 'clamp':3, 'smoothstep':3,
+    'mix':3, 'dot':2, 'pow':2, 'step':2, 'texelFetch':3,
+}
+def validate_builtin_calls(source, label):
+    clean=re.sub(r'/\*.*?\*/|//[^\n]*','',source,flags=re.S)
+    calls=re.finditer(r'\b('+'|'.join(_GLSL_ARG_COUNTS)+r')\s*\(',clean)
+    for match in calls:
+        op=match.group(1)
+        start=match.end()-1
+        depth=0
+        arguments=1
+        done=False
+        for i in range(start,len(clean)):
+            c=clean[i]
+            if c=='(':depth+=1
+            elif c==')':
+                depth-=1
+                if depth==0:
+                    done=True
+                    break
+            elif c==',' and depth==1:
+                arguments+=1
+            if depth<0:fail('unbalanced builtin GLSL function call '+label+' '+op)
+        if not done:fail('unterminated builtin GLSL function call '+label+' '+op)
+        if arguments!=_GLSL_ARG_COUNTS[op]:
+            fail('invalid GLSL builtin argument count '+label+' '+op+
+                 ' expected='+str(_GLSL_ARG_COUNTS[op])+' actual='+str(arguments))
+
+def assert_invalid_shader_rejected():
+    for source in ('void main(){float x=max(1.0,2.0,3.0);}',
+                   'void main(){float x=max(1.0,\n 2.0,\n 3.0);}',
+                   'void main(){float x=min(1.0);}',
+                   'void main(){float x=clamp(1.0,0.0);}'):
+        try:validate_builtin_calls(source,'NEGATIVE_ARITY')
+        except RuntimeError:continue
+        fail('local GLSL invalid built-in arity NEGATIVE test escaped')
+    validate_builtin_calls('float x=max(max(a,b),c); float y=clamp(x,0.0,1.0);',
+                           'VALID_NESTED_CALLS')
+
 def main():
  live='--live' in sys.argv
  if '--extract' in sys.argv and not live:fail('real compiler can only extract 26937-authority-seeded live shader')
+ assert_invalid_shader_rejected()
  bodies={n:get(n,live) for n in SRC}
  for n,s in bodies.items():
   if s is None:continue
+  validate_builtin_calls(s,n)
   clean=re.sub(r'/\*.*?\*/|//[^\n]*','',s,flags=re.S)
   # Prior documented 26904 optimizer failure: reserved GLSL tokens are forbidden in executable identifier positions.
   if re.search(r'\bcoherent\b|\b(?:readonly|writeonly|restrict|volatile)\s*=',clean):fail('reserved GLSL identifier '+n)
@@ -44,6 +91,7 @@ def main():
   'uniform int uBayerPattern;','float originalClip(ivec2 site)','vec3 phaseClip(ivec2 cell)',
   'vec3 sensorRgb=medianRgb/wb;','vec3 whiteCurve=smoothstep(vec3(0.70),vec3(0.99),sensorRgb);',
   'float clippedPink=wrongMagenta*max(rbEvidence,greenEvidence);',
+  'float fade=clamp(max(max(allEvidence,clippedPink),',
   'float luma=dot(medianRgb,vec3(0.25,0.50,0.25));',
   'vec3 corrected=mix(medianRgb,vec3(luma),fade);','oRgb=vec4(corrected,original.a);'):
   if m.count(k)!=1:fail('missing one-pass color/brightness shader contract '+k)

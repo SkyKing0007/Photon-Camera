@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Same pinned real 26937 glslang 16.5 / SPIR-V optimizer/validator, on CURRENT 26938 expanded GLSL.
+# 26938 V1 failed GLSL compile from max(a,b,c). V2 source contract checks builtin arity first.
 # Never bypass or replace real compiler with local regex/mock tests.
 set -eEuo pipefail
 cd "$(dirname "$0")"
@@ -17,7 +18,7 @@ command -v spirv-val >/dev/null;command -v spirv-opt >/dev/null
 exec 3>&1
 trap 'rc=$?;trap - ERR;echo "26938 pinned real shader compiler FAILED $rc" >&3;tail -n 120 "$OUT/26938_REAL_GLSL_SPIRV_COMPILER.txt" >&3 || :;exit "$rc"' ERR
 {
- echo 'PASS actual 26938 inline ESSL 300 310 pinned glslang 16.5.0 five current shaders; SPIR-V optimized and validated'
+ echo 'BEGIN actual 26938 inline ESSL 300 310 pinned glslang 16.5.0 five current shaders; SPIR-V optimizer and validator remain mandatory'
  cat "$OUT/26938_GLSLANG_VERSION.txt"
  for kind in raw_lens_median lkr_smooth_white motion_render motion_gainmap b_native_final; do
    if [ "$kind" != b_native_final ]; then
@@ -33,5 +34,6 @@ trap 'rc=$?;trap - ERR;echo "26938 pinned real shader compiler FAILED $rc" >&3;t
    sha256sum "$DIR/${kind}.spv" "$DIR/${kind}.opt.spv"
  done
  spirv-opt --version; spirv-val --version
+ echo 'PASS actual 26938 inline ESSL 300 310 pinned glslang 16.5.0 five current shaders; SPIR-V optimized and validated'
 } > "$OUT/26938_REAL_GLSL_SPIRV_COMPILER.txt" 2>&1
 trap - ERR;exec 3>&-
