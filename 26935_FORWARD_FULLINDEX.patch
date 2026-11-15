@@ -1,0 +1,554 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index cc86828ccac246d71097b130baab16acd93f2c48..b386b050a8ccf762bab23e58578156862db0cdad 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -9393,6 +9393,9 @@
+      * after shutter, but it must never change reconstruction/publication for this batch.
+      */
+     private boolean mMotion26575SuperResAtShutter = false;
++    /* Frozen only during this B/SR-ON physical acquisition; block deferred
++     * clicks before the processing session is armed after the 15th RAW. */
++    private volatile boolean mIris26935BOnAcquisition = false;
+     private boolean mMotion26636HeicAtShutter = false;
+     /* IRIS_26702_LOCAL_LAPLACIAN_SHUTTER_OWNER
+      * Freeze the A/B presentation decision at shutter exactly like SR/HEIC. */
+@@ -10980,6 +10983,10 @@
+         /* IRIS_26593_TOTAL_FRAME_CAPTURE_ENTRY */
+         if (mZslCapturing
+                 || mMotion26486InFlightBatches.get() >= MOTION_26486_MAX_INFLIGHT_BATCHES) {
++            if (mIris26935BOnAcquisition || Iris26935BOnSession.isActive()) {
++                Log.i(TAG, "IRIS_26935_B_ON_QUEUED_CAPTURE_DROPPED_NO_REPLAY");
++                return;
++            }
+             latchMotion26598DeferredShutter(mZslCapturing ? "ACQUISITION_ACTIVE" : "PROCESSING_ACTIVE");
+             Log.w(TAG, "ZSL: Motion busy; one shutter intent deferred until current immutable batch completes");
+             return;
+@@ -11213,6 +11220,16 @@
+                         com.particlesdevs.photoncamera.app.PhotonCamera.getApplicationContextStatic(),
+                         iris26593NormalReference == null ? physicalID : iris26754PhysicalCameraId(iris26593NormalReference),
+                         com.particlesdevs.photoncamera.settings.PreferenceKeys.getCameraID());
++        mIris26935BOnAcquisition =
++                iris26856FrozenExperiment ==
++                        com.particlesdevs.photoncamera.settings.Iris26856ABSettings.Mode.AMAZE_26855
++                && mMotion26575SuperResAtShutter
++                && PhotonCamera.getSettings().rawSaver != 2;
++        if (mIris26935BOnAcquisition) {
++            // No old deferred-shutter intent may survive into this 15-RAW LKR batch.
++            mMotion26598DeferredShutter.set(false);
++            mMotion26679DeferredReadinessOwner = false;
++        }
+         final boolean iris26905BOffAllNormal = iris26905BOffNormalOnly(
+                 iris26856FrozenExperiment, mMotion26575SuperResAtShutter);
+         final boolean iris26912AltHighlightsAtShutter =
+@@ -12152,7 +12169,19 @@
+                 + (iris26593Plan.normalFramesAtPress < iris26593Plan.normalTargetFrames));
+ 
+         /* IRIS_26486_MOTIONBATCH_SOLE_PROCESSING_OWNER */
+-        final ImageSaver iris26486ImageSaver = new ImageSaver(cameraEventsListener);
++        /* IRIS_26935_CAPTURE_FROZEN_B_ON_ONLY: never infer this ownership from
++         * mutable settings at completion. The original LKR/15-RAW batch is unchanged. */
++        final boolean iris26935BOnJpeg =
++                iris26856FrozenExperiment == com.particlesdevs.photoncamera.settings.Iris26856ABSettings.Mode.AMAZE_26855
++                && mMotion26575SuperResAtShutter
++                /* DNG-only mode intentionally has no JPEG publication. */
++                && PhotonCamera.getSettings().rawSaver != 2
++                && iris26593Plan.normalTargetFrames > 0;
++        final Iris26935BOnProcessingRelay iris26935Relay = iris26935BOnJpeg
++                ? new Iris26935BOnProcessingRelay(cameraEventsListener, mMotion26636HeicAtShutter) : null;
++        mIris26935BOnAcquisition = false;
++        final ImageSaver iris26486ImageSaver = new ImageSaver(
++                iris26935Relay != null ? iris26935Relay : cameraEventsListener);
+         iris26486ImageSaver.setFrameCount(iris26480ProcessingFrames.size());
+         iris26486ImageSaver.setImageFormat(CaptureController.RAW_FORMAT);
+         iris26486ImageSaver.implementation = ImageSaverSelector.getImageSaver(
+@@ -12410,6 +12439,7 @@
+                     + " aeOffOwnerUnchanged=true previousHighlightsProtected=true"
+                     + " repeatedHalReentry=false framePolicyUnchanged=true");
+         }
++        try {
+         processExecutor.execute(() -> {
+             try {
+                 mBackgroundHandler.post(this::unlockFocus);
+@@ -12428,8 +12458,10 @@
+                         + Log.getStackTraceString(e));
+                 String message = e.getClass().getSimpleName()
+                         + ": " + String.valueOf(e.getLocalizedMessage());
+-                cameraEventsListener.onProcessingError(message);
++                if (iris26935Relay != null) iris26935Relay.onProcessingError(message);
++                else cameraEventsListener.onProcessingError(message);
+             } finally {
++                if (iris26935Relay != null) iris26935Relay.finishIfMissing();
+                 com.particlesdevs.photoncamera.util.MotionTrace.finish(
+                         iris26486ShotId,
+                         "FINALLY",
+@@ -12458,20 +12490,41 @@
+                         Log.e(TAG, "Motion shutter cleanup callback failed: "
+                                 + Log.getStackTraceString(cleanupError));
+                     }
+-                    scheduleMotion26598DeferredShutterReplay("batch_finished");
++                    if (iris26935Relay == null) scheduleMotion26598DeferredShutterReplay("batch_finished");
++                    else {
++                        mMotion26598DeferredShutter.set(false);
++                        Log.i(TAG, "IRIS_26935_NO_POST_LKR_DEFERRED_SHUTTER_REPLAY");
++                    }
+                 }
+             }
+         });
++        } catch (java.util.concurrent.RejectedExecutionException dispatchError) {
++            if (iris26935Relay == null) throw dispatchError;
++            mMotion26486InFlightBatches.decrementAndGet();
++            iris26935Relay.onProcessingError("LKR processing worker rejected the batch");
++            Log.e(TAG, "IRIS_26935_EXECUTOR_REJECTED_RELEASED", dispatchError);
++        }
+     }
+ 
+     private void captureStillPicture() {
+         final CameraMode iris26555Mode = PhotonCamera.getSettings().selectedMode;
++        /* IRIS_26935_NO_DEFERRED_DOUBLE_CAPTURE: never enqueue or replay another
++         * Motion shutter while the immutable B/SR-ON 15-RAW JPEG is being made. */
++        if (Iris26935BOnSession.isActive()) {
++            Log.w(TAG, "IRIS_26935_SHUTTER_REJECT_B_ON_LKR_ACTIVE deferred=false");
++            return;
++        }
+         if (!mIris26555RawStreamAvailable
+                 && (iris26555Mode == CameraMode.MOTION || iris26555Mode == CameraMode.NIGHT)) {
+             Log.w(TAG, "IRIS_26555_RAW_MODE_UNAVAILABLE_INTERNAL mode=" + iris26555Mode
+                     + " captureRejected=true");
+             iris26679RejectShutter("RAW_MODE_UNAVAILABLE_INTERNAL",
+                     "RAW capture is not supported by this camera");
++            return;
++        }
++        if (iris26555Mode == CameraMode.MOTION
++                && mZslCapturing && mIris26935BOnAcquisition) {
++            Log.i(TAG, "IRIS_26935_B_ON_ACQUISITION_SHUTTER_REJECT noDeferredReplay=true");
+             return;
+         }
+         if (iris26555Mode == CameraMode.MOTION
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26935BOnProcessingRelay.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26935BOnProcessingRelay.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4104197c237f21b95826ac4e9bd3aafcc5c02bb3
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26935BOnProcessingRelay.java
+@@ -0,0 +1,86 @@
++package com.particlesdevs.photoncamera.capture;
++
++import com.particlesdevs.photoncamera.processing.ProcessingEventsListener;
++import com.particlesdevs.photoncamera.util.Log;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.Locale;
++
++/** Only the frozen B/SR-ON ImageSaver receives this per-shot listener. */
++public final class Iris26935BOnProcessingRelay implements ProcessingEventsListener {
++    private final ProcessingEventsListener delegate;
++    private final long token;
++    private final boolean expectedHeic;
++    private boolean published;
++    private boolean terminal;
++
++    public Iris26935BOnProcessingRelay(ProcessingEventsListener delegate) {
++        this(delegate, false);
++    }
++    public Iris26935BOnProcessingRelay(ProcessingEventsListener delegate, boolean heicAtShutter) {
++        if (delegate == null) throw new IllegalArgumentException("no processing listener");
++        this.delegate = delegate;
++        expectedHeic = heicAtShutter;
++        token = Iris26935BOnSession.arm();
++        Log.i("Iris26935Relay", "IRIS_26935_B_ON_ARM token=" + token
++                + " output=" + (expectedHeic ? "HEIC" : "JPEG")
++                + " immutable15RawLkr=true");
++    }
++    public long token() { return token; }
++
++    @Override public void onProcessingStarted(String name) {
++        Log.i("Iris26935Relay", "IRIS_26935_B_ON_PROCESS_START token=" + token
++                + " monoNs=" + System.nanoTime());
++        delegate.onProcessingStarted(name);
++    }
++    @Override public void onProcessingChanged(Object obj) { delegate.onProcessingChanged(obj); }
++    @Override public void notifyImageSavedStatus(boolean saved, Path path) {
++        // Preserve gallery, DNG, notification and media scan exactly as before.
++        delegate.notifyImageSavedStatus(saved, path);
++        if (!saved || path == null || published || terminal) return;
++        String filename = path.getFileName().toString().toLowerCase(Locale.ROOT);
++        final boolean expected = expectedHeic
++                ? (filename.endsWith(".heic") || filename.endsWith(".heif"))
++                : (filename.endsWith(".jpg") || filename.endsWith(".jpeg"));
++        if (!expected) return;
++        try {
++            if (!Files.isRegularFile(path) || Files.size(path) <= 0L) {
++                Log.w("Iris26935Relay", "IRIS_26935_JPEG_NOT_PUBLISHED token=" + token);
++                return;
++            }
++            published = true;
++            terminal = true;
++            Iris26935BOnSession.complete(token, true, "saved_output_file_verified");
++            Log.i("Iris26935Relay", "IRIS_26935_OUTPUT_PUBLICATION_SUCCESS token="
++                    + token + " monoNs=" + System.nanoTime());
++        } catch (Exception exception) {
++            Log.w("Iris26935Relay", "IRIS_26935_JPEG_FILE_VERIFICATION_FAILED token=" + token, exception);
++        }
++    }
++    @Override public void onProcessingFinished(Object obj) {
++        // HdrX may finish before other callbacks; Motion also sends a second
++        // terminal callback. Neither is a substitute for actual JPG publication.
++        if (!published && !terminal) {
++            Log.w("Iris26935Relay", "IRIS_26935_FINISHED_WITHOUT_OUTPUT token=" + token
++                    + " event=" + obj + " terminalReleaseDeferred=true");
++            return;
++        }
++        delegate.onProcessingFinished(obj);
++    }
++    @Override public void onProcessingError(Object error) {
++        if (terminal) return;
++        terminal = true;
++        // Let CameraFragment finish its failure UI path while shutter remains
++        // locked; only then publish the terminal release, even if UI throws.
++        try { delegate.onProcessingError(error); }
++        finally { Iris26935BOnSession.complete(token, false, "processing_exception"); }
++    }
++    /** Called from the immutable Motion batch executor's finally, not the UI thread. */
++    public void finishIfMissing() {
++        if (terminal) return;
++        terminal = true;
++        Log.w("Iris26935Relay", "IRIS_26935_TERMINAL_NO_OUTPUT token=" + token);
++        try { delegate.onProcessingFinished("B ON processing terminal without saved output"); }
++        finally { Iris26935BOnSession.complete(token, false, "terminal_without_output"); }
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26935BOnSession.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26935BOnSession.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3855a59644f3bd6b1ce43839d592a35d4da17477
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26935BOnSession.java
+@@ -0,0 +1,86 @@
++package com.particlesdevs.photoncamera.capture;
++
++import java.lang.ref.WeakReference;
++import java.util.ArrayList;
++import java.util.Iterator;
++
++/**
++ * IRIS_26935_B_ON_JPEG_PUBLICATION_GUARD.
++ * One immutable owner token per B/SR-ON LKR batch. This model has no Android or
++ * view references and survives CameraFragment recreation within the app process.
++ * Never infer success from onProcessingFinished: only the verified JPG write can
++ * publish success. Failure releases only when the processor is terminal.
++ */
++public final class Iris26935BOnSession {
++    public interface Listener { void onBOnSession(long token, boolean busy, String event); }
++    private static final Object LOCK = new Object();
++    private static final ArrayList<WeakReference<Listener>> listeners = new ArrayList<>();
++    private static long nextToken = 1L;
++    private static long activeToken;
++    private static boolean active;
++    private Iris26935BOnSession() { }
++
++    public static boolean isActive() {
++        synchronized (LOCK) { return active; }
++    }
++    public static long currentToken() {
++        synchronized (LOCK) { return active ? activeToken : 0L; }
++    }
++    public static long arm() {
++        final long token;
++        synchronized (LOCK) {
++            if (active) throw new IllegalStateException("26935 overlapping B ON JPEG guard");
++            token = nextToken++;
++            activeToken = token;
++            active = true;
++        }
++        notifyListeners(token, true, "ARM");
++        return token;
++    }
++    public static boolean complete(long token, boolean success, String event) {
++        synchronized (LOCK) {
++            if (!active || token != activeToken) return false;
++            active = false;
++        }
++        notifyListeners(token, false, (success ? "SAVED:" : "FAILED:") + event);
++        return true;
++    }
++    public static void subscribe(Listener listener) {
++        if (listener == null) return;
++        final long token;
++        final boolean busy;
++        synchronized (LOCK) {
++            for (Iterator<WeakReference<Listener>> it = listeners.iterator(); it.hasNext();) {
++                Listener existing = it.next().get();
++                if (existing == null || existing == listener) it.remove();
++            }
++            listeners.add(new WeakReference<>(listener));
++            token = activeToken;
++            busy = active;
++        }
++        listener.onBOnSession(token, busy, "SUBSCRIBE");
++    }
++    public static void unsubscribe(Listener listener) {
++        synchronized (LOCK) {
++            for (Iterator<WeakReference<Listener>> it = listeners.iterator(); it.hasNext();) {
++                Listener existing = it.next().get();
++                if (existing == null || existing == listener) it.remove();
++            }
++        }
++    }
++    private static void notifyListeners(long token, boolean busy, String event) {
++        ArrayList<Listener> snapshot = new ArrayList<>();
++        synchronized (LOCK) {
++            for (Iterator<WeakReference<Listener>> it = listeners.iterator(); it.hasNext();) {
++                Listener listener = it.next().get();
++                if (listener == null) it.remove(); else snapshot.add(listener);
++            }
++        }
++        for (Listener listener : snapshot) {
++            try { listener.onBOnSession(token, busy, event); }
++            catch (RuntimeException ignored) {
++                // A detached Activity must never stop the native JPEG owner.
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index 89db14c7ee2f1cd85e2a88c671c963fed9b56938..67874d94ff263e1770a86f4446f0f842482d54ca 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -182,6 +182,29 @@
+     private android.view.ViewTreeObserver.OnPreDrawListener iris26675ManualPreDrawListener = null;
+     public float displayAspectRatio;
+     private boolean iris26562DeferredForegroundReset = false;
++    /* IRIS_26935_CROSS_FRAGMENT_PROCESS_OWNER: no activity is retained by
++     * the processing relay. The current foreground view subscribes on resume. */
++    private final com.particlesdevs.photoncamera.capture.Iris26935BOnSession.Listener
++            mIris26935BOnListener = (token, busy, event) -> {
++        final CameraUIView view = mCameraUIView;
++        if (view == null || ("SUBSCRIBE".equals(event) && !busy)) return;
++        final Activity owner = activity;
++        if (owner == null) return;
++        owner.runOnUiThread(() -> {
++            if (!isAdded() || mCameraUIView != view) return;
++            // Reject queued terminal UI events from an older batch after a
++            // newer token has armed; the UI can never outrun processor state.
++            if (busy != com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive()) return;
++            if (busy && token != com.particlesdevs.photoncamera.capture.Iris26935BOnSession.currentToken()) return;
++            view.activateShutterButton(!busy);
++            if (!busy && (event.startsWith("FAILED:") || event.startsWith("SAVED:"))) {
++                view.setProcessingProgressBarIndeterminate(false);
++                view.lockUIForBurst(false);
++            }
++            Log.i(TAG, "IRIS_26935_B_ON_SHUTTER_UI token=" + token + " busy=" + busy
++                    + " event=" + event + " monoNs=" + System.nanoTime());
++        });
++    };
+     private HorizonIndicatorView mHorizonIndicatorView;
+ 
+     public CameraFragment() {
+@@ -481,6 +504,7 @@
+             endPlayer = MediaPlayer.create(activity,R.raw.sound_end);
+             cameraFragmentViewModel.updateGalleryThumb(null);
+         });
++        com.particlesdevs.photoncamera.capture.Iris26935BOnSession.subscribe(mIris26935BOnListener);
+         cameraFragmentViewModel.onResume();
+         auxButtonsViewModel.setAuxButtonListener(mCameraUIEventsListener);
+         if (mHorizonIndicatorView != null) {
+@@ -510,6 +534,7 @@
+ 
+     @Override
+     public void onPause() {
++        com.particlesdevs.photoncamera.capture.Iris26935BOnSession.unsubscribe(mIris26935BOnListener);
+         PhotonCamera.getGravity().unregister();
+         PhotonCamera.getGyro().unregister();
+         PhotonCamera.getSettings().saveID();
+@@ -1203,7 +1228,16 @@
+                 return;
+             }
+             mCameraUIView.setProcessingProgressBarIndeterminate(true);
+-            mCameraUIView.activateShutterButton(true);
++            /* After the physical RAW burst is handed off, the repeating preview
++             * and touch/focus may resume without opening the shutter. The frozen
++             * B/ON session remains sole shutter click owner until JPEG save. */
++            if (com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive()) {
++                mCameraUIView.lockUIForBurst(false);
++            }
++            /* B/SR ON may be rendering the original RawLens 15-RAW LKR;
++             * never reactivate its shutter merely because background work began. */
++            mCameraUIView.activateShutterButton(
++                    !com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive());
+             showNotification(processName);
+         }
+ 
+@@ -1222,9 +1256,13 @@
+         @Override
+         public void onProcessingFinished(Object obj) {
+             logD("onProcessingFinished: " + obj);
+-            mCameraUIView.setProcessingProgressBarIndeterminate(false);
+-            mCameraUIView.activateShutterButton(true);
+-            mCameraUIView.lockUIForBurst(false);
++            /* Duplicate HDRX/Motion terminal notifications are not JPEG success.
++             * In B/ON only the verified publish or terminal error releases. */
++            if (!com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive()) {
++                mCameraUIView.setProcessingProgressBarIndeterminate(false);
++                mCameraUIView.activateShutterButton(true);
++                mCameraUIView.lockUIForBurst(false);
++            }
+             if (PhotonCamera.getSettings().selectedMode != CameraMode.RAWVIDEO) {
+                 stopNotification();
+             }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+index 136916065b5027e01141e4fa6a6674db46bd2024..c03b85a1eb729629d53fceda8af5d534d5a70386 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+@@ -305,6 +305,15 @@
+     }
+ 
+     private void onTimerFinished() {
++        if (com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive()) {
++            /* A queued timer/accessibility click cannot become a deferred Motion shot. */
++            this.shutterButton.setHovered(false);
++            this.shutterButton.setActivated(false);
++            this.shutterButton.setClickable(false);
++            com.particlesdevs.photoncamera.util.Log.i("CameraUIController",
++                    "IRIS_26935_QUEUED_SHUTTER_REJECT_B_ON_LKR_ACTIVE");
++            return;
++        }
+         this.shutterButton.setHovered(false);
+         this.shutterButton.setActivated(false);
+         this.shutterButton.setClickable(false);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+index 29552d15853f3eb9fe28832c6807dc65f1b5a604..eb961b6bbbf16a7250e1f10e875d0a3452a49406 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+@@ -791,14 +791,28 @@
+         }
+     }
+ 
++    private boolean mIris26935ShutterGrey = false;
++
+     @Override
+     public void activateShutterButton(boolean status) {
+         this.mShutterButton.post(() -> {
+             boolean videoStyle = isVideoStyleMode();
+ 
+             applyVideoShutterStack(videoStyle);
+-            this.mShutterButton.setActivated(status);
+-            this.mShutterButton.setClickable(status);
++            final boolean iris26935Locked =
++                    com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive();
++            this.mShutterButton.setActivated(status && !iris26935Locked);
++            this.mShutterButton.setClickable(status && !iris26935Locked);
++            /* Only the B/ON JPEG guard owns grey alpha and enabled=false;
++             * restore that ownership when its verified terminal event arrives. */
++            if (iris26935Locked) {
++                this.mShutterButton.setEnabled(false);
++                this.mShutterButton.setAlpha(0.38f);
++            } else if (mIris26935ShutterGrey) {
++                this.mShutterButton.setEnabled(true);
++                this.mShutterButton.setAlpha(1.0f);
++            }
++            mIris26935ShutterGrey = iris26935Locked;
+ 
+             /*
+              * In Video and RAW Video, keep the progress overlay hidden
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+index 47e3d9621fbc4587e89dabd17829448550e2ee96..aed6a1abcf2ee654dcc01702e05672815015ef7b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+@@ -70,6 +70,15 @@
+     private boolean mIris26872LoggedFirstValid = false;
+     private int mIris26872ProbePosition = -1;
+     private int mIris26872ProbeSampler = -1;
++    /* IRIS_26935_LKR_READBACK_BUDGET: only measured B/ON contention
++     * permits a bounded skip. Never guess a sample/exposure timestamp. */
++    private int mIris26935ProbeSkipBudget;
++    private int mIris26935SlowReadbackEvents;
++    private long mIris26935LastProbeWaitNs;
++    private boolean mIris26935LastBusy;
++    private long mIris26935LastFrameNs;
++    private long mIris26935LastMeasuredTimestamp;
++    private int mIris26935FrameCount;
+ 
+     private final GLPreview mView;
+ 
+@@ -118,8 +127,53 @@
+                 mIris26663LastConfirmedProtectionEv = 0.0f;
+             }
+         }
++        final boolean iris26935Busy = iris26872Eligible
++                && com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive();
++        if (iris26935Busy != mIris26935LastBusy) {
++            mIris26935LastBusy = iris26935Busy;
++            mIris26935ProbeSkipBudget = 0;
++            mIris26935LastProbeWaitNs = 0L;
++            mIris26935LastFrameNs = 0L;
++            Log.i("MainRenderer", "IRIS_26935_PREVIEW_B_ON_LKR busy=" + iris26935Busy);
++        }
+         if (iris26872Eligible && iris26553FrameTimestamp > 0L) {
+-            iris26872Probe(iris26553FrameTimestamp);
++            /* Read every frame unless a real preceding readback stalled. During
++             * a slow LKR interval skip at most two probe frames, always keep
++             * exact Camera2 exposure/flicker result lookups below untouched. */
++            final boolean iris26935LowLightEvidence = iris26872Controller.iris26911DarkPreviewEvidence();
++            /* Never coalesce a frame while stripe compensation is active.
++             * Full-rate synchronized probe remains mandatory under detected flicker. */
++            final boolean iris26935StripeInactive = mIris26872Stripe.params()[3] <= 0.0f;
++            final boolean iris26935Skip = iris26935Busy && !iris26935LowLightEvidence
++                    && iris26935StripeInactive && mIris26935ProbeSkipBudget > 0;
++            if (iris26935Skip) {
++                mIris26935ProbeSkipBudget--;
++            } else {
++                long iris26935Start = System.nanoTime();
++                iris26872Probe(iris26553FrameTimestamp);
++                mIris26935LastMeasuredTimestamp = iris26553FrameTimestamp;
++                long iris26935Elapsed = System.nanoTime() - iris26935Start;
++                if (iris26935Busy && !iris26935LowLightEvidence && iris26935StripeInactive
++                        && !mIris26872ProbeDisabled && iris26935Elapsed > 12_000_000L) {
++                    mIris26935ProbeSkipBudget = iris26935Elapsed > 32_000_000L ? 2 : 1;
++                    mIris26935SlowReadbackEvents++;
++                    if (mIris26935SlowReadbackEvents == 1 || mIris26935SlowReadbackEvents % 120 == 0) {
++                        Log.i("MainRenderer", "IRIS_26935_PREVIEW_PROBE_WALL_WAIT_NS="
++                                + iris26935Elapsed + " skipBound=" + mIris26935ProbeSkipBudget
++                                + " sampleTimestamp=" + iris26553FrameTimestamp);
++                    }
++                }
++                mIris26935LastProbeWaitNs = iris26935Elapsed;
++            }
++            mIris26935FrameCount++;
++            if (iris26935Busy && mIris26935FrameCount % 120 == 0) {
++                long frameDelta = mIris26935LastFrameNs > 0L
++                        ? System.nanoTime() - mIris26935LastFrameNs : 0L;
++                Log.i("MainRenderer", "IRIS_26935_PREVIEW_FRAME_TRACE timestamp="
++                        + iris26553FrameTimestamp + " probeWallWaitNs="
++                        + mIris26935LastProbeWaitNs + " renderDeltaNs=" + frameDelta);
++            }
++            mIris26935LastFrameNs = System.nanoTime();
+             mIris26911Preview.resolve(iris26553FrameTimestamp,
+                     iris26872Controller::iris26911PreviewStage,
+                     iris26872Controller.iris26911DarkPreviewEvidence(),
+@@ -134,8 +188,16 @@
+             }
+         }
+         float[] iris26872Stripe = mIris26872Stripe.params();
++        /* A missed GPU probe cannot apply prior-frame stripe phase to the
++         * new frame: neutral strength, not stale anti-stripe/exposure evidence. */
++        final boolean iris26935UnmeasuredFrame = iris26935Busy
++                && mIris26935LastProbeWaitNs > 12_000_000L
++                && mIris26935ProbeSkipBudget >= 0
++                && iris26553FrameTimestamp > 0L
++                && iris26553FrameTimestamp != mIris26935LastMeasuredTimestamp;
+         GLES20.glUniform4f(mIris26872StripeUniform, iris26872Stripe[0], iris26872Stripe[1],
+-                iris26872Stripe[2], iris26872Eligible ? iris26872Stripe[3] : 0f);
++                iris26872Stripe[2], iris26872Eligible && !iris26935UnmeasuredFrame
++                        ? iris26872Stripe[3] : 0f);
+         GLES20.glUniformMatrix4fv(uTexRotateMatrix, 1, false, mTexRotateMatrix, 0);
+         GLES20.glUniform1i(enablePeak, PhotonCamera.getSettings().focusPeak);
+         GLES20.glUniform1i(mirror, mMirrorPreview ? 1 : 0);
+diff --git a/app/version.properties b/app/version.properties
+index a246f8ca56a7266dd2eefe68cf683dcedd0e913e..283dae7734d8b6474dff08fbdabd06afaf36e925 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726934
+-VERSION_BUILD=26934
++VERSION_NAME=0.9726935
++VERSION_BUILD=26935
