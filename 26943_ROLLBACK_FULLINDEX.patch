@@ -1,0 +1,1330 @@
+diff --git a/app/src/main/cpp/CMakeLists.txt b/app/src/main/cpp/CMakeLists.txt
+index 4040f7e705b3081b1ba55cd1d00009625921189e..7cab377bb0e560b461b0f234f0ca210efb55c3f7 100644
+--- a/app/src/main/cpp/CMakeLists.txt
++++ b/app/src/main/cpp/CMakeLists.txt
+@@ -588,8 +588,6 @@ add_library(iris26864-native STATIC
+     "${IRIS26864_CPP_ROOT}/Iris26864NativeBridgeShaders.cpp"
+     "${IRIS26864_CPP_ROOT}/Iris26864RealRawrCoordinator.cpp"
+     "${IRIS26864_CPP_ROOT}/Iris26864TwoSlotRaw16Uploader.cpp"
+-    "${IRIS26864_CPP_ROOT}/Iris26943RawAhbIngress.cpp"
+-    "${IRIS26864_CPP_ROOT}/Iris26943GpuZslRing.cpp"
+     "${IRIS26864_CPP_ROOT}/Iris26864FrozenDirectRawrRunner.cpp"
+     "${IRIS26864_CPP_ROOT}/Iris26864VulkanBufferArena.cpp"
+     "${IRIS26864_CPP_ROOT}/Iris26864VulkanImageArena.cpp"
+diff --git a/app/src/main/cpp/iris26856/amaze/include/amaze/VulkanDeviceOwner.hpp b/app/src/main/cpp/iris26856/amaze/include/amaze/VulkanDeviceOwner.hpp
+index 4be6c85cddf6f3e159b1cecf27751090512cd8a6..c55fd117e8e2623356dba4e8d719b995e29ea685 100644
+--- a/app/src/main/cpp/iris26856/amaze/include/amaze/VulkanDeviceOwner.hpp
++++ b/app/src/main/cpp/iris26856/amaze/include/amaze/VulkanDeviceOwner.hpp
+@@ -8,20 +8,17 @@ namespace amaze {
+ // Do not destroy until every GPU submission and imported AHB has settled.
+ class VulkanDeviceOwner final {
+ public:
+-    explicit VulkanDeviceOwner(bool photoBOffTwoQueue = false);
++    VulkanDeviceOwner();
+     ~VulkanDeviceOwner();
+     VulkanDeviceOwner(const VulkanDeviceOwner&) = delete;
+     VulkanDeviceOwner& operator=(const VulkanDeviceOwner&) = delete;
+     VulkanContext context() const noexcept;
+     VkQueue queue() const noexcept { return queue_; }
+-    VkQueue ingressQueue() const noexcept { return ingressQueue_ ? ingressQueue_ : queue_; }
+-    bool hasSeparateIngressQueue() const noexcept { return ingressQueue_ && ingressQueue_ != queue_; }
+ private:
+     VkInstance instance_ = VK_NULL_HANDLE;
+     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
+     VkDevice device_ = VK_NULL_HANDLE;
+     VkQueue queue_ = VK_NULL_HANDLE;
+-    VkQueue ingressQueue_ = VK_NULL_HANDLE;
+     uint32_t family_ = UINT32_MAX;
+ };
+ }  // namespace amaze
+diff --git a/app/src/main/cpp/iris26856/amaze/src/VulkanDeviceOwner.cpp b/app/src/main/cpp/iris26856/amaze/src/VulkanDeviceOwner.cpp
+index 0a13e2f990702e544c42294b6ede550c1c551882..aaf4fba5b15472eda654d7fd020067a45004d6b9 100644
+--- a/app/src/main/cpp/iris26856/amaze/src/VulkanDeviceOwner.cpp
++++ b/app/src/main/cpp/iris26856/amaze/src/VulkanDeviceOwner.cpp
+@@ -17,7 +17,7 @@ bool containsExtension(const std::vector<VkExtensionProperties>& all, const char
+     });
+ }
+ }
+-VulkanDeviceOwner::VulkanDeviceOwner(bool photoBOffTwoQueue) {
++VulkanDeviceOwner::VulkanDeviceOwner() {
+     try {
+         VkApplicationInfo app{};
+         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+@@ -57,18 +57,12 @@ VulkanDeviceOwner::VulkanDeviceOwner(bool photoBOffTwoQueue) {
+             vkGetPhysicalDeviceQueueFamilyProperties(p, &fc, families.data());
+             for (uint32_t i = 0; i < fc; ++i) {
+                 if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) == 0 || families[i].queueCount == 0) continue;
+-                // IRIS_26943: RAWR's same-family queue separation, ONLY for
+-                // the Photo B HDR+ owned device. All other callers request
+-                // the exact original single queue. Both priorities are NORMAL:
+-                // upstream found that LOW global-priority still queues could
+-                // freeze some Adreno viewfinders.
+-                const bool twoQueues = photoBOffTwoQueue && families[i].queueCount >= 2;
+-                const float priorities[2] = {1.0f, 1.0f};
++                float priority = 1.0f;
+                 VkDeviceQueueCreateInfo q{};
+                 q.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+                 q.queueFamilyIndex = i;
+-                q.queueCount = twoQueues ? 2u : 1u;
+-                q.pQueuePriorities = priorities;
++                q.queueCount = 1;
++                q.pQueuePriorities = &priority;
+                 VkDeviceCreateInfo d{};
+                 d.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+                 d.queueCreateInfoCount = 1;
+@@ -83,15 +77,7 @@ VulkanDeviceOwner::VulkanDeviceOwner(bool photoBOffTwoQueue) {
+                 physical_ = p;
+                 device_ = dev;
+                 family_ = i;
+-                if (twoQueues) {
+-                    // Queue zero ingests live RAW; queue one processes frozen
+-                    // bursts. An explicit binary semaphore bridges them.
+-                    ingressQueue_ = queue;
+-                    vkGetDeviceQueue(dev, i, 1u, &queue_);
+-                    if (!queue_) queue_ = queue;
+-                } else {
+-                    queue_ = queue;
+-                }
++                queue_ = queue;
+                 return;
+             }
+         }
+diff --git a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+index b37415e457abe4bffe5a43513cf946b1f17d6059..9927b275df66246fc7f3522d9c0522f2d62899d3 100644
+--- a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+@@ -19,7 +19,6 @@ struct Iris26920Arm {
+ };
+ thread_local Iris26920Arm iris26920Arm{};
+ thread_local std::string iris26920Report="NOT_EXECUTED";
+-thread_local std::string iris26943LastTimings;
+ struct Iris26923NoiseReceipt { bool ready=false, custom=false; std::uint32_t count=0; std::array<float,8> phase{}; };
+ thread_local Iris26923NoiseReceipt iris26923Noise{};
+ } // namespace
+@@ -57,16 +56,12 @@ void runRealRawrFromFrozenDirectNormals(
+     }
+     iris26920Report = iris26920Enabled ? "ON_EXECUTION_PENDING" : "OFF_BASELINE_WRONSKI";
+     iris26923Noise = {};
+-    iris26943LastTimings.clear();
+     // IRIS_26873_B_RESIDENT_INPUT_OWNER. One capture scoped owner, not a
+     // second camera ZSL ring, not a new JNI/GL/Vulkan context.
+     // RAWR Wronski 2x intentionally remains exactly inherited two-slot.
+     const bool hdrq=request.algorithm==RealBEngine::HdrPlusFrequency;
+-    const bool alreadyStaged=hdrq && !request.preStagedGpu.empty();
+-    if(alreadyStaged && (request.preStagedGpu.size()!=request.normals.size() || !bOffReusable))
+-        throw std::invalid_argument("26943 incomplete GPU ring or invalid B-only owner");
+     const uint64_t rawBytes=uint64_t(request.width)*request.height*2u;
+-    bool residentEligible=!alreadyStaged && hdrq && request.normals.size()<=30u;
++    bool residentEligible=hdrq && request.normals.size()<=30u;
+     if(residentEligible) {
+         VkPhysicalDeviceMemoryProperties mem{};
+         vkGetPhysicalDeviceMemoryProperties(request.physical,&mem);
+@@ -97,15 +92,14 @@ void runRealRawrFromFrozenDirectNormals(
+                 "B_RESIDENT_ALLOC_FALLBACK normals=%zu why=%s",request.normals.size(),e.what());
+         }
+     }
+-    if(!alreadyStaged && !inputs) inputs.reset(new TwoSlotRaw16Uploader(request.physical,request.device,
++    if(!inputs) inputs.reset(new TwoSlotRaw16Uploader(request.physical,request.device,
+         inheritedUploads,request.width,request.height));
+-    const auto ref=inputs ? inputs->referenceImage() : TransientImageView{};
+-    const auto companion=inputs ? inputs->companionImage() : TransientImageView{};
++    const auto ref=inputs->referenceImage();
++    const auto companion=inputs->companionImage();
+     RealRawrRunRequest merge{};
+     merge.physical=request.physical;
+     merge.device=request.device;
+     merge.inheritedQueue=request.inheritedQueue;
+-    merge.initialWaitSemaphore=request.initialWaitSemaphore;
+     merge.queueFamily=request.queueFamily;
+     merge.width=request.width;merge.height=request.height;
+     merge.effectiveCfa=request.localCfa;
+@@ -118,7 +112,7 @@ void runRealRawrFromFrozenDirectNormals(
+     }
+     merge.bOffNoiseByPhase=request.bOffNoiseByPhase;
+     merge.hasBOffCustomNoise=request.hasBOffCustomNoise;
+-    merge.inputLayout=(resident||alreadyStaged)?FrozenRawInputLayout::CaptureResident:FrozenRawInputLayout::FencedTwoSlot;
++    merge.inputLayout=resident?FrozenRawInputLayout::CaptureResident:FrozenRawInputLayout::FencedTwoSlot;
+     std::vector<Raw16PlaneBorrow> raw;
+     raw.reserve(request.normals.size());
+     merge.normals.reserve(request.normals.size());
+@@ -129,9 +123,8 @@ void runRealRawrFromFrozenDirectNormals(
+            !std::isfinite(f.exposureProduct)||f.exposureProduct<=0.f||
+            !std::isfinite(f.whiteLevel)||f.whiteLevel<=0.f)
+             throw std::invalid_argument("26864 B frozen normal bytes/lens/exposure invalid");
+-        const auto gpu=alreadyStaged?request.preStagedGpu[i]:
+-            (resident?inputs->imageAt(uint32_t(i)):
+-            ((i==request.referenceIndex)?ref:companion));
++        const auto gpu=resident?inputs->imageAt(uint32_t(i)):
++            ((i==request.referenceIndex)?ref:companion);
+         RealRawrNormal frame{};
+         frame.borrowedRaw.ref.frameId=i+1u;
+         frame.borrowedRaw.ref.timestampNs=f.borrowed.timestamp;
+@@ -153,9 +146,7 @@ void runRealRawrFromFrozenDirectNormals(
+     const auto uploadBegin=now();
+     uint32_t uploadCalls=0;
+     double uploadMs=0.0;
+-    if(alreadyStaged) {
+-        merge.prepareNormal=[](std::uint32_t){};
+-    } else if(resident) {
++    if(resident) {
+         try {
+             // Every frozen direct RAW16 buffer remains borrowed until all
+             // uploads are individually fence-complete. No post-shutter frame
+@@ -168,7 +159,7 @@ void runRealRawrFromFrozenDirectNormals(
+             }
+         } catch(...) {
+             const VkResult idle=vkQueueWaitIdle(request.inheritedQueue);
+-            if(idle!=VK_SUCCESS && inputs) inputs->quarantineUnresolved();
++            if(idle!=VK_SUCCESS) inputs->quarantineUnresolved();
+             throw; // fence uncertainty: no silent alternate capture
+         }
+         merge.prepareNormal=[](std::uint32_t){}; // 4 passes reuse pinned views
+@@ -193,39 +184,6 @@ void runRealRawrFromFrozenDirectNormals(
+     auto wrappedConsume=[&](const rawr::raw_gpu_pipeline::BurstRunResult& result,
+                            const RealRawrRunRequest& frozen){
+         enteredConsumer=true;
+-        if (hdrq) {
+-            const auto& t=result.timings;
+-            std::ostringstream timing;
+-            timing.setf(std::ios::fixed); timing.precision(1);
+-            // Same RAWR `MultiframeStageTimings` boundaries; no Camera2
+-            // capture, queue, JPEG encode or disk I/O included in subtotal.
+-            timing << "Multiframe: " << t.totalMs << " ms\n"
+-                   << "- Initialization: " << t.initializeMs << " ms\n"
+-                   << "- Noise estimation: " << t.noiseEstimateMs << " ms\n"
+-                   << "- Reference prepare: " << t.referencePrepareMs << " ms\n"
+-                   << "- Reference statistics: " << t.referenceStatsMs << " ms\n"
+-                   << "- Companion prepare: " << t.companionPrepareMs << " ms\n"
+-                   << "- Alignment: " << t.alignmentMs << " ms\n"
+-                   << "- Kernel statistics: " << t.kernelStatsMs << " ms\n"
+-                   << "- Robustness: " << t.robustnessMs << " ms\n"
+-                   << "- Frequency accumulation: " << t.accumulationMs << " ms\n"
+-                   << "- Finalize: " << t.finalizeMs << " ms\n"
+-                   << "- GPU execution: " << t.chunkGpuMs << " ms\n"
+-                   << "- GPU fence waits (includes execution): " << t.chunkWaitMs << " ms\n"
+-                   << "- Host recording: " << t.chunkRecordMs << " ms\n"
+-                   << "- Queue submit: " << t.chunkSubmitMs << " ms\n"
+-                   << "- GPU submissions: " << t.chunkCount << "\n"
+-                   << "- RAW input route: " << (alreadyStaged?"pre_shutter_gpu_ring":
+-                                                  (resident?"post_shutter_resident":"two_slot")) << "\n"
+-                   << "- RAW post-shutter upload calls: " << uploadCalls << "\n"
+-                   << "- RAW post-shutter upload wall: " << uploadMs << " ms\n"
+-                   << "(Stage timings follow RAWR definitions; fusion wall includes host work. "
+-                   << "Shutter, capture, JPEG encoding and file write excluded.)";
+-            iris26943LastTimings=timing.str();
+-            __android_log_print(ANDROID_LOG_INFO,"Iris26943","RAW_RAWR_EQUIVALENT_TIMING frame=%llu gpu=%.1f wait=%.1f chunk=%u",
+-                 static_cast<unsigned long long>(frozen.normals[frozen.referenceIndex].timestampNs),
+-                 t.chunkGpuMs,t.chunkWaitMs,t.chunkCount);
+-        }
+         originalMergeUploads=uploadCalls;
+         originalMergeUploadMs=uploadMs;
+         if (request.algorithm == RealBEngine::WronskiTrue2x) {
+@@ -287,7 +245,7 @@ void runRealRawrFromFrozenDirectNormals(
+                 why.find("multiframe arena: create image")!=std::string::npos||
+                 why.find("multiframe host buffer memory")!=std::string::npos||
+                 why.find("std::bad_alloc")!=std::string::npos;
+-            if(alreadyStaged||!resident||enteredConsumer||!allocationFailure)
++            if(!resident||enteredConsumer||!allocationFailure)
+                 throw;
+             if(vkQueueWaitIdle(request.inheritedQueue)!=VK_SUCCESS) {
+                 inputs->quarantineUnresolved();
+@@ -323,8 +281,8 @@ void runRealRawrFromFrozenDirectNormals(
+         const double uploadWallMs=std::chrono::duration<double,std::milli>(now()-uploadBegin).count();
+         __android_log_print(ANDROID_LOG_INFO,"Iris26873",
+             "B_GPU_INPUT mode=%s normals=%zu uploads=%u expected=%zu upload_ms=%.2f total_span_ms=%.2f retry=%d frame_drop=0",
+-            alreadyStaged?"pre_shutter_gpu_ring":(resident?"resident":"two_slot"),raw.size(),originalMergeUploads,
+-            alreadyStaged?0u:(resident?raw.size():(size_t(1)+4u*(raw.size()-1u))),originalMergeUploadMs,uploadWallMs,
++            resident?"resident":"two_slot",raw.size(),originalMergeUploads,
++            resident?raw.size():(size_t(1)+4u*(raw.size()-1u)),originalMergeUploadMs,uploadWallMs,
+             arenaRetry?1:0);
+         // Separate minimal sidecar receipt; never misattribute extra RAW
+         // transfers to original HDR+ merge or frame-count degradation.
+@@ -343,7 +301,7 @@ void runRealRawrFromFrozenDirectNormals(
+         // Every upstream chunk and upload uses a waited fence. Retain GPU
+         // input allocations if the queue entered an unresolved state.
+         const VkResult idle=vkQueueWaitIdle(request.inheritedQueue);
+-        if(idle!=VK_SUCCESS && inputs) inputs->quarantineUnresolved();
++        if(idle!=VK_SUCCESS) inputs->quarantineUnresolved();
+         throw;
+     }
+ }
+@@ -412,11 +370,3 @@ Java_com_hinnka_mycamera_processor_Iris26920NativeProbe_nativeTakeLastNoise(
+     if (out) env->SetFloatArrayRegion(out,0,10,values);
+     return out;
+ }
+-
+-extern "C" JNIEXPORT jstring JNICALL
+-Java_com_hinnka_mycamera_processor_GlesIris26864NativeRawr_nativeTakeLastTimings(
+-    JNIEnv* env,jclass) {
+-    const auto receipt=iris26864::iris26943LastTimings;
+-    iris26864::iris26943LastTimings.clear();
+-    return env->NewStringUTF(receipt.c_str());
+-}
+diff --git a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.hpp b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.hpp
+index ea5b8184d5ddff50df75f66de9650b11dea83ad8..80044a0b0f01a6268577d1e4d3c9f40c16eed508 100644
+--- a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.hpp
++++ b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.hpp
+@@ -25,8 +25,6 @@ struct FrozenDirectBRequest final {
+     std::array<float,8> bOffNoiseByPhase{};
+     bool hasBOffCustomNoise=false;
+     std::vector<FrozenDirectNormal> normals;
+-    std::vector<TransientImageView> preStagedGpu; // all frozen timestamps matched or empty
+-    VkSemaphore initialWaitSemaphore=VK_NULL_HANDLE;
+ };
+ // The caller's original SafeImage ByteBuffer owners stay live through this
+ // synchronous call. JNI must not free the source between stage and GPU fence.
+diff --git a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+index baa21bdfa3bff5964dba4d2a709cb8dde309507f..65e1ba766b61b49fd200d40b587b8513384cc321 100644
+--- a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
++++ b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+@@ -2,13 +2,6 @@
+ // This is included by the exact successful 26863 AMaZE JNI implementation,
+ // preserving its existing GL/AHB/fence helpers and original JNI entry point.
+ #include "Iris26864FrozenDirectRawrRunner.hpp"
+-#include "Iris26943GpuZslRing.hpp"
+-#include <android/hardware_buffer_jni.h>
+-#include <deque>
+-#include <thread>
+-#include <condition_variable>
+-#include <chrono>
+-#include <unistd.h>
+ #include "Iris26864NativeBridgeShaders.hpp"
+ #include "bridge/Iris26864HdrqCanonicalGpuBridge.hpp"
+ #include "bridge/Iris26887BOffRawPhaseDiversity.hpp"
+@@ -127,18 +120,15 @@ struct Iris26940BOffGpuCache final {
+     std::mutex mutex;
+     std::unique_ptr<amaze::VulkanDeviceOwner> device;
+     std::unique_ptr<rawr::raw_gpu_pipeline::AndroidBurstCoordinator> coordinator;
+-    std::unique_ptr<iris26864::Iris26943GpuZslRing> ring;
+     uint64_t lens = 0;
+     uint32_t width = 0, height = 0, localCfa = 0;
+     void clear() noexcept {
+-        if (device && vkDeviceWaitIdle(device->context().device) != VK_SUCCESS) {
++        if (device && vkQueueWaitIdle(device->queue()) != VK_SUCCESS) {
+             // Unresolved GPU commands: never free potentially live buffers.
+             (void)coordinator.release();
+-            (void)ring.release();
+             (void)device.release();
+         } else {
+             coordinator.reset();
+-            ring.reset();
+             device.reset();
+         }
+         lens = 0;
+@@ -150,15 +140,9 @@ struct Iris26940BOffGpuCache final {
+     }
+     void select(uint64_t wantedLens, uint32_t w, uint32_t h, uint32_t cfa) {
+         if (device && coordinator && lens == wantedLens &&
+-            width == w && height == h) {
+-            // Ring owns only sensor RAW16, never a CFA-dependent kernel.
+-            // A later shutter may discover exact crop parity without
+-            // invalidating already uploaded same-lens RAW pixels.
+-            localCfa = cfa;
+-            return;
+-        }
++            width == w && height == h && localCfa == cfa) return;
+         clear(); // camera/lens/geometry changes never inherit stale handles.
+-        device = std::make_unique<amaze::VulkanDeviceOwner>(true);
++        device = std::make_unique<amaze::VulkanDeviceOwner>();
+         coordinator = std::make_unique<rawr::raw_gpu_pipeline::AndroidBurstCoordinator>();
+         lens = wantedLens;
+         width = w;
+@@ -170,104 +154,6 @@ Iris26940BOffGpuCache& iris26940BOffCache() {
+     static Iris26940BOffGpuCache cache;
+     return cache;
+ }
+-
+-// IRIS_26943_BACKGROUND_GPU_RAW_INGRESS: do no GPU/Vulkan call, fence
+-// wait, heap allocation, or camera Image pinning on the RAW callback.
+-// Every AHB and sync fd is retained before enqueue returns. The existing
+-// Camera2 ZSL / NORMAL burst is wholly independent of this optional worker.
+-struct Iris26943IngressWorker final {
+-    struct Job {
+-        AHardwareBuffer* ahb = nullptr;
+-        int fd = -1;
+-        uint64_t timestamp = 0, lens = 0, generation = 0;
+-        uint32_t width = 0, height = 0;
+-        ~Job() { if (fd >= 0) ::close(fd); if (ahb) AHardwareBuffer_release(ahb); }
+-        Job() = default;
+-        Job(const Job&) = delete;
+-        Job& operator=(const Job&) = delete;
+-        Job(Job&& x) noexcept : ahb(x.ahb),fd(x.fd),timestamp(x.timestamp),lens(x.lens),
+-          generation(x.generation),width(x.width),height(x.height) { x.ahb=nullptr;x.fd=-1; }
+-    };
+-    std::mutex mutex;
+-    std::condition_variable wake;
+-    std::deque<Job> pending;
+-    bool stopping=false;
+-    std::thread thread;
+-    Iris26943IngressWorker() : thread([this]{ run(); }) {}
+-    ~Iris26943IngressWorker() {
+-        { std::lock_guard<std::mutex> lock(mutex); stopping=true;pending.clear(); }
+-        wake.notify_all();
+-        if (thread.joinable()) thread.join();
+-    }
+-    bool enqueue(AHardwareBuffer* ahb, int fd, uint64_t ts, uint64_t lens,
+-                 uint64_t gen, uint32_t w, uint32_t h) {
+-        if (!ahb || !ts || !lens || !gen || w<32u || h<32u) return false;
+-        // AHB_acquire does not block the camera's producer and pins its data.
+-        // Never retain a Camera2 Image or its ImageReader slot.
+-        std::lock_guard<std::mutex> lock(mutex);
+-        if (stopping || pending.size()>=3u) return false;
+-        const int ownedFd = fd<0 ? -1 : ::dup(fd);
+-        if (fd>=0 && ownedFd<0) return false;
+-        AHardwareBuffer_acquire(ahb);
+-        Job j; j.ahb=ahb;j.fd=ownedFd;j.timestamp=ts;j.lens=lens;
+-        j.generation=gen;j.width=w;j.height=h;
+-        pending.emplace_back(std::move(j));
+-        wake.notify_one();
+-        return true;
+-    }
+-    void run() noexcept {
+-        for(;;){
+-            std::unique_ptr<Job> job;
+-            {
+-                std::unique_lock<std::mutex> lock(mutex);
+-                wake.wait(lock,[this]{return stopping || !pending.empty();});
+-                if (stopping) return;
+-                job=std::make_unique<Job>(std::move(pending.front()));
+-                pending.pop_front();
+-            }
+-            auto& cache=iris26940BOffCache();
+-            // No Vulkan activity can delay an active shutter/AMaZE. Optional
+-            // staging is dropped immediately if the exclusive B GPU is busy.
+-            std::unique_lock<std::mutex> lock(cache.mutex,std::try_to_lock);
+-            if(!lock.owns_lock()) continue;
+-            try {
+-                if(cache.device && (cache.lens!=job->lens || cache.width!=job->width ||
+-                                    cache.height!=job->height)) cache.clear();
+-                if (!cache.device) cache.select(job->lens,job->width,job->height,0);
+-                if(!cache.ring || cache.ring->generation()!=job->generation) {
+-                    // Never destroy an in-flight GPU resource: every ingress
+-                    // upload is fence-complete, but previous merge must also
+-                    // finish (same cache mutex; confirm full-device idle).
+-                    if(cache.ring && vkDeviceWaitIdle(cache.device->context().device)!=VK_SUCCESS)
+-                        throw std::runtime_error("26943 input-ring retirement fence unproven");
+-                    cache.ring.reset();
+-                    const uint64_t bytes=uint64_t(job->width)*job->height*2u;
+-                    VkPhysicalDeviceMemoryProperties mem{};
+-                    vkGetPhysicalDeviceMemoryProperties(cache.device->context().physicalDevice,&mem);
+-                    uint64_t largest=0;
+-                    for(uint32_t i=0;i<mem.memoryHeapCount;++i)
+-                        if(mem.memoryHeaps[i].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+-                            largest=std::max(largest,uint64_t(mem.memoryHeaps[i].size));
+-                    // Retain 1.5 GiB for HDRq scratch, GL preview and AMaZE.
+-                    constexpr uint32_t slots=18u;
+-                    if(largest < (1536ull<<20u) ||
+-                       bytes*slots > largest-(1536ull<<20u)) continue;
+-                    cache.ring=std::make_unique<iris26864::Iris26943GpuZslRing>(
+-                        *cache.device,job->width,job->height,slots,job->lens,job->generation);
+-                }
+-                cache.ring->stage(job->ahb,job->fd,job->timestamp,job->lens,job->generation);
+-            } catch(const std::exception& failure) {
+-                __android_log_print(ANDROID_LOG_WARN,"Iris26943",
+-                    "RAW_OPTIONAL_STAGE_FALLBACK reason=%s",failure.what());
+-                cache.clear(); // includes whole-device idle, conservative quarantine on failure
+-            }
+-        }
+-    }
+-};
+-Iris26943IngressWorker& iris26943IngressWorker(){
+-    static Iris26943IngressWorker state; return state;
+-}
+-
+ struct Iris26940CacheFailureGuard final {
+     Iris26940BOffGpuCache* cache;
+     int exceptionsAtEntry;
+@@ -422,26 +308,6 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+         f.whiteBalance={gainsVec[0],gainsVec[1],gainsVec[2]};
+         req.normals.push_back(f);
+     }
+-    // IRIS_26943 EXACT_ALL_SELECTED_READY_OR_ORIGINAL_FALLBACK. Snapshot
+-    // compares the immutable frozen normal timestamps, not the live ring's
+-    // chronological order. No partial or different-generation RAW frame.
+-    if(bOffCache && bOffCache->ring) {
+-        std::vector<uint64_t> selected;
+-        selected.reserve(req.normals.size());
+-        for(const auto& frame:req.normals) selected.push_back(frame.borrowed.timestamp);
+-        if(bOffCache->ring->select(selected,uint64_t(physicalLensIdentity),req.preStagedGpu)) {
+-            req.initialWaitSemaphore=bOffCache->ring->bridgeForMerge();
+-            __android_log_print(ANDROID_LOG_INFO,"Iris26943",
+-                "RAW_GPU_ZSL_HANDOFF exact=%zu ready=%u uploadCallsAfterShutter=0",
+-                req.preStagedGpu.size(),bOffCache->ring->readyCount());
+-        } else {
+-            // Release optional allocations before proven post-shutter fallback
+-            // so HDRq retains its 26942 scratch-memory budget.
+-            if(vkDeviceWaitIdle(ctx.device)!=VK_SUCCESS)
+-                throw std::runtime_error("26943 fallback GPU ring retirement failed");
+-            bOffCache->ring.reset();
+-        }
+-    }
+     // B OFF is independent of optional A DNG and uses ONLY original NORMAL
+     // sensor RAW16. Coarse seeds authorize NOTHING; every GPU tile and pixel
+     // must independently verify physical R/G/B support before color changes.
+@@ -1042,20 +908,3 @@ Java_com_hinnka_mycamera_processor_GlesIris26864NativeRawr_nativeExecuteGpu(
+         if(cl)env->ThrowNew(cl,error.what());
+     }
+ }
+-
+-// Camera Image.getHardwareBuffer() arrived on the callback; native must
+-// only retain AHB and enqueue. The callback never initializes Vulkan.
+-extern "C" JNIEXPORT jboolean JNICALL
+-Java_com_hinnka_mycamera_processor_GlesIris26864NativeRawr_nativeTryZslGpuStage(
+-    JNIEnv* env,jclass,jobject javaHardwareBuffer,jint fd,jlong timestamp,
+-    jlong lens,jlong generation,jint width,jint height) {
+-    if (!javaHardwareBuffer || fd < -1 || timestamp<=0 || lens==0 || generation<=0 ||
+-        width<32 || height<32 || width>8192 || height>8192) return JNI_FALSE;
+-    AHardwareBuffer* source=AHardwareBuffer_fromHardwareBuffer(env,javaHardwareBuffer);
+-    if (!source) return JNI_FALSE;
+-    AHardwareBuffer_Desc desc{}; AHardwareBuffer_describe(source,&desc);
+-    if (desc.width != uint32_t(width) || desc.height != uint32_t(height) ||
+-        desc.layers != 1u || desc.stride < uint32_t(width)) return JNI_FALSE;
+-    return iris26943IngressWorker().enqueue(source,fd,uint64_t(timestamp),uint64_t(lens),
+-        uint64_t(generation),uint32_t(width),uint32_t(height)) ? JNI_TRUE : JNI_FALSE;
+-}
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+index 6fc0034c4d663b4a4415f2764ac51333a2b271a7..f87fa556e469d1d1dd28e5d8422926e003eedab5 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+@@ -145,28 +145,8 @@ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
+     std::unique_ptr<AndroidBurstCoordinator> perCapture;
+     if (!bOffReusable) perCapture = std::make_unique<AndroidBurstCoordinator>();
+     AndroidBurstCoordinator* coordinator = bOffReusable ? bOffReusable : perCapture.get();
+-    // First merge command waits for the optional live-ingress queue's
+-    // release semaphore. No host GPU wait or extra preview submission.
+-    bool ingressPending=frozen.initialWaitSemaphore!=VK_NULL_HANDLE;
+-    auto inheritedSubmit=[queue=frozen.inheritedQueue,ingress=frozen.initialWaitSemaphore,
+-                          &ingressPending](const VkSubmitInfo& si,VkFence fence){
+-        if(ingressPending) {
+-            std::vector<VkSemaphore> sems;
+-            std::vector<VkPipelineStageFlags> stages;
+-            if (si.waitSemaphoreCount) {
+-                if (!si.pWaitSemaphores || !si.pWaitDstStageMask)
+-                    throw std::runtime_error("26943 invalid inherited Vulkan waits");
+-                sems.assign(si.pWaitSemaphores,si.pWaitSemaphores+si.waitSemaphoreCount);
+-                stages.assign(si.pWaitDstStageMask,si.pWaitDstStageMask+si.waitSemaphoreCount);
+-            }
+-            sems.push_back(ingress); stages.push_back(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+-            VkSubmitInfo bridged=si;
+-            bridged.waitSemaphoreCount=uint32_t(sems.size());
+-            bridged.pWaitSemaphores=sems.data();bridged.pWaitDstStageMask=stages.data();
+-            if(vkQueueSubmit(queue,1u,&bridged,fence)!=VK_SUCCESS)
+-                throw std::runtime_error("26943 RAW ingress/merge semaphore submit failed");
+-            ingressPending=false;
+-        } else if(vkQueueSubmit(queue,1u,&si,fence)!=VK_SUCCESS)
++    auto inheritedSubmit=[queue=frozen.inheritedQueue](const VkSubmitInfo& si,VkFence fence){
++        if(vkQueueSubmit(queue,1u,&si,fence)!=VK_SUCCESS)
+             throw std::runtime_error("26864 actual RAWR GPU queue submission failed");
+     };
+     // Only a borrowed, Photo B SR OFF coordinator may omit Wronski-only
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
+index 9eb6cbeda8636ae25ebe409f703db68efd1fcc29..80cb5c8cdb0f8efd1acb0a7b305302318f7bd4b6 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
+@@ -27,7 +27,6 @@ struct RealRawrRunRequest final {
+     VkPhysicalDevice physical=VK_NULL_HANDLE;
+     VkDevice device=VK_NULL_HANDLE;
+     VkQueue inheritedQueue=VK_NULL_HANDLE;
+-    VkSemaphore initialWaitSemaphore=VK_NULL_HANDLE; // only first B OFF merge submit
+     uint32_t queueFamily=0;
+     uint32_t width=0,height=0;
+     uint32_t effectiveCfa=0;
+diff --git a/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.hpp b/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.hpp
+index df6d58a110d0d9a195571c9dd7ac5183789889cc..24e70af6581b0a0672d91717a1b0de738b4e33f1 100644
+--- a/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.hpp
++++ b/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.hpp
+@@ -7,7 +7,6 @@
+ #include "amaze/CommandSubmissionOwner.hpp"
+ #include <cstdint>
+ #include <cstddef>
+-#include <android/hardware_buffer.h>
+ #include <memory>
+ #include <vector>
+ namespace iris26864 {
+@@ -29,9 +28,6 @@ public:
+     TransientImageView companionImage() const;
+     TransientImageView imageAt(uint32_t index) const;
+     void uploadInto(uint32_t index, uint32_t slot, const std::vector<Raw16PlaneBorrow>& frames);
+-    // Optional camera worker: direct AHB, GPU buffer, then CPU mapping.
+-    // Failed or unresolved submissions quarantine the destination arena.
+-    void uploadHardwareBufferInto(uint32_t slot, AHardwareBuffer* source, int cameraFenceFd, uint32_t queueFamily);
+     void upload(uint32_t index, uint32_t referenceIndex,
+                 const std::vector<Raw16PlaneBorrow>& frames);
+     // If a queue/fence failure prevents demonstrating completion, allow the
+diff --git a/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake b/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
+index bd55212984433a72bfc5016ae0b34546780f66ed..5f1cbf4e62a3d377cd908baf7220fbbf3db8230e 100644
+--- a/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
++++ b/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
+@@ -44,8 +44,6 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26888BOffVulkan
+     "${IRIS26887_VENDOR_SHADOW}/multiframe/pipeline/src/VulkanExecutor.cpp" COPYONLY)
+ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp"
+     "${IRIS26887_VENDOR_SHADOW}/multiframe/pipeline/include/rawr/raw_gpu_pipeline/HdrPlusRecorder.h" COPYONLY)
+-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26943BOffHdrqBorder.comp"
+-    "${IRIS26887_VENDOR_SHADOW}/multiframe/merge_hdrplus/shaders/hdrq_border.comp" COPYONLY)
+ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffHdrqMerge.comp"
+     "${IRIS26887_VENDOR_SHADOW}/multiframe/merge_hdrplus/shaders/hdrq_merge.comp" COPYONLY)
+ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp"
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+index 9d313e98ba3f9bdcac4ad8cf1104897230805f58..9405c32f1deef6aa3bb0f7047621966588aa56ac 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+@@ -8,9 +8,6 @@
+ #include <utility>
+ 
+ namespace rawr::raw_gpu_pipeline {
+-// From the existing successful 26941 B-only Vulkan owner. No global mode
+-// switch: thread-local scoped opt-in cannot leak into Night or SR ON.
+-extern thread_local bool iris26941BOffHdrqLazyPoolReset;
+ namespace {
+ namespace hp = rawr::raw_merge_hdrplus_gpu;
+ 
+@@ -362,9 +359,8 @@ struct MismatchPc {
+     float slopeRaw[4], offsetRaw[4], referenceBlack[4];
+     std::int32_t measuredNoise, uniformExposure;
+     float referenceWhite, gainForMask;
+-    std::int32_t motionEnabled;
+ };
+-static_assert(sizeof(MismatchPc) == 100u, "26943 B-only mismatch GLSL push ABI");
++static_assert(sizeof(MismatchPc) == 96u, "26888 B-only mismatch GLSL push ABI");
+ struct HighlightsPc {
+     std::int32_t tilesX, tilesY;
+     float exposureFactor, whiteLevel, blackLevelMean;
+@@ -408,9 +404,7 @@ struct BackwardPc {
+ struct BorderPc {
+     std::int32_t width, height;
+     float minValue;
+-    std::int32_t motionEnabled;
+ };
+-static_assert(sizeof(BorderPc)==16u,"26943 motion-aware border push ABI");
+ struct NormalizePc {
+     std::int32_t width, height, multiply;
+ };
+@@ -448,9 +442,6 @@ ScratchLayout makeHdrPlusFrequencyScratchLayout(const hp::FrequencyGeometry& f,
+     add("hdrq_final_ft", spectrum, PixelStorage::RGBA32Float, Lifetime::Output);
+     add("hdrq_rms", tiles, PixelStorage::RGBA32Float, Lifetime::Burst);
+     add("hdrq_mismatch", tiles, PixelStorage::R32Float, Lifetime::Companion);
+-    // One 8x8 tile's worst measured companion support, per pass. Reset to
+-    // one on reference, reduced by each aligned normal; no frame downgrade.
+-    add("hdrq_motion_min", tiles, PixelStorage::R32Float, Lifetime::Output);
+     add("hdrq_total_mismatch", tiles, PixelStorage::R32Float, Lifetime::Output);
+     add("hdrq_highlights", tiles, PixelStorage::R32Float, Lifetime::Companion);
+     add("hdrq_weight_sum", rgba, PixelStorage::R32Float, Lifetime::Output);
+@@ -596,11 +587,6 @@ void HdrPlusFrequencyRecorder::recordReference(VkCommandBuffer c, VkImageView ra
+     const VkClearColorValue zero{};
+     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+     vkCmdClearColorImage(c, arena_.image("hdrq_total_mismatch").image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+-    if (iris26941BOffHdrqLazyPoolReset && uniformExposure_ && rawNoiseMeasured_) {
+-        VkClearColorValue oneMotion{}; oneMotion.float32[0]=1.0f;
+-        vkCmdClearColorImage(c,arena_.image("hdrq_motion_min").image,
+-                             VK_IMAGE_LAYOUT_GENERAL,&oneMotion,1,&range);
+-    }
+     // Bracketed merges seed each bin's weight sum with the reference's weight.
+     if (!uniformExposure_) {
+         VkClearColorValue one{};
+@@ -651,7 +637,6 @@ void HdrPlusFrequencyRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint
+     mp.exposureFactor = exposureFactor;
+     mp.uniformExposure = uniformExposure_ ? 1 : 0;
+     mp.measuredNoise = rawNoiseMeasured_ ? 1 : 0;
+-    mp.motionEnabled = iris26941BOffHdrqLazyPoolReset && uniformExposure_ && rawNoiseMeasured_ ? 1 : 0;
+     mp.referenceWhite = referenceWhite_;
+     mp.gainForMask = frameGain(slot);
+     for (std::size_t s = 0; s < 4u; ++s) {
+@@ -662,8 +647,7 @@ void HdrPlusFrequencyRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint
+     }
+     executor_.record(c, ShaderId::HdrqMismatch,
+                      {{ib(0, refRgba), ib(1, alignedRgba), ib(2, arena_.image("hdrq_rms")), ib(3, mismatch),
+-                       ib(4, arena_.image("hdrq_weight_sum")),
+-                       ib(5, arena_.image("hdrq_motion_min"))}, {}}, &mp,
++                       ib(4, arena_.image("hdrq_weight_sum"))}, {}}, &mp,
+                      sizeof(mp), tx, ty);
+     if (mark) {
+         computeWriteBarrier(c);
+@@ -775,11 +759,8 @@ void HdrPlusFrequencyRecorder::recordPassFinish(VkCommandBuffer c, std::uint32_t
+     executor_.record(c, ShaderId::HdrqBackwardDft, {{ib(0, finalFt), ib(1, out)}, {}}, &bp, sizeof(bp), tx, ty);
+     computeWriteBarrier(c);
+     // Exposure control off: upstream passes black level -1, so the clamp floor is -2 * window.
+-    BorderPc bd{std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight), -2.0f,
+-                iris26941BOffHdrqLazyPoolReset && uniformExposure_ && rawNoiseMeasured_ ? 1 : 0};
+-    executor_.record(c, ShaderId::HdrqBorder,
+-                     {{ib(0,out), ib(1,arena_.image("hdrq_ref_rgba")),
+-                       ib(2,arena_.image("hdrq_motion_min"))}, {}}, &bd, sizeof(bd),
++    BorderPc bd{std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight), -2.0f};
++    executor_.record(c, ShaderId::HdrqBorder, {{ib(0, out), ib(1, arena_.image("hdrq_ref_rgba"))}, {}}, &bd, sizeof(bd),
+                      divUp(geometry_.rgbaWidth, 16), divUp(geometry_.rgbaHeight, 16));
+     computeWriteBarrier(c);
+     const auto& accum = arena_.image("hdrp_accum");
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+index 32a00a9c229cf04ebd9f15bfddf6d54571f68392..272f24b444767e30ad262d3138584e100edbcec6 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+@@ -12,9 +12,6 @@ layout(set = 0, binding = 3, r32f) writeonly uniform image2D mismatch;
+ // Uniform B only: tile confidence stored in existing bracket-only weightSum
+ // image at the tile coordinate; B bracketed never writes this binding.
+ layout(set = 0, binding = 4, r32f) writeonly uniform image2D independentSupport;
+-// 26943: per-pass lowest subpixel-aligned CFA support across companions.
+-// All writes are serialized by the existing real Vulkan chunk fences.
+-layout(set = 0, binding = 5, r32f) uniform image2D motionMin;
+ layout(push_constant) uniform P {
+     ivec2 tiles;
+     ivec2 rgbaSize;
+@@ -29,7 +26,6 @@ layout(push_constant) uniform P {
+     int uniformExposure;
+     float referenceWhite;
+     float gainForMask;
+-    int motionEnabled;  // 26943: only B OFF, measured uniform-exposure RAW
+ } p;
+ 
+ const float PI = 3.14159265358979323846;
+@@ -142,7 +138,7 @@ void main() {
+     barrier();
+     if (lane != 0u) return;
+     if (p.uniformExposure != 0) {
+-        // 12.5th percentile of 8x8 local confidence, insensitive to an isolated
++        // 25th percentile of 8x8 local confidence, insensitive to an isolated
+         // bad pixel but protective when a moving edge occupies part of a tile.
+         // Four overlapping 8x8 Fourier passes soften tile transitions.
+         float worst16[16];
+@@ -157,10 +153,7 @@ void main() {
+                 }
+             }
+         }
+-        float support = clamp(worst16[7],0.0,1.0);
+-        imageStore(independentSupport,g,vec4(support));
+-        if (p.motionEnabled != 0)
+-            imageStore(motionMin,g,vec4(min(imageLoad(motionMin,g).x,support)));
++        imageStore(independentSupport,g,vec4(clamp(worst16[15],0.0,1.0)));
+     }
+     vec4 noise = imageLoad(rms, g);
+     vec4 diff = sDiff[0] / sWeight[0];
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26864NativeRawr.java b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26864NativeRawr.java
+index aa3c6824c179d253eb6587f4adabb879d0a5a4ff..bd8fd55ca2cd7f9f656db0a8034b8130f76970c5 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26864NativeRawr.java
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26864NativeRawr.java
+@@ -3,9 +3,7 @@ package com.hinnka.mycamera.processor;
+ import android.content.Context;
+ import android.content.res.AssetManager;
+ import android.opengl.GLES30;
+-import android.hardware.HardwareBuffer;
+ import java.nio.ByteBuffer;
+-import java.util.concurrent.ConcurrentHashMap;
+ 
+ /**
+  * IRIS_26864_NATIVE_B_RAW_BURST_TO_REAL_RAWR_VULKAN_AMAZE.
+@@ -18,33 +16,8 @@ import java.util.concurrent.ConcurrentHashMap;
+  */
+ public final class GlesIris26864NativeRawr {
+     private GlesIris26864NativeRawr() { }
+-    private static final ConcurrentHashMap<Long,String> savedTiming = new ConcurrentHashMap<>();
+-    // Called synchronously on the same thread as nativeExecuteGpu, whose
+-    // native timing receipt is thread-local and cannot leak into next JPEG.
+-    public static void recordTiming(long shutterReferenceTimestamp) {
+-        final String text=nativeTakeLastTimings();
+-        if (text==null || text.isEmpty() || shutterReferenceTimestamp<=0L) return;
+-        if (savedTiming.size()>12) savedTiming.clear();
+-        savedTiming.put(shutterReferenceTimestamp,text);
+-    }
+-    public static String takeTiming(long shutterReferenceTimestamp) {
+-        return savedTiming.remove(shutterReferenceTimestamp);
+-    }
+-    private static native String nativeTakeLastTimings();
+     static { System.loadLibrary("iris26856amaze"); }
+ 
+-    /** Optional, nonblocking staging for the proven Camera2 ZSL frame.
+-     * JNI immediately retains the AHardwareBuffer and duplicate fence FD.
+-     * Returning false never changes ZSL or burst admission. */
+-    public static boolean tryZslGpuStage(HardwareBuffer raw, int cameraFenceFd,
+-            long timestampNs, long lensIdentity, long generation, int width, int height) {
+-        return raw != null && nativeTryZslGpuStage(raw,cameraFenceFd,timestampNs,
+-                lensIdentity,generation,width,height);
+-    }
+-    private static native boolean nativeTryZslGpuStage(HardwareBuffer raw,
+-            int fenceFd,long timestampNs,long lensIdentity,long generation,
+-            int width,int height);
+-
+     public static int createOwnedClipGlTexture(int width, int height) {
+         if (width < 32 || height < 32 || width > 16384 || height > 16384)
+             throw new IllegalArgumentException("26864 invalid GL sensor-clip dimensions");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 4a1977bec677cfc960073377147e47cfe6069be0..f11b994e28c6585b4f32cb10fea14ab19dc88de7 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -515,8 +515,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                                         + iris26678TopUpSampleFailure.getClass().getSimpleName());
+                             }
+                         }
+-                        if (iris26598SameGeneration && iris26598Plan.expectsTopUpRaw(img.getTimestamp()))
+-                            iris26943StageOptionalGpuZsl(img);
+                         if (iris26598SameGeneration && iris26598Plan.tryOwnTopUpRaw(img)) {
+                             Log.i(TAG, "IRIS_26598_NORMAL_TOPUP_RAW_OWNED timestamp="
+                                     + img.getTimestamp()
+@@ -531,7 +529,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                          * a live ticket claims the exact same sensor timestamp; unrelated repeating
+                          * RAWs simply expire/close and never enter the capture. */
+                         if (iris26598SameGeneration && iris26598Plan.stageEarlyTopUpRaw(img)) {
+-                            iris26943StageOptionalGpuZsl(img);
+                             final long iris26752EarlyTs = img.getTimestamp();
+                             Log.i(TAG, "IRIS_26752_EARLY_NORMAL_RAW_STAGED timestamp="
+                                     + iris26752EarlyTs
+@@ -580,7 +577,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     // Keep buffering during AE probe. Eligibility is decided from
+                     // actual exposure/ISO groups at shutter time.
+                     sampleMotion26380RawCaptureQuality(img);
+-                    iris26943StageOptionalGpuZsl(img);
+ 
+                     synchronized (mZslBufferLock) {
+                         mZslRingBuffer.addLast(img);
+@@ -2295,50 +2291,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
+-    /* IRIS_26943_CAMERA_CALLBACK_OPTIONAL_GPU_RING: no fence polling,
+-     * Vulkan invocation or retained Camera2 Image on this thread. Requires
+-     * Android 13's explicit Camera2 sync fence; fail closed on older APIs.
+-     * Only normal Photo B SR OFF below physical-lens-relative 1.10x.
+-     */
+-    private void iris26943StageOptionalGpuZsl(Image img) {
+-        if (img == null || android.os.Build.VERSION.SDK_INT < 33 ||
+-                !iris26871BExposureSelected() ||
+-                PreferenceKeys.isIrisSuperResOn() || mIrisNight26540CaptureActive ||
+-                mIsRecordingVideo || mIris26548CameraHealthGeneration <= 0L)
+-            return;
+-        try {
+-            final IrisZoomController.ZoomSnapshot zoom = IrisZoomController.snapshot();
+-            if (zoom == null || !Float.isFinite(zoom.outputLocalZoom) ||
+-                    zoom.outputLocalZoom >= 1.10f ||
+-                    physicalID == null || physicalID.isEmpty() ||
+-                    (zoom.ownerCameraId != null && !zoom.ownerCameraId.isEmpty() &&
+-                     !zoom.ownerCameraId.equals(physicalID))) return;
+-            long hash=1469598103934665603L;
+-            for (int i=0;i<physicalID.length();++i)
+-                hash=(hash ^ (long)physicalID.charAt(i))*1099511628211L;
+-            if (hash==0L) hash=1L;
+-            android.hardware.HardwareBuffer buffer=img.getHardwareBuffer();
+-            if (buffer==null) return;
+-            try (android.hardware.SyncFence fence=img.getFence()) {
+-                // The public API does not expose an fd duplicate. Never
+-                // introspect hidden APIs or block the camera callback.
+-                // Unsignaled/unknown frames remain with original Camera2 ZSL.
+-                if (fence!=null && fence.isValid()) {
+-                    final long signaled=fence.getSignalTime();
+-                    if (signaled==android.hardware.SyncFence.SIGNAL_TIME_PENDING ||
+-                        signaled==android.hardware.SyncFence.SIGNAL_TIME_INVALID) return;
+-                }
+-                com.hinnka.mycamera.processor.GlesIris26864NativeRawr.tryZslGpuStage(
+-                    buffer,-1,img.getTimestamp(),hash,
+-                    mIris26548CameraHealthGeneration,img.getWidth(),img.getHeight());
+-            } finally { buffer.close(); }
+-        } catch (Throwable failure) {
+-            // Optional import may fail on unsupported HALs, native versions,
+-            // SDK levels, or AHardwareBuffer formats. Keep Camera2 untouched.
+-            Log.d(TAG,"IRIS_26943_OPTIONAL_GPU_INGRESS_UNAVAILABLE "+failure.getClass().getSimpleName());
+-        }
+-    }
+-
+     /* IRIS_26872_B_PREVIEW_ONLY_SCOPE: read-only route query on the GL thread.
+      * Never alters HAL AE, shutter, JPEG, DNG, or the frozen RAW burst. */
+     public boolean iris26872BPreviewStripeEligible() {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index e315ccc391ba1c5034506cb10d305f591dbf4d79..210e578dbd26fa99b4c7ac4953b573b585b288de 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -1565,16 +1565,6 @@ private void ApplyHdrX() {
+                         processingParameters, pipeline.cropSize, pipeline.motionV2ToneSettingsSnapshot,
+                         pipeline.motionV2WatermarkEnabled);
+             } else {
+-                // IRIS_26943 RAWR-compatible multiframe native timing EXIF.
+-                // Only B SR OFF; every other JPEG description remains exactly
+-                // its established 26942 state. The keyed receipt is consumed
+-                // once and is not fabricated from shutter-to-save wall time.
+-                if (iris26856BOnly && !mIris26903NightB) {
+-                    String iris26943Timing = com.hinnka.mycamera.processor.GlesIris26864NativeRawr.takeTiming(
+-                            iris26409V2.referenceTimestamp);
+-                    if (iris26943Timing != null && !iris26943Timing.isEmpty())
+-                        exifData.IMAGE_DESCRIPTION = "Iris Photo B HDR+ Higher Quality\nTIMINGS\n" + iris26943Timing;
+-                }
+                 imageSaved = ImageSaver.Util.saveBitmapAsJPGMotionV2(
+                         imageFile, img, ImageSaver.JPG_QUALITY, exifData,
+                         iris26856Primary2x, iris26856Primary2xWidth, iris26856Primary2xHeight,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 739d9290acb63bcfbdd070524913a0f81473b00b..1184aa85cb32e9150120e3ffb6897f238e343119 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -930,8 +930,6 @@ object PhotonMotionMgc1271Bridge {
+                                         false, output, clipTexture, physicalIdentity, bOffNoise26912,
+                                         !parameters.iris26903NightB && !parameters.irisNightActive,
+                                     )
+-                                    if (!parameters.iris26903NightB && !parameters.irisNightActive)
+-                                        com.hinnka.mycamera.processor.GlesIris26864NativeRawr.recordTiming(referenceTimestamp)
+                                 }
+                                 PLog.i(TAG,"IRIS_26864_REAL_RAWR_HDRQ_B_ACTIVE " +
+                                     "normals=${frames.count { it.role == RawBurstFrameRole.NORMAL }} " +
+diff --git a/app/version.properties b/app/version.properties
+index 6497081eebacec0a980d7f30ca94548a92ec9ec3..77850a5450c9fb632bb9af7150d487734dfa57cc 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726943
+-VERSION_BUILD=26943
++VERSION_NAME=0.9726942
++VERSION_BUILD=26942
+diff --git a/app/src/main/cpp/iris26864/Iris26943GpuZslRing.cpp b/app/src/main/cpp/iris26864/Iris26943GpuZslRing.cpp
+deleted file mode 100644
+index f3e8353dd6d52609228190fc9ec05c0ced682551..0000000000000000000000000000000000000000
+--- a/app/src/main/cpp/iris26864/Iris26943GpuZslRing.cpp
++++ /dev/null
+@@ -1,73 +0,0 @@
+-#include "Iris26943GpuZslRing.hpp"
+-#include <android/log.h>
+-#include <stdexcept>
+-#include <string>
+-#include <unordered_set>
+-namespace iris26864 {
+-Iris26943GpuZslRing::Iris26943GpuZslRing(amaze::VulkanDeviceOwner& owner,
+-        uint32_t width,uint32_t height,uint32_t capacity,uint64_t lens,uint64_t generation)
+-    : owner_(owner), width_(width), height_(height), capacity_(capacity),
+-      lens_(lens), generation_(generation), frames_(capacity) {
+-    if (!lens||!generation||!width||!height||capacity<2u||capacity>30u)
+-        throw std::invalid_argument("26943 invalid raw ring capacity/provenance");
+-    const auto c=owner.context();
+-    device_=c.device; family_=c.queueFamilyIndex;
+-    uploads_=std::make_unique<amaze::CommandSubmissionOwner>(c.physicalDevice,
+-        c.device,owner.ingressQueue(),family_);
+-    images_=std::make_unique<TwoSlotRaw16Uploader>(c.physicalDevice,c.device,
+-        *uploads_,width,height,capacity);
+-}
+-Iris26943GpuZslRing::~Iris26943GpuZslRing() {
+-    // All ring uploads were individually fence-complete, but the merge
+-    // possibly read these images from another same-family queue. The owner
+-    // must have settled the *whole device* before destroying this ring.
+-    if (bridge_) vkDestroySemaphore(device_,bridge_,nullptr);
+-}
+-void Iris26943GpuZslRing::stage(AHardwareBuffer* ahb,int cameraFenceFd,
+-                               uint64_t timestamp,uint64_t lens,uint64_t generation) {
+-    if (lens!=lens_ || generation!=generation_ || !timestamp)
+-        throw std::invalid_argument("26943 stale camera generation/lens/raw timestamp");
+-    for (const auto& f:frames_) if (f.ready && f.timestamp==timestamp) return;
+-    const uint32_t slot=next_;
+-    // No selected frames are overwritten during a shutter/merge: JNI holds
+-    // the same B cache mutex from snapshot through final AMaZE GPU fence.
+-    frames_[slot].ready=false;
+-    frames_[slot].timestamp=0;
+-    try {images_->uploadHardwareBufferInto(slot,ahb,cameraFenceFd,family_);}
+-    catch (...) {frames_[slot]={};throw;}
+-    frames_[slot]={timestamp,true};
+-    next_=(next_+1u)%capacity_;
+-}
+-bool Iris26943GpuZslRing::select(const std::vector<uint64_t>& timestamps,
+-                                 uint64_t lens,std::vector<TransientImageView>& views) {
+-    views.clear();
+-    if (lens!=lens_ || timestamps.size()<2u || timestamps.size()>capacity_)return false;
+-    std::unordered_set<uint64_t> seen;
+-    for (const auto ts:timestamps) {
+-        if (!ts || !seen.insert(ts).second) {views.clear();return false;}
+-        bool found=false;
+-        for (uint32_t i=0;i<capacity_;++i) {
+-            if (frames_[i].ready && frames_[i].timestamp==ts) {
+-                views.push_back(images_->imageAt(i));found=true;break;
+-            }
+-        }
+-        if (!found){views.clear();return false;}
+-    }
+-    return true;
+-}
+-VkSemaphore Iris26943GpuZslRing::bridgeForMerge() {
+-    if (!owner_.hasSeparateIngressQueue())return VK_NULL_HANDLE;
+-    if (bridge_) {vkDestroySemaphore(device_,bridge_,nullptr);bridge_=VK_NULL_HANDLE;}
+-    VkSemaphoreCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+-    if (vkCreateSemaphore(device_,&ci,nullptr,&bridge_)!=VK_SUCCESS)
+-        throw std::runtime_error("26943 RAW ring cross-queue semaphore allocation failed");
+-    // Completing the signal submit's fence is not enough for cross-queue
+-    // memory visibility. The FIRST merge submit MUST explicitly wait on
+-    // this semaphore at COMPUTE_SHADER stage. No queue-idle shortcut.
+-    uploads_->execute([](VkCommandBuffer) {},VK_NULL_HANDLE,bridge_);
+-    return bridge_;
+-}
+-uint32_t Iris26943GpuZslRing::readyCount() const noexcept {
+-    uint32_t n=0;for(const auto& f:frames_)if(f.ready)++n;return n;
+-}
+-} // namespace iris26864
+diff --git a/app/src/main/cpp/iris26864/Iris26943GpuZslRing.hpp b/app/src/main/cpp/iris26864/Iris26943GpuZslRing.hpp
+deleted file mode 100644
+index 241ceccd9b426a3232205cb8157faf2a2a0b54a5..0000000000000000000000000000000000000000
+--- a/app/src/main/cpp/iris26864/Iris26943GpuZslRing.hpp
++++ /dev/null
+@@ -1,54 +0,0 @@
+-#pragma once
+-// IRIS_26943_OPTIONAL_CAMERA_TO_VULKAN_ZSL_RING
+-// The existing Camera2 ZSL ring is authoritative. These are only OPTIONAL
+-// GPU copies of its RAW16 images. No ImageReader slot, shutter timestamp,
+-// exposure or selected burst is ever owned/changed here.
+-#include "Iris26864TwoSlotRaw16Uploader.hpp"
+-#include "amaze/VulkanDeviceOwner.hpp"
+-#include <android/hardware_buffer.h>
+-#include <cstdint>
+-#include <memory>
+-#include <vector>
+-
+-namespace iris26864 {
+-class Iris26943GpuZslRing final {
+-public:
+-    Iris26943GpuZslRing(amaze::VulkanDeviceOwner& device, uint32_t width,
+-                       uint32_t height, uint32_t capacity, uint64_t lens,
+-                       uint64_t cameraGeneration);
+-    ~Iris26943GpuZslRing();
+-    Iris26943GpuZslRing(const Iris26943GpuZslRing&) = delete;
+-    Iris26943GpuZslRing& operator=(const Iris26943GpuZslRing&) = delete;
+-    // Called only by the private worker while the B cache mutex is held.
+-    // Upload finishes on a real Vulkan fence before a slot becomes ready.
+-    void stage(AHardwareBuffer* image, int cameraFenceFd,
+-               uint64_t timestamp, uint64_t lens, uint64_t generation);
+-    // Called only at the shutter's already-frozen immutable JPEG handoff,
+-    // with the SAME B cache mutex. All N selected frames must match exactly,
+-    // otherwise no partial resident subset is ever used.
+-    bool select(const std::vector<uint64_t>& timestamps, uint64_t lens,
+-                std::vector<TransientImageView>& views);
+-    // The writer's queue and merge queue are same-family. If distinct, the
+-    // returned binary semaphore is signaled by ingress AFTER all prior copies,
+-    // and the first merge submit waits on it. Owned until last merge fence.
+-    VkSemaphore bridgeForMerge();
+-    uint32_t capacity() const noexcept { return capacity_; }
+-    uint32_t readyCount() const noexcept;
+-    uint64_t generation() const noexcept { return generation_; }
+-    uint64_t lens() const noexcept { return lens_; }
+-    uint32_t width() const noexcept { return width_; }
+-    uint32_t height() const noexcept { return height_; }
+-private:
+-    struct Frame { uint64_t timestamp=0; bool ready=false; };
+-    amaze::VulkanDeviceOwner& owner_;
+-    VkDevice device_{};
+-    uint32_t family_=0;
+-    uint32_t width_=0,height_=0,capacity_=0;
+-    uint64_t lens_=0,generation_=0;
+-    uint32_t next_=0;
+-    std::unique_ptr<amaze::CommandSubmissionOwner> uploads_;
+-    std::unique_ptr<TwoSlotRaw16Uploader> images_;
+-    std::vector<Frame> frames_;
+-    VkSemaphore bridge_{};
+-};
+-} // namespace iris26864
+diff --git a/app/src/main/cpp/iris26864/Iris26943RawAhbIngress.cpp b/app/src/main/cpp/iris26864/Iris26943RawAhbIngress.cpp
+deleted file mode 100644
+index 2a7cd2910239675f1fc9566b9b23096d822068b7..0000000000000000000000000000000000000000
+--- a/app/src/main/cpp/iris26864/Iris26943RawAhbIngress.cpp
++++ /dev/null
+@@ -1,266 +0,0 @@
+-// IRIS_26943_CAPTURE_TIME_GPU_RAW_RING_IMPORT
+-// Imported Camera2 AHardwareBuffer -> a permanently owned R16_UINT RAW image.
+-// Runs only on the bounded optional B/ZSL worker, never a Camera2 callback.
+-// The memory lifetime extends beyond all GPU fences; unsafe failures poison.
+-#include "Iris26864TwoSlotRaw16Uploader.hpp"
+-#include <vulkan/vulkan_android.h>
+-#include <android/hardware_buffer.h>
+-#include <android/log.h>
+-#include <poll.h>
+-#include <unistd.h>
+-#include <stdexcept>
+-#include <string>
+-#include <vector>
+-#include <memory>
+-#include <limits>
+-#include <cerrno>
+-
+-namespace iris26864 {
+-namespace {
+-void checked(VkResult v, const char* message) {
+-    if (v != VK_SUCCESS) throw std::runtime_error(message);
+-}
+-// All Vulkan objects are destroyed only on a proven completed fence. The
+-// complete object may instead be intentionally quarantined on device loss.
+-struct Imported final {
+-    VkDevice device{};
+-    VkImage image{};
+-    VkBuffer buffer{};
+-    VkDeviceMemory memory{};
+-    VkImageLayout imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+-    explicit Imported(VkDevice d) : device(d) {}
+-    ~Imported() {
+-        if (image) vkDestroyImage(device,image,nullptr);
+-        if (buffer) vkDestroyBuffer(device,buffer,nullptr);
+-        if (memory) vkFreeMemory(device,memory,nullptr);
+-    }
+-};
+-uint32_t memoryType(VkPhysicalDevice p, uint32_t compatible) {
+-    VkPhysicalDeviceMemoryProperties mem{};
+-    vkGetPhysicalDeviceMemoryProperties(p,&mem);
+-    for (uint32_t i=0; i<mem.memoryTypeCount; ++i)
+-        if ((compatible&(1u<<i)) &&
+-            (mem.memoryTypes[i].propertyFlags&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return i;
+-    for (uint32_t i=0; i<mem.memoryTypeCount; ++i)
+-        if (compatible&(1u<<i)) return i;
+-    throw std::runtime_error("26943 RAW AHB incompatible memory type");
+-}
+-void waitForCameraFence(int fenceFd) {
+-    if (fenceFd < 0) return; // API 33 invalid fence means already signaled.
+-    struct pollfd pfd{fenceFd,POLLIN,0};
+-    int rc=0;
+-    do { rc=poll(&pfd,1,250); } while (rc<0 && errno==EINTR);
+-    if (rc!=1 || !(pfd.revents&(POLLIN|POLLHUP)))
+-        throw std::runtime_error("26943 camera acquire fence not signaled in optional 250ms budget");
+-}
+-void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout oldL, VkImageLayout newL,
+-             VkAccessFlags src, VkAccessFlags dst, VkPipelineStageFlags from,
+-             VkPipelineStageFlags to, uint32_t oldFamily=VK_QUEUE_FAMILY_IGNORED,
+-             uint32_t newFamily=VK_QUEUE_FAMILY_IGNORED) {
+-    VkImageMemoryBarrier b{};
+-    b.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+-    b.srcAccessMask=src;b.dstAccessMask=dst;
+-    b.oldLayout=oldL;b.newLayout=newL;
+-    b.srcQueueFamilyIndex=oldFamily;b.dstQueueFamilyIndex=newFamily;
+-    b.image=img;
+-    b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0u,1u,0u,1u};
+-    vkCmdPipelineBarrier(cb,from,to,0,0,nullptr,0,nullptr,1,&b);
+-}
+-std::unique_ptr<Imported> importDirect(VkPhysicalDevice p,VkDevice d,AHardwareBuffer* ahb,
+-                                      uint32_t width,uint32_t height) {
+-    auto get=reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
+-        vkGetDeviceProcAddr(d,"vkGetAndroidHardwareBufferPropertiesANDROID"));
+-    if (!get) throw std::runtime_error("26943 AHB Vulkan extension unavailable");
+-    VkAndroidHardwareBufferFormatPropertiesANDROID fmt{};
+-    fmt.sType=VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+-    VkAndroidHardwareBufferPropertiesANDROID props{};
+-    props.sType=VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+-    props.pNext=&fmt;
+-    checked(get(d,ahb,&props),"26943 RAW AHB image properties");
+-    if (fmt.format!=VK_FORMAT_R16_UINT || !props.memoryTypeBits || !props.allocationSize)
+-        throw std::runtime_error("26943 RAW AHB direct R16_UINT not available");
+-    VkPhysicalDeviceExternalImageFormatInfo external{};
+-    external.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
+-    external.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+-    VkPhysicalDeviceImageFormatInfo2 fi{};
+-    fi.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+-    fi.pNext=&external;fi.format=VK_FORMAT_R16_UINT;
+-    fi.type=VK_IMAGE_TYPE_2D;fi.tiling=VK_IMAGE_TILING_OPTIMAL;
+-    fi.usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+-    VkExternalImageFormatProperties caps{};
+-    caps.sType=VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
+-    VkImageFormatProperties2 supported{};
+-    supported.sType=VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+-    supported.pNext=&caps;
+-    if (vkGetPhysicalDeviceImageFormatProperties2(p,&fi,&supported)!=VK_SUCCESS ||
+-        !(caps.externalMemoryProperties.externalMemoryFeatures&VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT))
+-        throw std::runtime_error("26943 RAW AHB image transfer-source import unsupported");
+-    auto imported=std::make_unique<Imported>(d);
+-    VkExternalMemoryImageCreateInfo em{};
+-    em.sType=VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+-    em.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+-    VkImageCreateInfo ci{};
+-    ci.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+-    ci.pNext=&em;
+-    ci.imageType=VK_IMAGE_TYPE_2D;
+-    ci.format=VK_FORMAT_R16_UINT;
+-    ci.extent={width,height,1u};ci.mipLevels=ci.arrayLayers=1u;
+-    ci.samples=VK_SAMPLE_COUNT_1_BIT;
+-    ci.tiling=VK_IMAGE_TILING_OPTIMAL;
+-    ci.usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+-    ci.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
+-    checked(vkCreateImage(d,&ci,nullptr,&imported->image),"26943 direct imported image");
+-    VkImportAndroidHardwareBufferInfoANDROID ai{};
+-    ai.sType=VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+-    ai.buffer=ahb;
+-    VkMemoryDedicatedAllocateInfo dedicated{};
+-    dedicated.sType=VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+-    dedicated.pNext=&ai;dedicated.image=imported->image;
+-    VkMemoryAllocateInfo alloc{};
+-    alloc.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+-    alloc.pNext=&dedicated;
+-    alloc.allocationSize=props.allocationSize;
+-    alloc.memoryTypeIndex=memoryType(p,props.memoryTypeBits);
+-    checked(vkAllocateMemory(d,&alloc,nullptr,&imported->memory),"26943 direct AHB memory");
+-    checked(vkBindImageMemory(d,imported->image,imported->memory,0),"26943 direct AHB bind");
+-    return imported;
+-}
+-std::unique_ptr<Imported> importGpuBuffer(VkPhysicalDevice p,VkDevice d,AHardwareBuffer* ahb,
+-                                          uint32_t stride,uint32_t height) {
+-    auto get=reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
+-        vkGetDeviceProcAddr(d,"vkGetAndroidHardwareBufferPropertiesANDROID"));
+-    if (!get) throw std::runtime_error("26943 RAW AHB buffer import extension unavailable");
+-    VkAndroidHardwareBufferPropertiesANDROID props{};
+-    props.sType=VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+-    checked(get(d,ahb,&props),"26943 AHB buffer properties");
+-    if (!props.allocationSize || !props.memoryTypeBits || uint64_t(stride)*height*2u>props.allocationSize)
+-        throw std::runtime_error("26943 AHB buffer size/stride incompatible");
+-    auto imported=std::make_unique<Imported>(d);
+-    // Same proven RAWR plain-buffer import route: Adreno devices can reject
+-    // the optional VkExternalMemoryBufferCreateInfo while accepting the AHB.
+-    VkBufferCreateInfo bi{};
+-    bi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+-    bi.size=uint64_t(stride)*height*2u;
+-    bi.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+-    bi.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
+-    checked(vkCreateBuffer(d,&bi,nullptr,&imported->buffer),"26943 imported AHB transfer buffer");
+-    VkMemoryRequirements req{};
+-    vkGetBufferMemoryRequirements(d,imported->buffer,&req);
+-    if (req.size>props.allocationSize) throw std::runtime_error("26943 raw buffer requirements exceed AHB allocation");
+-    VkImportAndroidHardwareBufferInfoANDROID ai{};
+-    ai.sType=VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+-    ai.buffer=ahb;
+-    VkMemoryDedicatedAllocateInfo dedicated{};
+-    dedicated.sType=VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+-    dedicated.pNext=&ai;dedicated.buffer=imported->buffer;
+-    VkMemoryAllocateInfo alloc{};
+-    alloc.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+-    alloc.pNext=&dedicated;
+-    alloc.allocationSize=props.allocationSize;
+-    alloc.memoryTypeIndex=memoryType(p,props.memoryTypeBits);
+-    checked(vkAllocateMemory(d,&alloc,nullptr,&imported->memory),"26943 imported RAW buffer memory");
+-    checked(vkBindBufferMemory(d,imported->buffer,imported->memory,0),"26943 imported RAW buffer bind");
+-    return imported;
+-}
+-}
+-void TwoSlotRaw16Uploader::uploadHardwareBufferInto(uint32_t slot,AHardwareBuffer* ahb,int cameraFenceFd,uint32_t queueFamily) {
+-    if (quarantined_ || !ahb || slot>=slots_ || queueFamily==VK_QUEUE_FAMILY_IGNORED)
+-        throw std::invalid_argument("26943 invalid RAW AHB ring slot/queue family");
+-    AHardwareBuffer_Desc desc{};
+-    AHardwareBuffer_describe(ahb,&desc);
+-    if (desc.width!=width_||desc.height!=height_||desc.layers!=1u||
+-        desc.stride<width_||uint64_t(desc.stride)*height_*2u>INT32_MAX)
+-        throw std::invalid_argument("26943 AHB dimensions/stride mismatch");
+-    // No CPU synchronization on the real-time camera callback. Camera fence
+-    // completion is proven here on the optional worker before Vulkan reads.
+-    waitForCameraFence(cameraFenceFd);
+-    std::unique_ptr<Imported> source;
+-    bool imageSource=false;
+-    try { source=importDirect(physical_,device_,ahb,width_,height_);imageSource=true; }
+-    catch (const std::exception& e) {
+-        __android_log_print(ANDROID_LOG_INFO,"Iris26943","RAW_DIRECT_IMPORT_UNAVAILABLE why=%s",e.what());
+-    }
+-    if (!source) try {source=importGpuBuffer(physical_,device_,ahb,desc.stride,height_);}
+-    catch (const std::exception& e) {
+-        __android_log_print(ANDROID_LOG_INFO,"Iris26943","RAW_GPU_BUFFER_IMPORT_UNAVAILABLE why=%s",e.what());
+-    }
+-    if (source) {
+-        // The two Vulkan import variants must not be retried after an
+-        // uncertain submit. Keep their AHB and imported memory alive instead.
+-        try {
+-            const auto output=imageAt(slot);
+-            submit_.execute([&](VkCommandBuffer cmd){
+-                images_->recordInitialGeneralTransitions(cmd);
+-                if (imageSource) {
+-                    // Camera/foreign producer ownership is acquired only after
+-                    // the Camera2 sync FD was signaled on the ingress worker.
+-                    barrier(cmd,source->image,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+-                        0,VK_ACCESS_TRANSFER_READ_BIT,
+-                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                        VK_QUEUE_FAMILY_FOREIGN_EXT,queueFamily);
+-                } else {
+-                    VkMemoryBarrier b{};
+-                    b.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+-                    b.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;
+-                    b.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+-                    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                        0,1,&b,0,nullptr,0,nullptr);
+-                }
+-                barrier(cmd,output.image,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+-                    VK_ACCESS_SHADER_READ_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,
+-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
+-                if (imageSource) {
+-                    VkImageCopy cp{};
+-                    cp.srcSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
+-                    cp.srcSubresource.layerCount=1;
+-                    cp.dstSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
+-                    cp.dstSubresource.layerCount=1;
+-                    cp.extent={width_,height_,1};
+-                    vkCmdCopyImage(cmd,source->image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+-                        output.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&cp);
+-                } else {
+-                    VkBufferImageCopy cp{};
+-                    cp.bufferRowLength=desc.stride;
+-                    cp.imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;
+-                    cp.imageSubresource.layerCount=1;
+-                    cp.imageExtent={width_,height_,1};
+-                    vkCmdCopyBufferToImage(cmd,source->buffer,output.image,
+-                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&cp);
+-                }
+-                barrier(cmd,output.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,
+-                    VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT,
+-                    VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+-            });
+-            __android_log_print(ANDROID_LOG_INFO,"Iris26943","RAW_CAPTURE_STAGE route=%s bytes=%llu",
+-                imageSource?"direct_image":"gpu_buffer_copy",
+-                static_cast<unsigned long long>(uint64_t(width_)*height_*2u));
+-            return;
+-        } catch (...) {
+-            quarantineUnresolved();
+-            // Imported resources and their AHB backing must not be released
+-            // after a possibly submitted but unresolved GPU queue.
+-            (void)source.release();
+-            throw;
+-        }
+-    }
+-    // AHB device import unavailable: attempt a CPU-read mapping only on this
+-    // worker, never inside ImageReader. If impossible, discard this OPTIONAL
+-    // ring update; at shutter retain the known 26942 frozen-RAW fallback.
+-    AHardwareBuffer_Planes planes{};
+-    if (AHardwareBuffer_lockPlanes(ahb,AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,-1,nullptr,&planes)!=0)
+-        throw std::runtime_error("26943 GPU/CPU AHB ingress not supported; use original postshutter upload");
+-    struct Unlock {AHardwareBuffer* b;~Unlock(){AHardwareBuffer_unlock(b,nullptr);}} unlock{ahb};
+-    if (planes.planeCount!=1 || !planes.planes[0].data ||
+-        planes.planes[0].pixelStride!=2 || planes.planes[0].rowStride<width_*2u)
+-        throw std::runtime_error("26943 AHB CPU fallback plane incompatible");
+-    Raw16PlaneBorrow frame{};
+-    frame.source=static_cast<const unsigned char*>(planes.planes[0].data);
+-    frame.bytes=uint64_t(planes.planes[0].rowStride)*height_;
+-    frame.rowStride=planes.planes[0].rowStride;
+-    frame.width=width_;frame.height=height_;frame.timestamp=1u;
+-    const std::vector<Raw16PlaneBorrow> one{frame};
+-    uploadInto(0u,slot,one);
+-    __android_log_print(ANDROID_LOG_INFO,"Iris26943","RAW_CAPTURE_STAGE route=cpu_worker_fallback bytes=%llu",
+-        static_cast<unsigned long long>(uint64_t(width_)*height_*2u));
+-}
+-} // namespace iris26864
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26943BOffHdrqBorder.comp b/app/src/main/cpp/iris26864/bridge/Iris26943BOffHdrqBorder.comp
+deleted file mode 100644
+index 2c9c22085507986b9678d8d6d9d8fcb5072798d6..0000000000000000000000000000000000000000
+--- a/app/src/main/cpp/iris26864/bridge/Iris26943BOffHdrqBorder.comp
++++ /dev/null
+@@ -1,42 +0,0 @@
+-#version 450
+-// Port of hdr-plus-swift reduce_artifacts_tile_border (exposure-control off,
+-// black levels -1): clamp below the windowed minimum and blend tile-border
+-// pixels with the windowed reference.
+-layout(local_size_x = 16, local_size_y = 16) in;
+-layout(set = 0, binding = 0, rgba32f) uniform image2D img;
+-layout(set = 0, binding = 1, rgba32f) readonly uniform image2D refRgba;
+-layout(set = 0, binding = 2, r32f) readonly uniform image2D motionMin;
+-layout(push_constant) uniform P {
+-    ivec2 size;
+-    float minValue;  // black level - 1
+-    int motionEnabled;
+-} p;
+-
+-const float PI = 3.14159265358979323846;
+-
+-void main() {
+-    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+-    if (any(greaterThanEqual(q, p.size))) return;
+-    ivec2 d = q % 8;
+-    float angle = -2.0 * PI / 8.0;
+-    float w = (0.5 - 0.5 * cos(-angle * (float(d.x) + 0.5))) * (0.5 - 0.5 * cos(-angle * (float(d.y) + 0.5)));
+-    vec4 v = clamp(imageLoad(img, q), vec4(w * p.minValue), vec4(65535.0));
+-    if (d.x == 0 || d.x == 7 || d.y == 0 || d.y == 7) v = 0.5 * (w * imageLoad(refRgba, q) + v);
+-    // Reject temporally inconsistent chroma AND luma at moving locations.
+-    // Each source is the shutter-selected sensor reference, with its own
+-    // exposure-time motion blur. Bilinear tile map avoids hard checker seams.
+-    if (p.motionEnabled != 0) {
+-        vec2 grid=vec2(q)/8.0-vec2(0.5);
+-        ivec2 tile0=ivec2(floor(grid));
+-        vec2 f=fract(grid);
+-        ivec2 limit=imageSize(motionMin)-1;
+-        float s00=imageLoad(motionMin,clamp(tile0,ivec2(0),limit)).x;
+-        float s10=imageLoad(motionMin,clamp(tile0+ivec2(1,0),ivec2(0),limit)).x;
+-        float s01=imageLoad(motionMin,clamp(tile0+ivec2(0,1),ivec2(0),limit)).x;
+-        float s11=imageLoad(motionMin,clamp(tile0+ivec2(1,1),ivec2(0),limit)).x;
+-        float support=mix(mix(s00,s10,f.x),mix(s01,s11,f.x),f.y);
+-        float moving=smoothstep(0.24,0.78,1.0-clamp(support,0.0,1.0));
+-        v=mix(v,w*imageLoad(refRgba,q),moving);
+-    }
+-    imageStore(img, q, v);
+-}
