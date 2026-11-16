@@ -14,7 +14,7 @@ BUILDER_SHA='602bac28864953f5c819beee5df799132ff0ecdc2b3d1361f3a6295987de6af7'
 WORKFLOW_SHA='9a72ae2b1223e83796196f456b2a0fc0ce47f7332610acd024c274f7ccde594b'
 PRIOR_APK_SHA='144fc0141dd6705558586056623415f465dcd670d698495b9978cfe05d3060b2'
 APKNAME='IrisCamera-0.9726943-26943-iris-rawr-debug.apk'
-NBASE=2050;NFILES=2054;NCHANGE=17;NADDED=4;NPROTECTED=2033
+NBASE=2050;NFILES=2054;NCHANGE=18;NADDED=4;NPROTECTED=2032
 REQUIRED={
  'app/src/main/cpp/CMakeLists.txt',
  'app/src/main/cpp/iris26856/amaze/include/amaze/VulkanDeviceOwner.hpp',
@@ -27,6 +27,7 @@ REQUIRED={
  'app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.hpp',
  'app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake',
  'app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp',
+ 'app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp',
  'app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp',
  'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26864NativeRawr.java',
  'app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java',
@@ -79,7 +80,7 @@ def scope():
  if (len(old),len(new),len(ch),len(ad),len(old)-len(ch))!=(NBASE,NFILES,NCHANGE,NADDED,NPROTECTED):fail('incorrect source universe counts')
  if ch!=REQUIRED or ad!=ADDED or dl or set(new)!=set(old)|ad or any(p in old for p in ad) or any(p not in old for p in ch):fail('invalid existing/add/delete source allowlist')
  if {p for p in old if old[p]!=new[p]}!=ch:fail('unapproved changed source or missing overlay')
- if {p:h for p,h in old.items() if p not in ch}!=parse(R/'26943_PROTECTED_SOURCE.sha256'):fail('2033 protected hashes invalid')
+ if {p:h for p,h in old.items() if p not in ch}!=parse(R/'26943_PROTECTED_SOURCE.sha256'):fail('2032 protected hashes invalid')
  for p in ch|ad:
   if '/vendor/' in p or '/jniLibs/' in p or p.endswith(('.so','.jar','.aar','.spv')):fail('protected source domain '+p)
  if old['app/build.gradle']!=new['app/build.gradle']:fail('Gradle changed')
@@ -116,7 +117,7 @@ def seal():
   if k not in s:fail('missing original mandatory Actions verification '+k)
  if s.count('actions/upload-artifact@v4')!=1 or s.count('./gradlew --no-daemon --build-cache :app:assembleDebug --stacktrace')!=1:fail('not exactly one APK build/artifact')
  subprocess.run([sys.executable,'-S','test_26943_workflow_refs.py']+([] if globals().get('PACKAGE_ONLY') else ['--on-actions']),cwd=R,check=True)
- print('PASS seal successful 26942 compiled base 2050 -> 26943 2054, changed 17, protected 2033, source added 4 / deleted 0')
+ print('PASS seal successful 26942 compiled base 2050 -> 26943 2054, changed 18, protected 2032, source added 4 / deleted 0')
 
 def fetch():
  seal();token=os.getenv('GITHUB_TOKEN','')
@@ -185,8 +186,8 @@ def prepare():
  if (R/'app/.cxx').exists():shutil.rmtree(R/'app/.cxx')
  exact(R,'26943_EXPECTED_FULL_APP.sha256','live 26943 compiled candidate source')
  OUT.mkdir(exist_ok=True)
- (OUT/'26943_SOURCE_SCOPE.txt').write_text(f'PRIOR SUCCESS 26942 V2 run={RUN} commit={COMMIT} artifact={ART_ID}\nART_SHA={ART_SHA}\nTAR_SHA={TAR_SHA}\nBUILDER_SHA={BUILDER_SHA}\nWORKFLOW_SHA={WORKFLOW_SHA}\nPRIOR_APK_SHA={PRIOR_APK_SHA}\n2050 -> 2054 source changed=17 protected=2033 added=4 deleted=0; B Photo HDR+ SR OFF zoom<1.10 only; optional camera-time AHB GPU ring, exact 15-frame matching, GPU queue separation, motion-aware reference restoration and RAWR stage EXIF; 26942 B OFF chunk scheduling retained, unmodified 2033 source files protected; SR ON, A, A+B, Night, LONG, DNG, Spektra and pinned vendor unchanged\n'+''.join(x+'\n' for x in sorted(REQUIRED)))
- print('PASS exact 26942 compiled authority reconstructed, candidate-first source, unchanged 2033 protected')
+ (OUT/'26943_SOURCE_SCOPE.txt').write_text(f'PRIOR SUCCESS 26942 V2 run={RUN} commit={COMMIT} artifact={ART_ID}\nART_SHA={ART_SHA}\nTAR_SHA={TAR_SHA}\nBUILDER_SHA={BUILDER_SHA}\nWORKFLOW_SHA={WORKFLOW_SHA}\nPRIOR_APK_SHA={PRIOR_APK_SHA}\n2050 -> 2054 source changed=18 protected=2032 added=4 deleted=0; B Photo HDR+ SR OFF zoom<1.10 only; optional camera-time AHB GPU ring, exact 15-frame matching, GPU queue separation, motion-aware reference restoration and RAWR stage EXIF; 26942 B OFF chunk scheduling retained, unmodified 2032 source files protected; SR ON, A, A+B, Night, LONG, DNG, Spektra and pinned vendor unchanged\n'+''.join(x+'\n' for x in sorted(REQUIRED)))
+ print('PASS exact 26942 compiled authority reconstructed, candidate-first source, unchanged 2032 protected')
 
 def regress():
  seal();exact(R,'26943_EXPECTED_FULL_APP.sha256','26943 live candidate')
@@ -245,7 +246,7 @@ def finalize():
      meta.uid=meta.gid=0;meta.uname=meta.gname='';meta.mtime=0
      with src.open('rb') as inp:t.addfile(meta,inp)
  (OUT/'26943_candidate_app_source.tar.gz.sha256').write_text(sha(OUT/'26943_candidate_app_source.tar.gz')+'  26943_candidate_app_source.tar.gz\n')
- print('PASS 26943 final actual real compiled APK, 2033 protected SHA invariant, actual tar+apk checksums')
+ print('PASS 26943 final actual real compiled APK, 2032 protected SHA invariant, actual tar+apk checksums')
 
 if __name__=='__main__':
  try:

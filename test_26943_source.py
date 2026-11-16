@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""26943 V2: strict native cross-references against 26942 compiled authority.
+"""26943 V5: strict native cross-references against 26942 compiled authority.
 Android API26 NDK, original GLSL, Kotlin/Java and full assemble remain mandatory.
 """
 import sys,re,subprocess,tempfile,ctypes
@@ -13,6 +13,82 @@ def src(rel,live):
 def require(s,items,name):
  for x in items:
   if x not in s:fail('missing '+name+' contract '+x)
+def verify_hdrq_descriptor_abi(executor,rec,mismatch,border):
+ """Match actual active GLSL set0/binding, Vulkan layout and each recorder dispatch.
+
+ 26943 device regression: VkResult=-13 occurred at hdrq_mismatch pipeline
+ creation because shader set=0 binding5 had no executor descriptor layout.
+ The next active hdrq_border pass similarly lacked shader binding2.
+ This test runs in existing mandatory source-contract step, no weakening of
+ real glslang/SPIR-V/NDK/Kotlin/Java/assemble gates.
+ """
+ def bindings_from_shader(code,stage):
+  decls=re.findall(r'layout\s*\(\s*set\s*=\s*0\s*,\s*binding\s*=\s*(\d+)\s*,[^)]*\)\s*(?:(?:readonly|writeonly|coherent|restrict|volatile)\s+)*uniform\s+(image\w+)\s+(\w+)\s*;',code)
+  if not decls:fail('26943 missing actual '+stage+' shader descriptor declarations')
+  d=[(int(n),typ,name) for n,typ,name in decls]
+  if len({n for n,_,_ in d})!=len(d):fail('26943 duplicate '+stage+' GLSL descriptor')
+  return d
+ def spec(name,nextname):
+  begin=executor.find('{"'+name+'",');end=executor.find('{"'+nextname+'",',begin+1)
+  if begin<0 or end<0 or executor.count('{"'+name+'",')!=1:fail('missing/duplicate executor spec '+name)
+  section=executor[begin:end]
+  b=[(int(n),kind) for n,kind in re.findall(r'\{(\d+)\s*,\s*VK_DESCRIPTOR_TYPE_(STORAGE_IMAGE|STORAGE_BUFFER)\s*\}',section)]
+  if len(set(n for n,_ in b))!=len(b):fail('duplicate '+name+' executor binding')
+  return b
+ def record(name):
+  # Extract the active C++ bindings block (and fail on another untracked call).
+  matches=list(re.finditer(r'executor_\.record\(c,\s*ShaderId::'+name+r'\s*,\s*\{\{(.*?)\},\s*\{\}\}\s*,',rec,re.S))
+  if len(matches)!=1:fail('missing/ambiguous recorder dispatch '+name)
+  return [int(n) for n in re.findall(r'\bib\(\s*(\d+)\s*,',matches[0].group(1))]
+ for name,next_name,shader,idname,expected in (
+  ('hdrq_mismatch','hdrq_region_mean',mismatch,'HdrqMismatch',(0,1,2,3,4,5)),
+  ('hdrq_border','hdrq_accumulate',border,'HdrqBorder',(0,1,2))):
+  shader_decl=bindings_from_shader(shader,name)
+  shader_ids=[x for x,_,_ in shader_decl]
+  layout=spec(name,next_name)
+  recorder=record(idname)
+  if tuple(shader_ids)!=expected or tuple(n for n,_ in layout)!=expected or tuple(recorder)!=expected:
+   fail(f'26943 Vulkan descriptor ABI disagreement {name}: shader={shader_ids}, executor={layout}, recorder={recorder}, expected={expected}')
+  if not all(t=='STORAGE_IMAGE' for _,t in layout) or not all(t.startswith('image') for _,t,_ in shader_decl):
+   fail('26943 Vulkan descriptor image type disagreement '+name)
+ # Validate active public runtime dispatch mechanics and matching ABI sizes.
+ for x in ('for (auto b : s.b) bs.push_back({b.n, b.t, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});',
+           'ck(vkCreateDescriptorSetLayout(d, &dc, nullptr, &p.dsl)',
+           'ck(vkCreatePipelineLayout(d, &lc, nullptr, &p.layout)',
+           'for (const auto expected : s.b)',
+           'if (count != 1) throw std::invalid_argument("multiframe executor: missing/duplicate required binding")',
+           'vkUpdateDescriptorSets(device_, uint32_t(w.size()), w.data(), 0, nullptr)',
+           'VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 128};'):
+  if x not in executor:fail('26943 Vulkan descriptor pipeline invariant missing '+x)
+ if 'static_assert(sizeof(MismatchPc) == 100u' not in rec and 'static_assert(sizeof(MismatchPc)==100u' not in rec:
+  fail('26943 mismatch push ABI 100 not constrained')
+ if 'static_assert(sizeof(BorderPc)==16u' not in rec and 'static_assert(sizeof(BorderPc) == 16u' not in rec:
+  fail('26943 border push ABI 16 not constrained')
+
+
+def descriptor_abi_negative_tests(executor,rec,mismatch,border):
+ # Inject the exact device crash root causes, plus downstream recorder / GLSL
+ # and type ABI corruption. EACH MUST fail before the next Actions build.
+ begin=executor.index('{"hdrq_mismatch",');end=executor.index('{"hdrq_region_mean",',begin)
+ t=executor[begin:end]
+ assert t.count('{5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}')==1
+ wrong_type=executor[:begin]+t.replace('{5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}', '{5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}',1)+executor[end:]
+ mm=executor[:begin]+t.replace(', {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}','')+executor[end:]
+ begin=executor.index('{"hdrq_border",');end=executor.index('{"hdrq_accumulate",',begin)
+ t=executor[begin:end]
+ assert t.count('{2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}')==1
+ bd=executor[:begin]+t.replace(', {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}','')+executor[end:]
+ bad=[('missing mismatch layout5',mm,rec,mismatch,border),
+      ('missing border layout2',bd,rec,mismatch,border),
+      ('wrong descriptor type',wrong_type,rec,mismatch,border),
+      ('wrong mismatch recorder5',executor,rec.replace('ib(5, arena_.image("hdrq_motion_min"))','ib(6, arena_.image("hdrq_motion_min"))'),mismatch,border),
+      ('missing border shader2',executor,rec,mismatch,re.sub(r'^layout\(set = 0, binding = 2,.*\n','',border,count=1,flags=re.M))]
+ for name,e,r,ms,bs in bad:
+  if (e,r,ms,bs)==(executor,rec,mismatch,border):fail('26943 negative mutation did not change '+name)
+  try:verify_hdrq_descriptor_abi(e,r,ms,bs)
+  except RuntimeError:pass
+  else:fail('26943 missed descriptor ABI negative '+name)
+
 def main():
  paths,old,new=scope();live='--live' in sys.argv
  if live:exact(R,'26943_EXPECTED_FULL_APP.sha256','current source 2054 compiled candidate inputs')
@@ -88,6 +164,9 @@ def main():
  require(rec,('hdrq_motion_min','mp.motionEnabled = iris26941BOffHdrqLazyPoolReset','sizeof(BorderPc)==16u','sizeof(MismatchPc) == 100u','ShaderId::HdrqBorder'),'motion support')
  require(mismatch,('layout(set = 0, binding = 5, r32f)','int motionEnabled;','if (p.motionEnabled != 0)','pointSupport(','sSupport[64]'),'motion mismatch')
  require(border,('layout(set = 0, binding = 2, r32f)','int motionEnabled;','if (p.motionEnabled != 0)','imageLoad(refRgba','smoothstep(0.24,0.78','imageStore(img'),'reference blend')
+ executor=cp('bridge/Iris26888BOffVulkanExecutor.cpp')
+ verify_hdrq_descriptor_abi(executor,rec,mismatch,border)
+ descriptor_abi_negative_tests(executor,rec,mismatch,border)
  for f in (mismatch,border):
   if re.search(r'(?:\bfloat\s+|\bvec\d\s+|\bint\s+)coherent\b',f):fail('GLSL reserved word used as identifier')
  vendor=cp('Iris26864VendorRawr.cmake');cmake=src('app/src/main/cpp/CMakeLists.txt',live)
@@ -100,13 +179,27 @@ def main():
   require(pinned,('struct BurstStageTimings','double totalMs','std::uint32_t submissionCount','using StageSink','FenceWaitBegin','FenceWaitEnd'),'actual pinned 26942 vendor ABI')
   if re.search(r'\b(?:chunkGpuMs|chunkWaitMs|chunkRecordMs|chunkSubmitMs|chunkCount)\b',pinned):
    fail('26943 native timing ABI audit must be updated for new vendor members')
+  base_executor=(BASE/'app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp').read_text()
+  stage1=base_executor.index('{"hdrq_mismatch",');stage2=base_executor.index('{"hdrq_region_mean",',stage1)
+  source=base_executor[stage1:stage2]
+  target=source.replace('{4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}}',
+                        '{4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}}')
+  if target==source or source.count('{4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}}')!=1:fail('26942 mismatch layout authority changed')
+  predicted=base_executor[:stage1]+target+base_executor[stage2:]
+  stage1=predicted.index('{"hdrq_border",');stage2=predicted.index('{"hdrq_accumulate",',stage1)
+  source=predicted[stage1:stage2]
+  target=source.replace('{1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}}',
+                        '{1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}}')
+  if target==source or source.count('{1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}}')!=1:fail('26942 border layout authority changed')
+  predicted=predicted[:stage1]+target+predicted[stage2:]
+  if predicted!=executor:fail('26943 executor modifies more than two mandatory descriptor bindings')
   # Existing successful 26942 scheduler, shader and vendor byte-invariance.
   for protected in ('app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp',
                     'app/src/main/assets/shaders/motionv2/render.glsl',
                     'app/src/main/assets/shaders/motionv2/gainmap.glsl'):
    if old.get(protected)!=new.get(protected):fail('successful 26942 protected path altered '+protected)
    if sha(BASE/protected)!=sha(R/protected):fail('previous compiled runtime protected content mismatch')
- print('PASS 26943 V3 API26 AHB and modeled Vulkan 1.1 API26 dynamic loader link, real pinned StageSink timing ABI, GPU ZSL ownership, shader, 17 changed+4 added, 2033 protected')
+ print('PASS 26943 V5 camera GPU ZSL/API26/Vulkan1.1, HDRq shader-executor-recorder descriptor ABIs and five mutation negatives, 18 changed+4 added, 2032 protected')
 if __name__=='__main__':
  try:main()
  except Exception as e:print(str(e),file=sys.stderr);sys.exit(1)

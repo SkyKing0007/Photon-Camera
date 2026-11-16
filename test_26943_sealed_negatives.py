@@ -27,12 +27,16 @@ def main():
    m.seal()
    p=t/'handoff_payload_26943/app/src/main/cpp/iris26864/Iris26943RawAhbIngress.cpp'
    reject('modified import',p,p.read_bytes()+b'\n//tampered')
+   p=t/'handoff_payload_26943/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp'
+   reject('removed descriptor-layout correction',p,p.read_bytes().replace(b'{5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}',b'{5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}',1))
    p=t/'26943_CHANGED_RUNTIME_ALLOWLIST.txt'
    reject('changed unapproved',p,p.read_bytes()+b'app/src/main/cpp/vendor/OOPS.cpp\n')
    p=t/'26943_ADDED_RUNTIME_PATHS.txt'
    reject('missing new runtime',p,b'')
    p=t/'test_26943_shader_contract.py'
    reject('missing shader gate',p,b'')
+   p=t/'test_26943_source.py'
+   reject('remove runtime descriptor ABI check',p,p.read_bytes().replace(b'verify_hdrq_descriptor_abi(',b'disabled_hdrq_descriptor_abi(',1))
    p=t/'26943_V1_STAGE_2_UPLOAD_PATHS.txt'
    reject('incorrect workflow path',p,b'.github/workflows/WRONG.yml\n')
    p=t/'26943_EXPECTED_ACTION_EXECUTABLES.txt'
@@ -41,7 +45,7 @@ def main():
    reject('missing receipt',p,p.read_bytes().replace(b'test_26943_source.py',b'BADABSENT_source.py'))
    m.seal()
   finally:m.R=oldR;m.PACKAGE_ONLY=oldPackage
- print('PASS 26943 negative rejection: 17+4 source, shader gate, allowlists, stage2 trigger, executable refs, package seals')
+ print('PASS 26943 negative rejection: 18 changes+4 added, 2032 protected, descriptor ABIs, shaders, allowlists, stages, executable refs and package seals')
 if __name__=='__main__':
  try:main()
  except Exception as e:print(str(e),file=sys.stderr);sys.exit(1)
