@@ -510,7 +510,7 @@ float iris26941BOffMatchedSdrPrimary(float priorGuide,float sourceGuide){
  * untouched. No halo/semantic detector, no spatial cross-pixel operation.
  */
 float iris26948BHeadroomShoulder(float target){
-    if(target<=0.82)return target;
+    if (target <= 0.82) return target;
     float excess=target-0.82;
     float former=0.82+0.18*(1.0-exp(-excess/0.18));
     float separated=0.82+0.18*excess/(excess+0.18);

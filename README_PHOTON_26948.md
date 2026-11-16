@@ -1,4 +1,10 @@
-# Photon 26948 — B-only SDR color fidelity / smooth white / manual flicker timing
+# Photon 26948 V2 — B-only SDR color fidelity / smooth white / manual flicker timing
+
+## V2 correction to real Actions failure
+- Real failed Actions: run `43967482256`, job `133650612748`, commit `aa1a357d110db20f79a6be446c8c804c7726f01d`; 26941 historical shader validator stopped before Android assembly.
+- The new 26948 headroom helper repeated old `if(target<=0.82)return target;` literal and violated its count==1 historical ABI. Two new-helper lines were changed to GLSL-equivalent `if (target <= 0.82) return target;`; the historical 26941 original function and all other B/Experiment A/native/vendor source unchanged.
+- A new **pre-fetch payload** validator checks real candidate against 26941,26942,26943,26944 shader contracts, seven fail-closed historical failure cases, and exact Git blob hashes of inherited validators. It repeats after source reconstruction **before** the original compiler steps. No old checker is removed or weakened.
+- The actual pinned GLSL/SPIR-V / two-ABI native / Java / Kotlin / Gradle checks remain mandatory and are NOT RUN in this local environment.
 
 ## State
 PREPARED FOR ACTIONS — locally validated only. **Not build-proven** until new successful Actions job AND published artifact. No device or image-quality guarantee.

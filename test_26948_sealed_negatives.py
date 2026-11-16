@@ -7,7 +7,7 @@ def main():
  origin=b.R
  paths=[pathlib.Path(line.split('  ',1)[1]) for line in (origin/'26948_HANDOFF_HASHES.sha256').read_text().splitlines()]
  paths.append(pathlib.Path('26948_HANDOFF_HASHES.sha256'))
- cases=[('build_26948_incremental.py','delete'),('test_26948_source.py','delete'),
+ cases=[('build_26948_incremental.py','delete'),('test_26948_source.py','delete'),('test_26948_v2_shader_compat.py','delete'),
  ('test_26948_sdr_hdr_math.py','delete'),('test_26948_flicker_host.py','delete'),
  ('test_26948_gpu_row.py','delete'),('test_26948_patch_proof.py','delete'),
  ('test_26948_workflow_refs.py','delete'),('compile_26948_shaders.sh','delete'),
@@ -38,7 +38,7 @@ def main():
     else:b.fail('unsealed hostile staging mutation accepted '+rel)
    finally:f.write_bytes(before)
   workflow=d/'.github/workflows/build-26948-change-aware.yml';receipt=d/'26948_HANDOFF_HASHES.sha256'
-  for needle,replacement in [('build_26947_incremental.py seal','build_26932_incremental.py seal'),('compile_26948_shaders.sh','compile_26944_shaders.sh'),('test_26948_flicker_host.py --live','test_26948_source.py --live'),('actions/upload-artifact@v4','actions/upload-artifact@v4\n        uses: actions/upload-artifact@v4'),('./gradlew --no-daemon --build-cache :app:assembleDebug --stacktrace','echo "weak compiler bypass"')]:
+  for needle,replacement in [('build_26947_incremental.py seal','build_26932_incremental.py seal'),('compile_26948_shaders.sh','compile_26944_shaders.sh'),('test_26948_v2_shader_compat.py --payload --on-actions','test_26948_source.py --payload'),('test_26948_flicker_host.py --live','test_26948_source.py --live'),('actions/upload-artifact@v4','actions/upload-artifact@v4\n        uses: actions/upload-artifact@v4'),('./gradlew --no-daemon --build-cache :app:assembleDebug --stacktrace','echo "weak compiler bypass"')]:
    old=workflow.read_bytes();full=receipt.read_bytes()
    try:
     if needle.encode() not in old:b.fail('negative fixture needle absent '+needle)
@@ -56,7 +56,7 @@ def main():
     except Exception:passed+=1
     else:b.fail('65-hex SHA accepted '+name)
    finally:setattr(b,name,original)
-  if passed!=len(cases)+10:b.fail(f'wrong expected negative count {passed} vs {len(cases)+10}')
+  if passed!=len(cases)+11:b.fail(f'wrong expected negative count {passed} vs {len(cases)+11}')
   b.seal()
  b.R=origin
  print('PASS',passed,'fail-closed tamper/stale/sealed-back workflow/real Android compiler and 26945 V1 invalid SHA regressions')

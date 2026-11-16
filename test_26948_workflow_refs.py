@@ -17,18 +17,18 @@ def main():
   j=s.find(k,pos)
   if j<0:fail('missing/incorrect ordering '+k)
   pos=j+len(k)
- for required in ('verify_26904_v3_safety.py','verify_26904_v2_safety.py','test_26903_v3_archive_receipt.py','test_26925_source.py','test_26945_gainmap.py --payload','test_26946_gainmap_geometry.py --payload','test_26947_lifecycle.py --payload','test_26947_java_host.py --payload','test_26947_sealed_negatives.py','test_26948_sealed_negatives.py','test_26948_patch_proof.py --payload','test_26948_flicker_host.py --payload','test_26948_gpu_row.py --payload','compile_26941_shaders.sh','compile_26942_shaders.sh','compile_26943_shaders.sh','actions/cache/restore@v4','actions/cache/save@v4','if-no-files-found: error','retention-days: 90'):
+ for required in ('verify_26904_v3_safety.py','verify_26904_v2_safety.py','test_26903_v3_archive_receipt.py','test_26925_source.py','test_26945_gainmap.py --payload','test_26946_gainmap_geometry.py --payload','test_26947_lifecycle.py --payload','test_26947_java_host.py --payload','test_26947_sealed_negatives.py','test_26948_sealed_negatives.py','test_26948_patch_proof.py --payload','test_26948_flicker_host.py --payload','test_26948_gpu_row.py --payload','test_26948_v2_shader_compat.py --payload --on-actions','test_26948_v2_shader_compat.py --live --on-actions','compile_26941_shaders.sh','compile_26942_shaders.sh','compile_26943_shaders.sh','actions/cache/restore@v4','actions/cache/save@v4','if-no-files-found: error','retention-days: 90'):
   if required not in s:fail('missing historical/current gate '+required)
  if s.count('./gradlew --no-daemon --build-cache :app:assembleDebug --stacktrace')!=1 or s.count('actions/upload-artifact@v4')!=1:fail('duplicate or absent full real APK/Artifact')
  steps=re.findall(r'^\s+- name: (.+)$',s,re.M)
  if len(steps)!=len(set(steps)):fail('duplicate stage names')
  refs=set(re.findall(r'python3 -S ([a-zA-Z0-9_]+\.py)',s))|set(re.findall(r'\bbash ([a-zA-Z0-9_]+\.sh)',s))|{'gradlew'}
  want=(R/'26948_EXPECTED_ACTION_EXECUTABLES.txt').read_text().splitlines()
- if sorted(refs)!=want or len(refs)!=251 or any('/' in x or '..' in x for x in want):fail('unused/stale/missing refs '+str(sorted(set(want)^refs)))
+ if sorted(refs)!=want or len(refs)!=252 or any('/' in x or '..' in x for x in want):fail('unused/stale/missing refs '+str(sorted(set(want)^refs)))
  if '--on-actions' in sys.argv:
   for p in want:
    if not (R/p).is_file():fail('missing in real GitHub checkout '+p)
- print('PASS 26948 preserved exact 141 original successful commands SHA, 251 referenced executables no missing/unused/stale, one pinned shader/NDK/Kotlin/Java/assemble APK')
+ print('PASS 26948 preserved exact 141 original successful commands SHA, 252 referenced executables no missing/unused/stale, one pinned shader/NDK/Kotlin/Java/assemble APK')
 if __name__=='__main__':
  try:main()
  except Exception as e:print(e,file=sys.stderr);sys.exit(1)
