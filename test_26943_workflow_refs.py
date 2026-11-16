@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Preserve successful 26942 historical command graph and require new 26943 artifacts/compile."""
+"""26943 V2 R1: validate active workflow identity, sealed executable manifest and historical graph.
+The original 26943 workflow regression is preserved in the full check below.
+"""
 import hashlib,re,sys
 from build_26943_incremental import R,fail
 HIST='bce2979074eba73c9fa7defa4ee5657bb3ba619d705b2bb79334b1f901a7648b'
 def main():
  wf=R/'.github/workflows/build-26943-change-aware.yml'
  s=wf.read_text()
+ if not s.startswith('name: Photon 26943 V2 R1 -') or s.count('name: photon-26943-v2-r1-b-off-gpu-zsl-motion-reconstruction') != 1:
+  fail('stale V1 or wrong V2 R1 workflow/artifact identity')
  if len(s.splitlines())<375:fail('truncated mandatory Actions workflow')
  if 'TRIGGER_26943.txt' not in s or '\n      - TRIGGER_26942.txt' in s:fail('wrong 26943 trigger')
  a=s.index('      - name: Checkout intended experimental branch');b=s.index('      - name: Preserve successful 26934 visual-white')
@@ -69,7 +73,7 @@ def main():
  if '--on-actions' in sys.argv:
   for p in expected:
    if not (R/p).is_file():fail('Actions checkout executable missing '+p)
- print(f'PASS 26943 inherited original 141 historical command SHA, {len(refs)} exact executable refs, real unchanged 26942 build gates, mandatory new full Android compile+publish')
+ print(f'PASS 26943 V2 R1 workflow identity, historical 141 command SHA, {len(refs)} executable refs, real unchanged 26942 build gates, mandatory full Android compile+publish')
 if __name__=='__main__':
  try:main()
  except Exception as e:print(str(e),file=sys.stderr);sys.exit(1)

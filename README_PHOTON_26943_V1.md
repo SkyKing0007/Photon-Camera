@@ -1,34 +1,44 @@
-# Photon 26943 V1 — complete B-only RAWR-style RAW Vulkan ingress, motion-safe HDR+ fusion and RAWR timing EXIF
+# Photon 26943 — V2 R1 corrected handoff (historical V1 filename retained for original runner seal)
 
-## Status: LOCALLY VALIDATED / PREPARED FOR ACTIONS; NOT BUILD-PROVEN
+The **V1** handoff at commit `a781ace0e40e4f2a39ac6cd25baabd999960b886` **FAILED** the real
+native compiler in Actions run `43786723951` job `133035917372` and produced no APK or artifact.
+Any earlier V1 prepared/validated claims were LOCAL ONLY and do not establish compilation.
+This replacement file intentionally keeps the original `README_PHOTON_26943_V1.md` repository
+**path**, because the 26943 original sealed runner and source package expect that path.
+The contents now describe only the current corrected **V2 R1** candidate.
 
-The handoff is complete as an Actions candidate. SDK 35/NDK 27, real pinned GLSL glslang 16.5/SPIR-V optimizer/validator, complete Kotlin+Java, both ARM native ABIs, APK assembly, publication, and device performance/IQ must run on GitHub Actions/device; they have NOT RUN in this local environment. Do not mistake host C++17 and static GLSL tests for Android compiler proof. No source commit/push has been done. No APK distributed in this ZIP. Do not upload an APK to GitHub.
+## Latest successful runtime authority
 
-## Exact latest successful compiled runtime authority
+Successful 26942 V2 Actions run `43772082845`, commit
+`514c3caca5f56b3fe289ec2220be520eb61fa096`, artifact `14185016520`,
+artifact archive SHA-256 `08ed272d964bc0f0e3987ddf5315abb74c9dc8cf6a22a8ade108527f9a571040`,
+actual compiled source TAR SHA-256 `91ad16f7f4e1b529124c60b09ceacaf6b600cd9ebca0f7ca0224636aaaf98b91`.
+Actual successful 26942 builder SHA-256 `602bac28864953f5c819beee5df799132ff0ecdc2b3d1361f3a6295987de6af7`.
+26943 runner SHA-256 (unchanged) `ad7250f5249d7c5e3def108e034a712068bdeb7c26cf9ad04c224e2bf736e620`.
 
-- Repository `SkyKing0007/Photon-Camera`, branch `experimental-clean-photon-rebuild`
-- Successful 26942 V2 Actions run `43772082845`, commit `514c3caca5f56b3fe289ec2220be520eb61fa096`
-- Published artifact `14185016520`, verified SHA-256 `08ed272d964bc0f0e3987ddf5315abb74c9dc8cf6a22a8ade108527f9a571040`
-- Actual compiled source TAR SHA-256 `91ad16f7f4e1b529124c60b09ceacaf6b600cd9ebca0f7ca0224636aaaf98b91`
-- Actual executed 26942 builder SHA-256 `602bac28864953f5c819beee5df799132ff0ecdc2b3d1361f3a6295987de6af7`
-- Actual executed workflow SHA-256 `9a72ae2b1223e83796196f456b2a0fc0ce47f7332610acd024c274f7ccde594b`
-- Actual compiled 26942 APK SHA-256 `144fc0141dd6705558586056623415f465dcd670d698495b9978cfe05d3060b2`
-- 26942 prior **2050 source files**. 26943 **2054 source files**; **17 modified existing files + 4 new**, **2033 protected SHA-identical**, no deletions; no pinned vendor, JNI binary, Gradle or toolchain change.
-- 26942 real pinned GLSL/SPIR-V, dual-ABI NDK/CMake, Kotlin, Java, full assembleDebug = PASS. Its successful build proves neither 26943 compilation nor 26943 image quality.
+## Runtime and verification
 
-## Mandatory single combined implementation (Photo Experiment B, Super Res OFF, lens-relative zoom below 1.10x)
+V2 fixes the API26 NDK `AHardwareBuffer_lockPlanes` incompatibility by using
+`AHardwareBuffer_lock`, and uses RAWR's pinned `StageSink` host timing events plus
+`BurstRunResult.submissionCount` instead of nonexistent `timings.chunk*` members.
+V2 R1 makes **no further runtime-source changes**; the 21 allowed paths are still
+17 existing modifications + 4 additions out of a 2050-file successful 26942 base.
+2033 protected source paths are SHA-identical, including pinned vendor, motion, Night,
+LONG, DNG, existing Spektra and all other out-of-scope modes.
 
-1. Camera2 RAW callbacks opportunistically acquire original `AHardwareBuffer` only; never wait on GPU/camera fences, change shutter selection or hold Camera2 image. API 33+ public `SyncFence` readiness; older devices use 26942 fallback. One bounded B-only worker queues at most 3 frames; optional staging is dropped when B GPU busy. Attempts external R16_UINT AHB image import, GPU buffer transfer, then asynchronous CPU-worker staging where compatible. Original B capture and 15-frame ZSL selection entirely unchanged.
-2. Separate B-only Vulkan device takes two same-family queues when supported: independent live ingress and merge, both normal priority (avoids known low-priority Adreno freezes), else original single queue. Cross-queue image visibility protected with explicit first-submit semaphore. Owner/fences and failure quarantine protect resources; 18-slot bounded RAW GPU ring with memory budget leaving 1.5GiB nominal reserve. Incomplete or mismatched timestamp/lens/camera-generation => **no partial use**, original 26942 full post-shutter upload path. Never reduce selected frame count.
-3. Successful 26942 four-pass HDRq frequency reconstruction retained. New B-only subpixel-aligned 3x3 RAW-support estimate across companion frames records 12.5th percentile per 8x8 tile, preserves protected RAWR vendor source, and interpolates low-confidence motion support to revert pixels toward shutter-selected RAW frame's natural blur. Real color/unchanged non-B modes and mathematically defined 4-pass merges retained. Does not promise elimination of television refresh aliasing.
-4. Native RAWR-equivalent HDR+ stage measurements are recorded from *actual* RAWR `BurstStageTimings` and propagated by timestamp into **Photo B HDR+ SR OFF JPEG EXIF ImageDescription**: initialization, noise, reference, companion, alignment, frequency accumulation, finalize, GPU execution, GPU waits, submission count, upload route and post-shutter uploads. The EXIF subtotal excludes capture and JPEG encoding; use the existing shutter-to-save logger for those totals.
+The complete original 26943 workflow is retained with unchanged compiler stages:
+141 SHA-locked historical commands, strict 211 executable references, real glslang/optimizer,
+NDK native both ABIs, Kotlin/Java, full Gradle `:app:assembleDebug`, and exactly one artifact.
+V2 R1 changes its display name and published artifact label from V1 to V2 R1 only;
+it does not disable or remove compilation, regression or negative tests.
 
-## One normal three-stage vscode.dev handoff
+## Exact upload
 
-1. Upload exact contents listed in `26943_V1_STAGE_1_UPLOAD_PATHS.txt`, preserving paths; includes 21 runtime payload files nested under `handoff_payload_26943/app/...`, complete builder and verification scripts and source/patch/seal manifests. Never upload the ZIP itself to repository.
-2. Upload exact `26943_V1_STAGE_2_UPLOAD_PATHS.txt`, the `.github/workflows/build-26943-change-aware.yml` file.
-3. Upload only `26943_V1_STAGE_3_UPLOAD_PATHS.txt`, the `TRIGGER_26943.txt` file **last** to invoke Actions.
-
-Inherited successful 26941/26942 historical **141 exact executable commands (SHA-locked)**, 26886/87, 26903 archive receipt, 26904 optimizer CLI and Spektra CMake regressions, 26942 V1 failed undeclared TLS symbol, full real 26904 pinned GLSL shader validation, dual ABI NDK, Kotlin/Java, single complete Gradle assemble and single artifact publication are kept. The new additions are additive and fail-closed. Historical 26942 shader real recompile remains, plus current real 26943 shaders. The original 26941/26942 source rebuild commands are *not* rerun against stale source: 26943 fetches exactly the successful published 26942 artifact and reconstructs before compiling.
-
-Mandatory stop if incomplete: current candidate must rebuild successfully in Actions and publish the new APK+compiled-source TAR. The package is NOT BUILD-PROVEN and no 26943 APK/device image quality/timing can be claimed yet. No source push to dev, no backup branch.
+Use the **single newer V2 R1 three-stage ZIP**. Never use the older V1 or V2 ZIP.
+Upload and commit the Stage 1 replacement files at their repository-relative paths.
+Upload/commit the Stage 2 workflow with its corrected V2 R1 labels.
+Upload and commit Stage 3 `TRIGGER_26943.txt` last.
+Retain the pre-existing `26943_V1_STAGE_*_UPLOAD_PATHS.txt` filenames: those are
+historical *structural keys* required by the original 26943 runner, not V1 runtime inputs.
+Do not upload an APK or push dev. The V2 R1 source, APK, and image quality are not
+build-/device-proven until a full Actions run succeeds and publishes the artifact.

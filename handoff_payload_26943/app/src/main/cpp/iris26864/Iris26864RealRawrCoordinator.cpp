@@ -10,6 +10,7 @@ extern thread_local bool iris26940BOffHdrqPipelineInit;
 extern thread_local bool iris26941BOffHdrqLazyPoolReset;
 }
 #include <cmath>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -17,7 +18,15 @@ extern thread_local bool iris26941BOffHdrqLazyPoolReset;
 #include <unordered_set>
 
 namespace iris26864 {
+thread_local Iris26943HostChunkTimings iris26943HostChunkTimings{};
 namespace {
+// The original vendor AndroidBurstCoordinator sends BEGIN/END events on its
+// synchronous execution thread. No vendor ABI change or guessed chunk fields.
+struct Iris26943ChunkEventStart final {
+    std::chrono::steady_clock::time_point record{}, submit{}, fenceWait{};
+    bool recording=false, submitting=false, waiting=false;
+};
+thread_local Iris26943ChunkEventStart iris26943ChunkEventStart{};
 using namespace rawr::raw_gpu_pipeline;
 void checkFrozen(const RealRawrRunRequest& r) {
     if(!r.physical||!r.device||!r.inheritedQueue||r.width<32u||r.height<32u||
@@ -183,8 +192,36 @@ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
     };
     {
         BOffInitScope initScope(bOffReusable != nullptr);
+        // StageSink events are already emitted by the pinned RAWR coordinator.
+        // Enable only for B HDR+ SR OFF and keep Wronski/Night unchanged.
+        iris26943HostChunkTimings={};
+        iris26943ChunkEventStart={};
+        AndroidBurstCoordinator::StageSink hostTiming;
+        if (!sr) hostTiming=[](AndroidBurstCoordinator::Stage event,
+                               VkDeviceSize, VkDeviceSize) {
+            using Clock=std::chrono::steady_clock;
+            const auto now=Clock::now();
+            auto& active=iris26943ChunkEventStart;
+            auto& totals=iris26943HostChunkTimings;
+            using Stage=AndroidBurstCoordinator::Stage;
+            switch (event) {
+              case Stage::RecordBegin: active.record=now;active.recording=true;break;
+              case Stage::RecordEnd:
+                if(active.recording) totals.recordMs+=std::chrono::duration<double,std::milli>(now-active.record).count();
+                active.recording=false;break;
+              case Stage::SubmitBegin: active.submit=now;active.submitting=true;break;
+              case Stage::SubmitEnd:
+                if(active.submitting) totals.queueSubmitMs+=std::chrono::duration<double,std::milli>(now-active.submit).count();
+                active.submitting=false;break;
+              case Stage::FenceWaitBegin: active.fenceWait=now;active.waiting=true;break;
+              case Stage::FenceWaitEnd:
+                if(active.waiting) totals.fenceWaitMs+=std::chrono::duration<double,std::milli>(now-active.fenceWait).count();
+                active.waiting=false;break;
+              default:break;
+            }
+        };
         coordinator->initialize(frozen.physical,frozen.device,frozen.queueFamily,
-            inheritedSubmit,frozen.width,frozen.height,sr?2.f:1.f,{},
+            inheritedSubmit,frozen.width,frozen.height,sr?2.f:1.f,hostTiming,
             alignment,wronski,sr?MergeAlgorithm::Wronski:MergeAlgorithm::HdrPlusFrequency,hdrq);
     }
     std::vector<BurstFrame> upstream;

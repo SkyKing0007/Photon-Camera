@@ -210,11 +210,10 @@ void runRealRawrFromFrozenDirectNormals(
                    << "- Robustness: " << t.robustnessMs << " ms\n"
                    << "- Frequency accumulation: " << t.accumulationMs << " ms\n"
                    << "- Finalize: " << t.finalizeMs << " ms\n"
-                   << "- GPU execution: " << t.chunkGpuMs << " ms\n"
-                   << "- GPU fence waits (includes execution): " << t.chunkWaitMs << " ms\n"
-                   << "- Host recording: " << t.chunkRecordMs << " ms\n"
-                   << "- Queue submit: " << t.chunkSubmitMs << " ms\n"
-                   << "- GPU submissions: " << t.chunkCount << "\n"
+                   << "- GPU fence waits (includes execution): " << iris26943HostChunkTimings.fenceWaitMs << " ms\n"
+                   << "- Host recording: " << iris26943HostChunkTimings.recordMs << " ms\n"
+                   << "- Queue submit: " << iris26943HostChunkTimings.queueSubmitMs << " ms\n"
+                   << "- GPU submissions: " << result.submissionCount << "\n"
                    << "- RAW input route: " << (alreadyStaged?"pre_shutter_gpu_ring":
                                                   (resident?"post_shutter_resident":"two_slot")) << "\n"
                    << "- RAW post-shutter upload calls: " << uploadCalls << "\n"
@@ -222,9 +221,11 @@ void runRealRawrFromFrozenDirectNormals(
                    << "(Stage timings follow RAWR definitions; fusion wall includes host work. "
                    << "Shutter, capture, JPEG encoding and file write excluded.)";
             iris26943LastTimings=timing.str();
-            __android_log_print(ANDROID_LOG_INFO,"Iris26943","RAW_RAWR_EQUIVALENT_TIMING frame=%llu gpu=%.1f wait=%.1f chunk=%u",
-                 static_cast<unsigned long long>(frozen.normals[frozen.referenceIndex].timestampNs),
-                 t.chunkGpuMs,t.chunkWaitMs,t.chunkCount);
+            __android_log_print(ANDROID_LOG_INFO,"Iris26943",
+                "RAW_RAWR_EQUIVALENT_TIMING frame=%llu multiframeWallMs=%.1f recordMs=%.1f submitMs=%.1f fenceWaitMs=%.1f submissions=%u",
+                static_cast<unsigned long long>(frozen.normals[frozen.referenceIndex].timestampNs),
+                t.totalMs,iris26943HostChunkTimings.recordMs,iris26943HostChunkTimings.queueSubmitMs,
+                iris26943HostChunkTimings.fenceWaitMs,result.submissionCount);
         }
         originalMergeUploads=uploadCalls;
         originalMergeUploadMs=uploadMs;

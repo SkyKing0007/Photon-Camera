@@ -246,17 +246,30 @@ void TwoSlotRaw16Uploader::uploadHardwareBufferInto(uint32_t slot,AHardwareBuffe
     // AHB device import unavailable: attempt a CPU-read mapping only on this
     // worker, never inside ImageReader. If impossible, discard this OPTIONAL
     // ring update; at shutter retain the known 26942 frozen-RAW fallback.
-    AHardwareBuffer_Planes planes{};
-    if (AHardwareBuffer_lockPlanes(ahb,AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,-1,nullptr,&planes)!=0)
+    // Android API 26 baseline: lockPlanes is an API 29 entry point, and
+    // cannot be referenced by our API 26 NDK target. Camera2 RAW_SENSOR uses
+    // HAL_PIXEL_FORMAT_RAW16=0x20 (AIMAGE_FORMAT_RAW16); modern gralloc may
+    // instead use R16_UINT=0x39. The latter enum is NOT present in older NDK
+    // API26 headers, so use the documented numeric buffer-format values.
+    // Both are single-plane 16-bit; reject everything else and bad geometry.
+    constexpr uint32_t kCameraRaw16PixelFormat=0x20u;
+    constexpr uint32_t kR16UintPixelFormat=0x39u;
+    // Reuse the validated descriptor acquired at entry; do NOT redeclare.
+    const uint64_t rowBytes=uint64_t(desc.stride)*sizeof(uint16_t);
+    if (desc.width!=width_ || desc.height!=height_ || desc.layers!=1u ||
+        (desc.format!=kCameraRaw16PixelFormat && desc.format!=kR16UintPixelFormat) ||
+        desc.stride<width_ ||
+        rowBytes>std::numeric_limits<uint32_t>::max())
+        throw std::runtime_error("26943 AHB CPU fallback requires exact single-plane RAW16 geometry and stride");
+    void* raw=nullptr;
+    if (AHardwareBuffer_lock(ahb,AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,-1,nullptr,&raw)!=0)
         throw std::runtime_error("26943 GPU/CPU AHB ingress not supported; use original postshutter upload");
     struct Unlock {AHardwareBuffer* b;~Unlock(){AHardwareBuffer_unlock(b,nullptr);}} unlock{ahb};
-    if (planes.planeCount!=1 || !planes.planes[0].data ||
-        planes.planes[0].pixelStride!=2 || planes.planes[0].rowStride<width_*2u)
-        throw std::runtime_error("26943 AHB CPU fallback plane incompatible");
+    if (!raw) throw std::runtime_error("26943 AHB CPU fallback locked a null plane");
     Raw16PlaneBorrow frame{};
-    frame.source=static_cast<const unsigned char*>(planes.planes[0].data);
-    frame.bytes=uint64_t(planes.planes[0].rowStride)*height_;
-    frame.rowStride=planes.planes[0].rowStride;
+    frame.source=static_cast<const unsigned char*>(raw);
+    frame.bytes=rowBytes*height_;
+    frame.rowStride=static_cast<uint32_t>(rowBytes);
     frame.width=width_;frame.height=height_;frame.timestamp=1u;
     const std::vector<Raw16PlaneBorrow> one{frame};
     uploadInto(0u,slot,one);

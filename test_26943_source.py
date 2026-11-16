@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Strict complete source cross-references and 2050->2054 26942 authority.
-Full Android native/Kotlin/Java GLSL compilers remain mandatory in Actions.
+"""26943 V2: strict native cross-references against 26942 compiled authority.
+Android API26 NDK, original GLSL, Kotlin/Java and full assemble remain mandatory.
 """
 import sys,re
 from build_26943_incremental import R,BASE,scope,exact,fail,sha
@@ -25,14 +25,19 @@ def main():
  mismatch=cp('bridge/Iris26888BOffHdrqMismatch.comp')
  require(ring,('std::make_unique<TwoSlotRaw16Uploader>','images_->uploadHardwareBufferInto','std::unordered_set<uint64_t> seen','frames_[i].ready && frames_[i].timestamp==ts','bridgeForMerge','uploads_->execute','VK_NULL_HANDLE'),'GPU ring')
  require(hdr,('Iris26943GpuZslRing','select(', 'stage(', 'generation()'), 'GPU ring header')
- require(ingress,('importDirect(','importGpuBuffer(','AHardwareBuffer_lockPlanes','VK_FORMAT_R16_UINT','waitForCameraFence','uploadHardwareBufferInto','vkCmdCopyImage','vkCmdCopyBufferToImage','quarantineUnresolved'),'RAW hardware-buffer ingress')
+ require(ingress,('importDirect(','importGpuBuffer(','AHardwareBuffer_lock(','kCameraRaw16PixelFormat=0x20u','kR16UintPixelFormat=0x39u','AHardwareBuffer_describe','desc.stride','VK_FORMAT_R16_UINT','waitForCameraFence','uploadHardwareBufferInto','vkCmdCopyImage','vkCmdCopyBufferToImage','quarantineUnresolved'),'RAW hardware-buffer ingress')
+ if re.search(r'AHardwareBuffer_lockPlanes\s*\(',ingress):fail('Android API29 lockPlanes would break API26 native compilation')
+ if 'AHARDWAREBUFFER_FORMAT_R16_UINT' in ingress:fail('newer AHB R16 enum must not be referenced with API26 NDK headers')
+ if ingress.count('AHardwareBuffer_Desc desc{}')!=1:fail('AHB descriptor redeclaration breaks C++ compilation')
  require(jni,('Iris26943IngressWorker','pending.size()>=3u','std::try_to_lock','AHardwareBuffer_acquire','AHardwareBuffer_release','bOffCache->ring->select(selected,','req.preStagedGpu','req.initialWaitSemaphore','vkDeviceWaitIdle(ctx.device)','nativeTryZslGpuStage'),'nonblocking camera worker')
  require(device,('const bool twoQueues = photoBOffTwoQueue','queueCount >= 2','q.queueCount = twoQueues ? 2u : 1u','ingressQueue_ = queue','vkGetDeviceQueue(dev, i, 1u, &queue_)','const float priorities[2] = {1.0f, 1.0f}'),'isolated queues')
  require(device_h,('VulkanDeviceOwner(bool photoBOffTwoQueue','ingressQueue()','hasSeparateIngressQueue()'),'queue owner ABI')
- require(run,('const bool alreadyStaged=hdrq && !request.preStagedGpu.empty()','!bOffReusable','merge.prepareNormal=[](std::uint32_t){}','pre_shutter_gpu_ring','post_shutter_resident','two_slot','- RAW post-shutter upload calls: ','- GPU fence waits (includes execution): '),'run/EXIF')
+ require(run,('const bool alreadyStaged=hdrq && !request.preStagedGpu.empty()','!bOffReusable','merge.prepareNormal=[](std::uint32_t){}','pre_shutter_gpu_ring','post_shutter_resident','two_slot','- RAW post-shutter upload calls: ','- GPU fence waits (includes execution): ','result.submissionCount','iris26943HostChunkTimings.fenceWaitMs','t.totalMs'),'run/EXIF')
+ if re.search(r'\bt\.chunk(?:GpuMs|WaitMs|RecordMs|SubmitMs|Count)\b',run):
+  fail('unimplemented vendor BurstStageTimings chunk member used by native runner')
  require(run_h,('std::vector<TransientImageView> preStagedGpu','VkSemaphore initialWaitSemaphore'),'frozen GPU handoff')
- require(coord,('initialWaitSemaphore','VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT','vkQueueSubmit'),'cross queue dependency')
- require(coord_h,('VkSemaphore initialWaitSemaphore'),'coordinator API')
+ require(coord,('initialWaitSemaphore','VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT','vkQueueSubmit','Stage::RecordBegin','Stage::RecordEnd','Stage::SubmitBegin','Stage::SubmitEnd','Stage::FenceWaitBegin','Stage::FenceWaitEnd','std::chrono::steady_clock'),'real native StageSink clock')
+ require(coord_h,('VkSemaphore initialWaitSemaphore','extern thread_local Iris26943HostChunkTimings'),'coordinator ABI')
  require(rec,('hdrq_motion_min','mp.motionEnabled = iris26941BOffHdrqLazyPoolReset','sizeof(BorderPc)==16u','sizeof(MismatchPc) == 100u','ShaderId::HdrqBorder'),'motion support')
  require(mismatch,('layout(set = 0, binding = 5, r32f)','int motionEnabled;','if (p.motionEnabled != 0)','pointSupport(','sSupport[64]'),'motion mismatch')
  require(border,('layout(set = 0, binding = 2, r32f)','int motionEnabled;','if (p.motionEnabled != 0)','imageLoad(refRgba','smoothstep(0.24,0.78','imageStore(img'),'reference blend')
@@ -44,13 +49,17 @@ def main():
  version=src('app/version.properties',live)
  require(version,('VERSION_NAME=0.9726943','VERSION_BUILD=26943'),'version')
  if live:
-  # Existing 26942 B scheduler and all vendor revisions are byte-identical.
+  pinned=(R/'app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/include/rawr/raw_gpu_pipeline/AndroidBurstCoordinator.h').read_text()
+  require(pinned,('struct BurstStageTimings','double totalMs','std::uint32_t submissionCount','using StageSink','FenceWaitBegin','FenceWaitEnd'),'actual pinned 26942 vendor ABI')
+  if re.search(r'\b(?:chunkGpuMs|chunkWaitMs|chunkRecordMs|chunkSubmitMs|chunkCount)\b',pinned):
+   fail('26943 native timing ABI audit must be updated for new vendor members')
+  # Existing successful 26942 scheduler, shader and vendor byte-invariance.
   for protected in ('app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp',
                     'app/src/main/assets/shaders/motionv2/render.glsl',
                     'app/src/main/assets/shaders/motionv2/gainmap.glsl'):
-   if old.get(protected)!=new.get(protected):fail('existing successful 26942 protected path altered '+protected)
-   if sha(BASE/protected)!=sha(R/protected):fail('actual previous runtime protected content mismatch')
- print('PASS 26943 native ring/ingress/queues/exact 15 frozen frames/cross-queue dependency/motion reference/RAWR timings; 17 changed+4 added, 2033 protected')
+   if old.get(protected)!=new.get(protected):fail('successful 26942 protected path altered '+protected)
+   if sha(BASE/protected)!=sha(R/protected):fail('previous compiled runtime protected content mismatch')
+ print('PASS 26943 V2 API26 AHB, real pinned StageSink timing ABI, GPU ZSL ownership, shader, 17 changed+4 added, 2033 protected')
 if __name__=='__main__':
  try:main()
  except Exception as e:print(str(e),file=sys.stderr);sys.exit(1)

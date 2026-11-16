@@ -12,6 +12,13 @@
 #include <vector>
 
 namespace iris26864 {
+// Measured on the SAME B-OFF worker via RAWR's existing native StageSink.
+// These are HOST times (including fence-blocked GPU execution), not claimed
+// GPU timestamps. The pinned vendor source and its timing ABI remain intact.
+struct Iris26943HostChunkTimings final {
+    double recordMs=0.0, queueSubmitMs=0.0, fenceWaitMs=0.0;
+};
+extern thread_local Iris26943HostChunkTimings iris26943HostChunkTimings;
 enum class RealBEngine { HdrPlusFrequency, WronskiTrue2x };
 enum class FrozenRawInputLayout { FencedTwoSlot, CaptureResident };
 struct RealRawrNormal final {
