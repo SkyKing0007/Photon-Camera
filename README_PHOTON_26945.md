@@ -1,6 +1,6 @@
-# Photon 26945 — front camera UHDR gain and camera-switch preview handoff
+# Photon 26945 V2 — front camera UHDR gain and camera-switch preview handoff
 
-**PREPARED FOR ACTIONS, NOT BUILD-PROVEN.** Upload exactly ONE ZIP with three sequential stages to the **existing** `experimental-clean-photon-rebuild` branch using vscode.dev. This ZIP is **not an APK**, and requires no locally run scripts from the user.
+**V2 repair of rejected 26945 V1 Actions run 43914080364. PREPARED FOR ACTIONS, NOT BUILD-PROVEN.** Upload exactly ONE ZIP with three sequential stages to the **existing** `experimental-clean-photon-rebuild` branch using vscode.dev. This ZIP is **not an APK**, and requires no locally run scripts from the user.
 
 1. **Stage 1:** Upload the contents of `STAGE_1_UPLOAD_NO_PUSH` to the root of the intended branch, preserving relative paths. Commit/upload without pushing; do not touch `dev`.
 2. **Stage 2:** Upload `STAGE_2_WORKFLOW_NO_PUSH/.github/workflows/build-26945-change-aware.yml` to the same branch, commit without pushing. All 26944 historical checks remain inherited.
@@ -30,3 +30,7 @@ Full source manifests, pinned real shader/NDK validations, exact historical 141-
 ## State and verification
 
 This package includes local source/geometry/switch tests, actual successful 26944 compiled-source protection proof, fail-closed sealed negatives, SHA-locked replay, and full-index forward/rollback patches at 7/12/40. `26945_LOCAL_VERIFICATION.txt` records their executed state. No 26945 APK has been assembled locally, and device visual testing remains unperformed. The release is only **BUILD-PROVEN** after the new Actions job succeeds **and** publishes its actual single APK/source artifact; compiled success alone does not establish front photo visual quality.
+
+## V2 targeted failure repair and prevention
+
+26945 V1 failed at exact 26944 compiled-source reconstruction before Android compilation: the 26945 runner contained a 65-character TAR_SHA literal due to one extra `a`. The correct published 26944 source TAR SHA-256 is `89dcc008d52993895b9aae04fb3b0554008c19487fa9bac9e6a8ef3286734cd0`. V2 validates canonical digest lengths, verifies the artifact's source TAR checksum receipt, and hashes the actual TAR bytes before restoration. The fail-closed negative suite includes a 65-character regression. **The six front/preview source overlays and successful 26944 shader/NDK/Gradle workflow remain identical to V1.** Upload all three V2 stages in order; stage 3 trigger text has advanced, so the new run can start. Do not rerun V1.

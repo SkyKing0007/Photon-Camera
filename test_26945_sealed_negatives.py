@@ -58,7 +58,16 @@ def main():
     else:b.fail('re-sealed malicious bypass accepted '+rel)
    finally:
     f.write_bytes(orig);seal.write_bytes(oldseal)
-  if passed!=len(cases)+3:b.fail('incorrect negative test count '+str(passed))
+  # The actual 26945 V1 error: 65-character SHA-256 literal escaped original tests.
+  # Negative test does not modify the sealed files or weaken existing checks.
+  good=b.TAR_SHA
+  try:
+   b.TAR_SHA=good[:52]+'a'+good[52:]
+   try:b.seal()
+   except Exception:passed+=1
+   else:b.fail('noncanonical 65-character source TAR SHA accepted')
+  finally:b.TAR_SHA=good
+  if passed!=len(cases)+4:b.fail('incorrect negative test count '+str(passed))
   b.seal()
  b.R=original
  print('PASS '+str(passed)+' fail-closed 26945 sealed negative mutations, incl re-SHA tampering and old 26944 check removal')

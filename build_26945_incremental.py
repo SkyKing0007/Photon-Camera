@@ -2,14 +2,14 @@
 """Photon 26945: exact successful 26944 Actions candidate and change-aware three-stage release.
 No downgrade to static validators. All true Android builds happen in the guarded Actions job.
 """
-import argparse,gzip,hashlib,json,os,pathlib,shutil,subprocess,sys,tarfile,tempfile,urllib.request,zipfile
+import argparse,gzip,hashlib,json,os,pathlib,re,shutil,subprocess,sys,tarfile,tempfile,urllib.request,zipfile
 R=pathlib.Path(__file__).resolve().parent
 TMP=R/'.photon_26945_incremental_work';OUT=R/'photon_26945_outputs'
 ART=TMP/'26944-success.zip';BASE=TMP/'authority_26944';CAND=TMP/'candidate_26945'
 REPO='SkyKing0007/Photon-Camera';BRANCH='experimental-clean-photon-rebuild'
 RUN=43877748845;COMMIT='e3dad87829003c53c603c0a05cb261e79dc131bd';ART_ID=14231721191
 ART_SHA='e0ed9d81eb7b7c7930f7fc88a9045724a5be8f5db0212a45fe4cc7c9b671a5df'
-TAR_SHA='89dcc008d52993895b9aae04fb3b0554008c19487fa9bac9e6a8aef3286734cd0'
+TAR_SHA='89dcc008d52993895b9aae04fb3b0554008c19487fa9bac9e6a8ef3286734cd0'
 BUILDER_SHA='fc699cd3a818256cd9a22ddbee31fe8ba13e5d86335db0528370776444e5cd3e'
 WORKFLOW_SHA='17236bb162ec9989bbc7f543ac2029f736a62bf95bba24fe7dfc4d2bf00d3f72'
 PRIOR_APK_SHA='7170698e5760471b356e23a151e7955d3b7a312175d8b42a538204f437ddc164'
@@ -78,6 +78,13 @@ def scope():
  return ch,old,new
 
 def seal():
+ # Every locked authority digest must be a canonical SHA-256 before any artifact fetch.
+ # 26945 V1 had a 65-character source-TAR literal; historical syntax checks did not
+ # catch it, and genuine Actions stopped at the source restoration gate.
+ for name in ('ART_SHA','TAR_SHA','BUILDER_SHA','WORKFLOW_SHA','PRIOR_APK_SHA'):
+  val=globals()[name]
+  if not isinstance(val,str) or not re.fullmatch(r'[0-9a-f]{64}',val):
+   fail('noncanonical or stale authority SHA-256 '+name)
  ch,old,new=scope()
  sealed={}
  for line in (R/'26945_HANDOFF_HASHES.sha256').read_text().splitlines():
@@ -123,7 +130,17 @@ def fetch():
  TMP.mkdir(exist_ok=True)
  subprocess.run(['curl','--fail','--location','--retry','3','--silent','--show-error','-H','Authorization: Bearer '+token,'-H','Accept: application/vnd.github+json','https://api.github.com/repos/'+REPO+'/actions/artifacts/'+str(ART_ID)+'/zip','-o',str(ART)],check=True)
  if sha(ART)!=ART_SHA:fail('26944 downloaded artifact ZIP SHA mismatch')
- print('PASS exact successful published 26944 GitHub Actions/artifact bytes')
+ with zipfile.ZipFile(ART) as z:
+  if z.testzip():fail('26944 published artifact ZIP CRC failed')
+  tarname='photon_26944_outputs/26944_candidate_app_source.tar.gz'
+  receiptname=tarname+'.sha256'
+  if tarname not in z.namelist() or receiptname not in z.namelist():fail('compiled 26944 source TAR or receipt missing')
+  if z.read(receiptname).decode('ascii')!=TAR_SHA+'  26944_candidate_app_source.tar.gz\n':fail('26944 published source TAR SHA receipt invalid')
+  with z.open(tarname) as f:
+   h=hashlib.sha256()
+   for block in iter(lambda:f.read(4*1024*1024),b''):h.update(block)
+   if h.hexdigest()!=TAR_SHA:fail('26944 published source TAR actual bytes SHA differs')
+ print('PASS exact successful published 26944 GitHub Actions, artifact, source TAR and source receipt bytes')
 
 def safe_tar(blob,dst):
  with tarfile.open(fileobj=blob,mode='r:gz') as t:
@@ -145,7 +162,11 @@ def prepare():
    if p not in z.namelist():fail('missing published 26944 member '+p)
    return z.read(p)
   raw=get('26944_candidate_app_source.tar.gz')
-  if hashlib.sha256(raw).hexdigest()!=TAR_SHA:fail('actual compiled 26944 source TAR wrong')
+  reported=get('26944_candidate_app_source.tar.gz.sha256').decode('ascii')
+  if reported!=TAR_SHA+'  26944_candidate_app_source.tar.gz\n':
+   fail('successful 26944 source TAR published receipt differs from locked SHA')
+  actual_tar_sha=hashlib.sha256(raw).hexdigest()
+  if actual_tar_sha!=TAR_SHA:fail('actual compiled 26944 source TAR wrong: actual='+actual_tar_sha+' expected='+TAR_SHA)
   expected=(R/'26945_BASE_26944_FULL_APP.sha256').read_bytes()
   if get('26944_PREBUILD_SEALED_APP.sha256')!=expected or get('26944_EXPECTED_FULL_APP.sha256')!=expected:fail('26944 source manifest mismatch')
   if hashlib.sha256(get('ACTUAL_EXECUTED_build_26944_incremental.py')).hexdigest()!=BUILDER_SHA or BUILDER_SHA not in get('26944_ACTUAL_EXECUTED_BUILDER.sha256').decode():fail('26944 executed builder wrong')
