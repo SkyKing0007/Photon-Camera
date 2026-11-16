@@ -1,0 +1,173 @@
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 22ec80afdc33668379fde9b0cea6ebb0c62a5cdf..2a19c478fa2efb872ab8d18979b88e7107298715 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -15,6 +15,8 @@
+ // B/SR-OFF only; never B ON, A, A+B or Night.
+ uniform int iris26932BOffSdrLiftEnabled;
+ uniform int iris26941BOffHdrqLowZoom;
++// 26944: Night (normal and B) shares 26941's matched-SDR presentation only.
++uniform int iris26944NightMatchedSdrEnabled;
+ uniform int iris26908NightPresentationLiftEnabled;
+ uniform float displayGain;
+ uniform sampler2D iris26621LocalToneLog;
+@@ -550,7 +552,7 @@
+     mappedGuide=iris26770MidtonePresentationTrim(mappedGuide);
+     mappedGuide=iris26892SdrAdaptiveGuide(mappedGuide);
+     if(iris26906BVisualToneEnabled!=0) mappedGuide=iris26906BVisualTone(mappedGuide);
+-    if(iris26941BOffHdrqLowZoom!=0) mappedGuide=iris26941BOffMatchedSdrPrimary(mappedGuide,guide);
++    if(iris26941BOffHdrqLowZoom!=0 || iris26944NightMatchedSdrEnabled!=0) mappedGuide=iris26941BOffMatchedSdrPrimary(mappedGuide,guide);
+     else if(iris26932BOffSdrLiftEnabled!=0) mappedGuide=iris26932BOffSdrBridge(mappedGuide,guide);
+     vec3 mapped=rgb*(mappedGuide/guide);
+ 
+@@ -1311,7 +1313,7 @@
+             mappedGuide=iris26770MidtonePresentationTrim(mappedGuide);
+             mappedGuide=iris26892SdrAdaptiveGuide(mappedGuide);
+             if(iris26906BVisualToneEnabled!=0) mappedGuide=iris26906BVisualTone(mappedGuide);
+-            if(iris26941BOffHdrqLowZoom!=0) mappedGuide=iris26941BOffMatchedSdrPrimary(mappedGuide,sourceGuide);
++            if(iris26941BOffHdrqLowZoom!=0 || iris26944NightMatchedSdrEnabled!=0) mappedGuide=iris26941BOffMatchedSdrPrimary(mappedGuide,sourceGuide);
+             else if(iris26932BOffSdrLiftEnabled!=0) mappedGuide=iris26932BOffSdrBridge(mappedGuide,sourceGuide);
+             linearSrgb=sourceRgb*(mappedGuide/sourceGuide);
+         }else{
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
+index 3d477c3ed545c82b7529cdac4b700ca4789b359f..308da51c2760cca43d12b3dc9ead354c4ff872aa 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
+@@ -194,6 +194,20 @@
+                   alignmentPrior * smoothstep(0.08, 0.28, mm))
+             : max(localMotion, smoothstep(0.18, 0.60, mm));
+         reject = max(reject, alignmentPrior * smoothstep(0.08, 0.28, mm));
++        // 26944: reject ghost/chroma contributors *before* Fourier reconstruction.
++        // Support was measured on the subpixel-warped RAW companion in the
++        // preceding barrier-separated mismatch dispatch (25th-percentile CFA
++        // consistency). Only substantial disagreement AND HDRq mismatch
++        // strengthen reference selection. Stationary data is exactly 26942;
++        // no post-FFT periodic tile mask or synthetic motion blur is applied.
++        if (p.supportMeasured != 0) {
++            float evidence = smoothstep(0.48, 0.82, 1.0 - independentSupport)
++                           * smoothstep(0.10, 0.27, mm);
++            // Exact 26942 numerical path whenever evidence is zero: avoid
++            // even a rounding change in stationary Fourier tile coefficients.
++            if (evidence > 0.0)
++                reject = 1.0 - (1.0 - reject) * (1.0 - evidence);
++        }
+         weight = mix(weight, 1.0, reject);
+         imageStore(outFt, o, imageLoad(outFt, o) + (1.0 - weight) * alRe + weight * refRe);
+         imageStore(outFt, o + ivec2(1, 0), imageLoad(outFt, o + ivec2(1, 0)) + (1.0 - weight) * alIm + weight * refIm);
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+index 9d313e98ba3f9bdcac4ad8cf1104897230805f58..b06eebca612a5639d79a25c37b51e0423cebb4a7 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+@@ -596,11 +596,7 @@
+     const VkClearColorValue zero{};
+     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+     vkCmdClearColorImage(c, arena_.image("hdrq_total_mismatch").image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+-    if (iris26941BOffHdrqLazyPoolReset && uniformExposure_ && rawNoiseMeasured_) {
+-        VkClearColorValue oneMotion{}; oneMotion.float32[0]=1.0f;
+-        vkCmdClearColorImage(c,arena_.image("hdrq_motion_min").image,
+-                             VK_IMAGE_LAYOUT_GENERAL,&oneMotion,1,&range);
+-    }
++    // 26944: no per-pass minimum-confidence clear; restored 26942 image math.
+     // Bracketed merges seed each bin's weight sum with the reference's weight.
+     if (!uniformExposure_) {
+         VkClearColorValue one{};
+@@ -651,7 +647,10 @@
+     mp.exposureFactor = exposureFactor;
+     mp.uniformExposure = uniformExposure_ ? 1 : 0;
+     mp.measuredNoise = rawNoiseMeasured_ ? 1 : 0;
+-    mp.motionEnabled = iris26941BOffHdrqLazyPoolReset && uniformExposure_ && rawNoiseMeasured_ ? 1 : 0;
++    // 26944: 26943 per-pass minimum evidence must never feed a periodic 8x8
++    // reference-replacement mask. Motion rejection remains in the aligned
++    // noise-aware Fourier merger, before inverse transform.
++    mp.motionEnabled = 0;
+     mp.referenceWhite = referenceWhite_;
+     mp.gainForMask = frameGain(slot);
+     for (std::size_t s = 0; s < 4u; ++s) {
+@@ -775,8 +774,9 @@
+     executor_.record(c, ShaderId::HdrqBackwardDft, {{ib(0, finalFt), ib(1, out)}, {}}, &bp, sizeof(bp), tx, ty);
+     computeWriteBarrier(c);
+     // Exposure control off: upstream passes black level -1, so the clamp floor is -2 * window.
+-    BorderPc bd{std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight), -2.0f,
+-                iris26941BOffHdrqLazyPoolReset && uniformExposure_ && rawNoiseMeasured_ ? 1 : 0};
++    // 26944: the 26942 HDRq border, window and reference blend must remain
++    // numerically identical. Never apply the 26943 periodic interior mask.
++    BorderPc bd{std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight), -2.0f, 0};
+     executor_.record(c, ShaderId::HdrqBorder,
+                      {{ib(0,out), ib(1,arena_.image("hdrq_ref_rgba")),
+                        ib(2,arena_.image("hdrq_motion_min"))}, {}}, &bd, sizeof(bd),
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+index 32a00a9c229cf04ebd9f15bfddf6d54571f68392..fc4cdc221c4b2c96f326fab39cd34261d99098df 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+@@ -142,7 +142,7 @@
+     barrier();
+     if (lane != 0u) return;
+     if (p.uniformExposure != 0) {
+-        // 12.5th percentile of 8x8 local confidence, insensitive to an isolated
++        // 26944: restored successful 26942 25th percentile of 8x8 local confidence, insensitive to an isolated
+         // bad pixel but protective when a moving edge occupies part of a tile.
+         // Four overlapping 8x8 Fourier passes soften tile transitions.
+         float worst16[16];
+@@ -157,7 +157,7 @@
+                 }
+             }
+         }
+-        float support = clamp(worst16[7],0.0,1.0);
++        float support = clamp(worst16[15],0.0,1.0);
+         imageStore(independentSupport,g,vec4(support));
+         if (p.motionEnabled != 0)
+             imageStore(motionMin,g,vec4(min(imageLoad(motionMin,g).x,support)));
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index e142fa8fd9a4aac8a6c3d327e217c5c7f320855a..8057c6cc343ec19940a963236341963105b41759 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1394,6 +1394,9 @@
+                             && !basePipeline.mParameters.irisNightActive
+                             && !basePipeline.mParameters.iris26903NightB) ? 1 : 0);
+             glProg.setVar("iris26941BOffHdrqLowZoom", iris26941BOffHdrqLowZoom ? 1 : 0);
++            glProg.setVar("iris26944NightMatchedSdrEnabled",
++                    (basePipeline.mParameters.irisNightActive
++                            || basePipeline.mParameters.iris26903NightB) ? 1 : 0);
+             glProg.setVar("iris26908NightPresentationLiftEnabled",
+                     (basePipeline.mParameters.irisNightActive
+                     || basePipeline.mParameters.iris26903NightB) ? 1 : 0);
+@@ -1579,6 +1582,8 @@
+                                 && !basePipeline.mParameters.irisNightActive
+                                 && !basePipeline.mParameters.iris26903NightB) ? 1 : 0);
+                 glProg.setVar("iris26941BOffHdrqLowZoom", iris26941BOffHdrqLowZoom ? 1 : 0);
++                // 26944 Night highlight gate is applied ONCE after Jin in
++                // IrisNightUltraHdr, not in the pre-Jin gain-map GLSL.
+                 glProg.setVar("maxGainRatio", encodingMaxGainRatio);
+                 glProg.setVar("iris26621LocalToneEnabled",
+                         basePipeline.mParameters.motionV2Active && iris26621LocalTone != null ? 1 : 0);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisNightUltraHdr.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisNightUltraHdr.java
+index 3ceec0e92540967f334d7d5c2fab549b81830ac7..ff9a8c0e1a83eea9ad111b7bfca317b1b343a22a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisNightUltraHdr.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisNightUltraHdr.java
+@@ -101,6 +101,15 @@
+                 double fin = Math.max(0.0, finalLuma[i]);
+                 double ratio = oldRatio * (pre + UHDR_OFFSET) / (fin + UHDR_OFFSET);
+                 ratio = Math.max(1.0, Math.min(prepared.maxRatio, ratio));
++                // 26944: the HDR master remains Sabre's *pre-Jin* exposure.
++                // Apply the same 26941 highlight-only gain gate AFTER Jin
++                // rebase so post-Jin body/shadow contrast cannot be lifted by
++                // a broad gainmap. This is luminance-only, pointwise and Night
++                // exclusive; no RGB, Jin or native reconstruction changes.
++                double hdrIntent = Math.max(0.0, oldRatio * (pre + UHDR_OFFSET) - UHDR_OFFSET);
++                double gateT = Math.max(0.0, Math.min(1.0, (hdrIntent - 0.68) / 0.28));
++                double highlightGate = gateT * gateT * (3.0 - 2.0 * gateT);
++                ratio = 1.0 + (ratio - 1.0) * highlightGate;
+                 int newCode = logMax > 1.0e-9
+                         ? (int)Math.round(Math.log(ratio) / logMax * 255.0) : 0;
+                 newCode = Math.max(0, Math.min(255, newCode));
+diff --git a/app/version.properties b/app/version.properties
+index 6497081eebacec0a980d7f30ca94548a92ec9ec3..0411d26a7a806fba753f78d4e85b6a3e2b612989 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726943
+-VERSION_BUILD=26943
++VERSION_NAME=0.9726944
++VERSION_BUILD=26944
