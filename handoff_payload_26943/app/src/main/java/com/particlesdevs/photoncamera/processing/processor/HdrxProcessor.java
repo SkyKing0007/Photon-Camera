@@ -1571,7 +1571,7 @@ private void ApplyHdrX() {
                 // once and is not fabricated from shutter-to-save wall time.
                 if (iris26856BOnly && !mIris26903NightB) {
                     String iris26943Timing = com.hinnka.mycamera.processor.GlesIris26864NativeRawr.takeTiming(
-                            iris26409V2.referenceTimestamp);
+                            iris26363ReferenceTimestamp);
                     if (iris26943Timing != null && !iris26943Timing.isEmpty())
                         exifData.IMAGE_DESCRIPTION = "Iris Photo B HDR+ Higher Quality\nTIMINGS\n" + iris26943Timing;
                 }
