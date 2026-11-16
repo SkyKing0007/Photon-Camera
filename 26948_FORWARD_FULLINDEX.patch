@@ -1,0 +1,496 @@
+diff --git a/app/src/main/assets/shaders/iris26876/b_fused_final_p3_gain.frag b/app/src/main/assets/shaders/iris26876/b_fused_final_p3_gain.frag
+index efebf89a8681858b2fc0d0942ae62c1b8ab1b65b..06157bde44aaf1c897b6aa29f9b3bb2c5df0c3df 100644
+--- a/app/src/main/assets/shaders/iris26876/b_fused_final_p3_gain.frag
++++ b/app/src/main/assets/shaders/iris26876/b_fused_final_p3_gain.frag
+@@ -40,8 +40,10 @@ uniform float uExposureEv;
+ uniform float uShadows;
+ uniform float uContrast;
+ uniform float uSaturation;
+-// Iris B / SR ON only; user settings remain independent. Night B stays unchanged.
++// 26932 B SR ON body tone retains its original Night policy.
+ uniform int uIris26932BOnTone;
++// 26948 B-only SDR/UHDR headroom also covers frozen Night B when routed here.
++uniform int uIris26948BUniversalSdrEnabled;
+ uniform float uSceneWhite;
+ uniform float uBodyToneStrength;
+ uniform int uMotionHdrHandoff;
+@@ -376,9 +378,21 @@ float iris26932BOnVisualTone(float y){
+     float contrast=pivot*pow(max(toe/pivot,1.0e-6),1.20);
+     return max(mix(toe,contrast,clamp(contrastGate,0.0,1.0)),0.0);
+ }
++/* IRIS_26948_B_TRUE2X_ONLY_SDR_UHDR_HEADROOM
++ * No extra texture pass. Shares 26948's strictly pointwise monotone shoulder,
++ * then converges to the frozen prior 26947 B-ON result at full-white headroom.
++ */
++float iris26948BHeadroomShoulder(float target){
++    if(target<=0.82)return target;
++    float excess=target-0.82;
++    float former=0.82+0.18*(1.0-exp(-excess/0.18));
++    float separated=0.82+0.18*excess/(excess+0.18);
++    return mix(separated,former,smoothstep(1.50,2.70,target));
++}
+ vec3 irisHeadroom(vec3 rgb,float localMappedGuide){
+     rgb=irisClampNonnegative(rgb);
+     float y=max(irisLuma(rgb),0.0),pk=irisPeak(rgb),guide=max(y,pk);
++    float originalGuide26948=guide;
+     /* IRIS_26621_SINGLE_TONE_OWNER_TRUE2X_GPU */
+     if(uMotionHdrHandoff!=0){
+         float globalMapped=iris26621MapMotionSdrFinalGuide(guide);
+@@ -402,6 +416,19 @@ vec3 irisHeadroom(vec3 rgb,float localMappedGuide){
+         float y=max(irisLuma(rgb),0.0);
+         if(y>1.0e-8)rgb*=iris26932BOnVisualTone(y)/y;
+     }
++    if(uIris26948BUniversalSdrEnabled!=0 && originalGuide26948>0.82){
++        float oldPeak=max(irisLuma(rgb),irisPeak(rgb));
++        if(oldPeak>1.0e-7){
++            float requested=max(uDisplayGain,1.0e-6)*0.80;
++            float target=max(oldPeak,originalGuide26948*requested);
++            float newGuide=iris26948BHeadroomShoulder(target);
++            // Rejoin the original 26947 true-2x smooth-white response before
++            // upstream clipping exhaustion; no new whiten/neutral mask.
++            float body=smoothstep(0.82,1.05,originalGuide26948)*
++                (1.0-smoothstep(2.0,2.70,originalGuide26948));
++            rgb*=mix(1.0,newGuide/oldPeak,body);
++        }
++    }
+     rgb=iris26638ApplyShadowFloorGuard(rgb);
+     float pk2=irisPeak(rgb);if(pk2>1.0)rgb*=1.0/max(pk2,1.0e-6);
+     return iris26638UserSaturation(irisClampNonnegative(rgb),uSaturation);
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index 809614174be70411f797c23d58a944f41ea68d2b..9d087ef2e2414e0a23d1958dd2283e8b83d63a25 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -11,6 +11,8 @@ uniform int iris26906BVisualToneEnabled;
+ // B/SR-OFF only; never B ON, A, A+B or Night.
+ uniform int iris26932BOffSdrLiftEnabled;
+ uniform int iris26941BOffHdrqLowZoom;
++// Frozen B identity: independent of lens, Super Res selection and B Night.
++uniform int iris26948BUniversalSdrEnabled;
+ uniform float maxGainRatio;
+ uniform float irisOutputZoom;
+ /* IRIS_26718_UHDR_HIGH_ZOOM_DETAIL_PARITY */
+@@ -332,6 +334,24 @@ float iris26941BOffMatchedSdrPrimary(float priorGuide,float sourceGuide){
+     if(target<=0.82)return target;
+     return 0.82+0.18*(1.0-exp(-(target-0.82)/0.18));
+ }
++/* IRIS_26948_B_ONLY_SDR_UHDR_CHROMA_HEADROOM
++ * Preserve the 26947 0.82 start and the EXACT old smooth-white curve at
++ * genuine extreme headroom >=2.70. In between, use a gentler monotone rational
++ * shoulder, with a positive-slope merge into the existing white transition.
++ * This leaves the upstream clipped-neutral provenance and actual HDR target
++ * untouched. No halo/semantic detector, no spatial cross-pixel operation.
++ */
++float iris26948BHeadroomShoulder(float target){
++    if(target<=0.82)return target;
++    float excess=target-0.82;
++    float former=0.82+0.18*(1.0-exp(-excess/0.18));
++    float separated=0.82+0.18*excess/(excess+0.18);
++    return mix(separated,former,smoothstep(1.50,2.70,target));
++}
++float iris26948BMatchedSdrPrimary(float priorGuide,float sourceGuide){
++    float requested=max(displayGain,1.0e-6)*hdrExposureScale;
++    return iris26948BHeadroomShoulder(max(max(priorGuide,0.0),max(sourceGuide,0.0)*requested));
++}
+ 
+ float iris26906BVisualTone(float y) {
+     float x=max(y,0.0);
+@@ -350,7 +370,8 @@ float iris26660SharedSdrGuide(float sourceGuide,vec2 masterSourcePixel){
+     float finalSdr=iris26892SdrAdaptiveGuide(
+             iris26770MidtonePresentationTrim(iris26660ObjectColorGamma(sharedSdr)));
+     if(iris26906BVisualToneEnabled!=0) finalSdr=iris26906BVisualTone(finalSdr);
+-    if(iris26941BOffHdrqLowZoom!=0) finalSdr=iris26941BOffMatchedSdrPrimary(finalSdr,sourceGuide);
++    if(iris26948BUniversalSdrEnabled!=0) finalSdr=iris26948BMatchedSdrPrimary(finalSdr,sourceGuide);
++    else if(iris26941BOffHdrqLowZoom!=0) finalSdr=iris26941BOffMatchedSdrPrimary(finalSdr,sourceGuide);
+     else if(iris26932BOffSdrLiftEnabled!=0) finalSdr=iris26932BOffSdrBridge(finalSdr,sourceGuide);
+     return finalSdr;
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 2a19c478fa2efb872ab8d18979b88e7107298715..004dedb9e17cb71b9bb200c64c3fbcf0540674b8 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -15,7 +15,10 @@ uniform int iris26906BVisualToneEnabled;
+ // B/SR-OFF only; never B ON, A, A+B or Night.
+ uniform int iris26932BOffSdrLiftEnabled;
+ uniform int iris26941BOffHdrqLowZoom;
+-// 26944: Night (normal and B) shares 26941's matched-SDR presentation only.
++// Set only by a frozen Experiment B snapshot, never A/A+B.
++uniform int iris26948BUniversalSdrEnabled;
++// 26944 fallback remains unchanged for non-B Night; the new frozen B 26948
++// headroom presentation overrides the final guide only when B is selected.
+ uniform int iris26944NightMatchedSdrEnabled;
+ uniform int iris26908NightPresentationLiftEnabled;
+ uniform float displayGain;
+@@ -499,6 +502,24 @@ float iris26941BOffMatchedSdrPrimary(float priorGuide,float sourceGuide){
+     if(target<=0.82)return target;
+     return 0.82+0.18*(1.0-exp(-(target-0.82)/0.18));
+ }
++/* IRIS_26948_B_ONLY_SDR_UHDR_CHROMA_HEADROOM
++ * Preserve the 26947 0.82 start and the EXACT old smooth-white curve at
++ * genuine extreme headroom >=2.70. In between, use a gentler monotone rational
++ * shoulder, with a positive-slope merge into the existing white transition.
++ * This leaves the upstream clipped-neutral provenance and actual HDR target
++ * untouched. No halo/semantic detector, no spatial cross-pixel operation.
++ */
++float iris26948BHeadroomShoulder(float target){
++    if(target<=0.82)return target;
++    float excess=target-0.82;
++    float former=0.82+0.18*(1.0-exp(-excess/0.18));
++    float separated=0.82+0.18*excess/(excess+0.18);
++    return mix(separated,former,smoothstep(1.50,2.70,target));
++}
++float iris26948BMatchedSdrPrimary(float priorGuide,float sourceGuide){
++    float requested=max(displayGain,1.0e-6)*outputExposureScale;
++    return iris26948BHeadroomShoulder(max(max(priorGuide,0.0),max(sourceGuide,0.0)*requested));
++}
+ 
+ float iris26906BVisualTone(float y) {
+     float x=max(y,0.0);
+@@ -552,7 +573,8 @@ vec3 mapExtendedLinearHeadroom(vec3 rgb) {
+     mappedGuide=iris26770MidtonePresentationTrim(mappedGuide);
+     mappedGuide=iris26892SdrAdaptiveGuide(mappedGuide);
+     if(iris26906BVisualToneEnabled!=0) mappedGuide=iris26906BVisualTone(mappedGuide);
+-    if(iris26941BOffHdrqLowZoom!=0 || iris26944NightMatchedSdrEnabled!=0) mappedGuide=iris26941BOffMatchedSdrPrimary(mappedGuide,guide);
++    if(iris26948BUniversalSdrEnabled!=0) mappedGuide=iris26948BMatchedSdrPrimary(mappedGuide,guide);
++    else if(iris26941BOffHdrqLowZoom!=0 || iris26944NightMatchedSdrEnabled!=0) mappedGuide=iris26941BOffMatchedSdrPrimary(mappedGuide,guide);
+     else if(iris26932BOffSdrLiftEnabled!=0) mappedGuide=iris26932BOffSdrBridge(mappedGuide,guide);
+     vec3 mapped=rgb*(mappedGuide/guide);
+ 
+@@ -1313,7 +1335,8 @@ void main() {
+             mappedGuide=iris26770MidtonePresentationTrim(mappedGuide);
+             mappedGuide=iris26892SdrAdaptiveGuide(mappedGuide);
+             if(iris26906BVisualToneEnabled!=0) mappedGuide=iris26906BVisualTone(mappedGuide);
+-            if(iris26941BOffHdrqLowZoom!=0 || iris26944NightMatchedSdrEnabled!=0) mappedGuide=iris26941BOffMatchedSdrPrimary(mappedGuide,sourceGuide);
++            if(iris26948BUniversalSdrEnabled!=0) mappedGuide=iris26948BMatchedSdrPrimary(mappedGuide,sourceGuide);
++            else if(iris26941BOffHdrqLowZoom!=0 || iris26944NightMatchedSdrEnabled!=0) mappedGuide=iris26941BOffMatchedSdrPrimary(mappedGuide,sourceGuide);
+             else if(iris26932BOffSdrLiftEnabled!=0) mappedGuide=iris26932BOffSdrBridge(mappedGuide,sourceGuide);
+             linearSrgb=sourceRgb*(mappedGuide/sourceGuide);
+         }else{
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856True2xCfa.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856True2xCfa.kt
+index 1c95c8ca465d9f9dc6154d169f61ce6c1e285c23..d6c5a6f9c41eba8220bae223dba6c39efbb3892f 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856True2xCfa.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856True2xCfa.kt
+@@ -191,8 +191,8 @@ internal object GlesIris26856True2xCfa {
+         uniform vec2 uCovRangeB;
+         uniform float uRawClipThreshold;
+         uniform int uUseFrameWeight;
+-        // Inherit 26720's evidence-only row-flicker reliability weighting.
+-        // No new capture timing or row-gain correction is introduced.
++        // Inherit 26720's existing row-flicker reliability. 26948 adds
++        // bounded B-only per-NORMAL-frame GPU radiometry, not RAW/DNG rewriting.
+         uniform int uRowFlickerEnabled;
+         uniform int uRowFlickerHarmonic;
+         uniform vec2 uRowFlickerAB;
+@@ -242,6 +242,22 @@ internal object GlesIris26856True2xCfa {
+                 v.y*uCovRangeRg.w+uCovRangeRg.z,
+                 v.z*uCovRangeB.y+uCovRangeB.x);
+         }
++        /* IRIS_26948_B_TRUE2X_EXACT_FRAME_ROW_CORRECTION
++         * All 2x sites receive the same proven per-NORMAL-frame row field.
++         * No CPU RAW rewrite, no SHORT correction, and no fabricated headroom.
++         * Guard near true-white and low-signal raw to avoid whitening artifacts.
++         */
++        float iris26948BRowGain(float rawSignal, float rowUv){
++            if(uRowFlickerEnabled==0 || uRowFlickerHarmonic<=0 ||
++               uRowFlickerStrength<=0.0 || length(uRowFlickerAB)<0.025) return 1.0;
++            float angle=6.283185307179586*float(uRowFlickerHarmonic)*clamp(rowUv,0.0,1.0);
++            float logModulation=dot(uRowFlickerAB,vec2(cos(angle),sin(angle)));
++            float goodSignal=smoothstep(0.005,0.025,max(rawSignal,0.0));
++            float goodWhite=1.0-smoothstep(0.83,0.97,max(rawSignal,0.0));
++            float correction=clamp(-logModulation,-0.16,0.16)*
++                clamp(uRowFlickerStrength,0.0,1.0)*goodSignal*goodWhite;
++            return exp(correction);
++        }
+         float rowReliability(float rowUv) {
+             if (uRowFlickerEnabled == 0 || uRowFlickerHarmonic <= 0 ||
+                 uRowFlickerStrength <= 0.0) return 1.0;
+@@ -308,6 +324,7 @@ internal object GlesIris26856True2xCfa {
+             }
+             float vote=weight>1e-5 ? admission : 0.0;
+             float normalized=weight>1e-5?numerator/weight:0.0;
++            float iris26948RowGain=iris26948BRowGain(normalized,sampleUv.y);
+             // Pixel value is one observation per frame, never nine independent
+             // temporal measurements from the same RAW frame.
+             // A frame's nine local same-CFA samples are not nine temporal frames.
+@@ -315,6 +332,10 @@ internal object GlesIris26856True2xCfa {
+             float perFrameVariance=(max(uPhaseNoiseShot26863[targetCanonical],0.0)*
+                 max(normalized,0.0)+max(uPhaseNoiseRead26863[targetCanonical],0.0)) *
+                 (weight>1.0e-5?weightSquared/(weight*weight):0.0);
++            // Keep shot/read variance physically associated with the exact
++            // measured RAW, then propagate the radiometric correction gain^2.
++            normalized*=iris26948RowGain;
++            perFrameVariance*=iris26948RowGain*iris26948RowGain;
+             oSignalWeight=vec4(normalized*vote,vote,vote*vote,256.0*vote*vote*perFrameVariance);
+             vec2 phase=fract(flow.xy*vec2(uRawFullSize));
+             int bin=(phase.x>=0.5?1:0)+(phase.y>=0.5?2:0);
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 9368cda3eb1ed7eacc8bfa86fcfd8ee48ac9d6b1..ecec21d20394781b6e8c5c9a6ed4342416bee2fd 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -5580,6 +5580,26 @@ internal object GlesMgcRawSabreShaders {
+                 packedCovariance.y * uCovRangeRg.w + uCovRangeRg.z,
+                 packedCovariance.z * uCovRangeB.y + uCovRangeB.x);
+         }
++        /* IRIS_26948_B_ONLY_GPU_ROW_RADIOMETRY
++         * Correct only the B-owned, exact-frame confirmed RAW harmonic before
++         * temporal RGB/CFA fusion. Physical RAW, DNG, clipping confidence,
++         * frame eligibility, and underlying exact sensor samples remain frozen.
++         * The 0.16 log cap is intentionally conservative; extreme flicker is
++         * NOT a license to extrapolate through clipped wells or invent colors.
++         * The original 26720 dark-row reliability gate remains unchanged.
++         */
++        float iris26948BRowCorrect(float signal, float rowUv, float sourceHeadroom){
++            if(uBNoiseMomentOwner26858==0 || uRowFlickerEnabled==0 ||
++               uRowFlickerHarmonic<=0 || uRowFlickerStrength<=0.0 ||
++               length(uRowFlickerAB)<0.025) return signal;
++            float angle=6.283185307179586*float(uRowFlickerHarmonic)*clamp(rowUv,0.0,1.0);
++            float logModulation=dot(uRowFlickerAB,vec2(cos(angle),sin(angle)));
++            float goodSignal=smoothstep(0.005,0.025,max(signal,0.0));
++            float goodHeadroom=smoothstep(0.04,0.15,sourceHeadroom);
++            float correction=clamp(-logModulation,-0.16,0.16)*
++                clamp(uRowFlickerStrength,0.0,1.0)*goodSignal*goodHeadroom;
++            return signal*exp(correction);
++        }
+         float rowReliability(float rowUv) {
+             if (uRowFlickerEnabled == 0 || uRowFlickerHarmonic <= 0 || uRowFlickerStrength <= 0.0) return 1.0;
+             float phase = 6.283185307179586 * float(uRowFlickerHarmonic) * clamp(rowUv, 0.0, 1.0);
+@@ -5599,6 +5619,10 @@ internal object GlesMgcRawSabreShaders {
+                 ivec2 p = pixelForPhaseLattice(nearest, phase);
+                 value = guardedRaw26855(p);
+                 headroom = headroomForSignal26855(value);
++                // Exact physical headroom is evaluated BEFORE display-only B
++                // row normalization; no changed clipped/SHORT/DNG provenance.
++                value = iris26948BRowCorrect(value,
++                    (float(p.y)+0.5)/float(uRawSize.y),headroom);
+                 return;
+             }
+             ivec2 base = ivec2(floor(lattice));
+@@ -5618,6 +5642,8 @@ internal object GlesMgcRawSabreShaders {
+                 }
+             }
+             value = sum / max(weight, 1.0e-8);
++            value = iris26948BRowCorrect(value,
++                sourceCenter.y/float(uRawSize.y),headroom);
+         }
+         float quadRejection(ivec2 quadOrigin) {
+             if (uUseFrameWeight == 0) return 1.0;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index b6bcb7687b3a153757ed13d48b45b8e147e37433..65d7aca79de252db974fe6dad824a510869cd21f 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -1865,6 +1865,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private int mMotion26678StableDriftFrames = 0;
+     private volatile boolean mMotion26678FlickerActive = false;
+     private volatile int mMotion26678ActiveHarmonic = 0;
++    /* IRIS_26948_EXACT_B_ROW_FLICKER_FREQUENCY_AUTHORITY. Under detector lock.
++     * Never turn a row harmonic into guessed 50/60Hz without actual Camera2
++     * skew and repeated coherent RAW samples from this physical camera epoch. */
++    private long mIris26948FlickerSampleTimestampNs = 0L;
++    private double mIris26948FlickerSampleSpanFraction = Double.NaN;
+     /* IRIS_26679_FLICKER_STATE_HYSTERESIS
+      * 26678 could enter/exit on adjacent RAWs when one evidence frame narrowly missed coherence.
+      * Require a stronger entry and four consecutive unsupported frames before exit. This changes
+@@ -2525,6 +2530,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mMotion26678PreviousPhaseDirection = 0;
+         mMotion26678StableDriftFrames = 0;
+         mMotion26678FlickerActive = false;
++        mIris26948FlickerSampleTimestampNs = 0L;
++        mIris26948FlickerSampleSpanFraction = Double.NaN;
+         mMotion26678ActiveHarmonic = 0;
+         mMotion26679FlickerMissFrames = 0;
+     }
+@@ -2556,7 +2563,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         try {
+             int top = 2;
+             int bottom = height - 2;
+-            if (PhotonCamera.getSettings().aspect169 && width > height) {
++            // B RAW correction operates on the full physical sensor row lattice.
++            // Keep the old aspect-cropped detector byte-for-byte for Experiment A.
++            if (!iris26871BExposureSelected()
++                    && PhotonCamera.getSettings().aspect169 && width > height) {
+                 int cropHeight = width * 9 / 16;
+                 if (cropHeight > 0 && cropHeight < height) {
+                     int offset = (height - cropHeight) / 2;
+@@ -2768,6 +2778,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         : 0.0f;
+                 motion26678StoreEvidenceLocked(image.getTimestamp(), bestHarmonic,
+                         coherentBlocks, bestA, bestB, bestAmplitude, strength);
++                if (iris26871BExposureSelected()) {
++                    mIris26948FlickerSampleTimestampNs = image.getTimestamp();
++                    mIris26948FlickerSampleSpanFraction =
++                            (rows - 1.0) * stepY / Math.max(1.0, height - 1.0);
++                }
+                 stateChanged = wasActive != nowActive;
+             }
+             if (stateChanged) {
+@@ -4766,6 +4781,41 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     }
+     public float iris26911RawSceneMean() { return mMotion26380RawMeanSignal; }
+ 
++    /* IRIS_26948_B_FLICKER_IDENTIFICATION_ONLY
++     * The 26678 observer is read-only. Use at least three separate recent,
++     * temporally ordered, same-harmonic coherent RAWs in the camera generation,
++     * plus an exact current Camera2 rolling-skew measurement. An ACTIVE flag
++     * alone does not identify 100/120Hz. Failure means no shutter snap.
++     */
++    private long iris26948BVerifiedPeriodNs(@NonNull TotalCaptureResult result) {
++        if (!iris26871BExposureSelected() || !isZslMode()
++                || mIris26909ManualActive || iris26909UserManualExposure()) return 0L;
++        Long skew = result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW);
++        Long timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP);
++        if (skew == null || timestamp == null || skew <= 0L || timestamp <= 0L) return 0L;
++        synchronized (mMotion26678FlickerLock) {
++            if (!mMotion26678FlickerActive || mMotion26678ActiveHarmonic <= 0
++                    || mMotion26678DetectorGeneration != mIris26548CameraHealthGeneration
++                    || mIris26948FlickerSampleTimestampNs <= 0L
++                    || mIris26948FlickerSampleTimestampNs > timestamp
++                    || timestamp - mIris26948FlickerSampleTimestampNs > 350_000_000L) return 0L;
++            int matches = 0;
++            long latest = Long.MAX_VALUE;
++            for (int i = 0; i < MOTION_26678_FLICKER_HISTORY; i++) {
++                long ts = mMotion26678FlickerTimestampNs[i];
++                if (ts <= 0L || ts > timestamp || timestamp - ts > 350_000_000L
++                        || mMotion26678FlickerHarmonic[i] != mMotion26678ActiveHarmonic
++                        || mMotion26678FlickerCoherentBlocks[i] < 3
++                        || mMotion26678FlickerStrength[i] <= 0.0f) continue;
++                if (ts < latest) latest = ts;
++                matches++;
++            }
++            if (matches < 3 || latest == Long.MAX_VALUE) return 0L;
++            return Iris26909ShutterIsoMath.verifiedMainsPeriodNs(
++                    mMotion26678ActiveHarmonic, skew, mIris26948FlickerSampleSpanFraction);
++        }
++    }
++
+     private void iris26909PutBManualOnBuilder() {
+         if (mPreviewRequestBuilder == null || !iris26909OwnsManualPreview()) return;
+         mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+@@ -4965,11 +5015,19 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         Long frameDurationMax = mCameraCharacteristics.get(
+                 CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION);
+         if (shutterRange == null || isoRange == null || shutterRange.getLower() <= 0L) return;
++        final long iris26948MeasuredPeriodNs = iris26948BVerifiedPeriodNs(result);
+         Iris26909ShutterIsoMath.Plan plan = Iris26909ShutterIsoMath.solveBrightnessAware(
+                 actualShutterNs, actualIso, isoRange.getLower(), isoRange.getUpper(),
+                 shutterRange.getLower(), shutterRange.getUpper(),
+                 frameDurationMax == null ? 0L : frameDurationMax, 0L);
+         if (plan == null || !plan.shutterFirstUseful) return;
++        // Keep the original brightness-aware allocator and original physical
++        // highlight-safe energy. A period lock may only shorten the shutter.
++        plan = Iris26909ShutterIsoMath.snapVerifiedBPlan(plan,
++                iris26948MeasuredPeriodNs, shutterRange.getLower(),
++                isoRange.getLower(), isoRange.getUpper(),
++                frameDurationMax == null ? 0L : frameDurationMax);
++
+         // The actual physical HAL result (including 26841 highlight-safe EV)
+         // is the sole brightness target. Never apply a second brightness boost.
+         final Range<Integer> formerFps = mPreviewRequestBuilder.get(
+@@ -5001,6 +5059,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     + " initialHighlightFraction=" + mIris26909InitialHighlightFraction
+                     + " frameDurationNs=" + plan.frameDurationNs
+                     + " sensorFpsCeiling=" + (1.0e9 / plan.frameDurationNs)
++                    + " iris26948VerifiedMainsPeriodNs=" + iris26948MeasuredPeriodNs
++                    + " iris26948SnappedToFullPeriods="
++                    + (iris26948MeasuredPeriodNs > 0L
++                        && plan.shutterNs % iris26948MeasuredPeriodNs == 0L)
+                     + " allocator=26913_low_iso_brightness_curve noMotionDecision=true"
+                     + " oneStableAeOffRequest=true noPreviewSessionRebuild=true"
+                     + " previewRawSameRepeating=true gyroMotionCeilingBypassed=true"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26909ShutterIsoMath.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26909ShutterIsoMath.java
+index a1ac961ed2f5a9c39c70143d589406eff9eadbb2..386c308d5db91809ffd54d5d8928f38d44e168bf 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26909ShutterIsoMath.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26909ShutterIsoMath.java
+@@ -152,4 +152,48 @@ public final class Iris26909ShutterIsoMath {
+                 && Math.abs(Math.log(((double)shutter * iso) / energy)) < 0.045;
+         return new Plan(shutter, iso, duration, energy, useful);
+     }
++
++    /* IRIS_26948_B_VERIFIED_MANUAL_FLICKER_PERIOD_ONLY
++     * A spatial row harmonic is NOT itself a lighting frequency. Convert it
++     * only with a valid exact Camera2 rolling-shutter skew and the fraction
++     * of the sensor actually sampled. Conservative acceptance avoids
++     * mistaking foliage, static venetian blinds or display PWM for 50/60 Hz
++     * mains. No inference from regional mains defaults.
++     */
++    public static long verifiedMainsPeriodNs(int harmonic, long skewNs,
++                                              double sampledSpanFraction) {
++        if (harmonic < 1 || harmonic > 6 || skewNs < 2_000_000L
++                || skewNs > 80_000_000L || !Double.isFinite(sampledSpanFraction)
++                || sampledSpanFraction < 0.80 || sampledSpanFraction > 1.0) return 0L;
++        double hz = harmonic * 1.0e9 / (skewNs * sampledSpanFraction);
++        if (Math.abs(hz - 100.0) <= 6.0) return 10_000_000L;
++        if (Math.abs(hz - 120.0) <= 7.2) return 8_333_333L;
++        return 0L;
++    }
++
++    /* Keep 26913's selected shutter/ISO target and highlight energy. Only
++     * snap DOWN when the existing chosen shutter contains >=1 whole verified
++     * flicker cycle; never extend exposure into clipping to force a period.
++     * If energy/ISO cannot be preserved, return the original manual plan.
++     * Shorter-than-cycle shutter remains exact, with measured GPU burst
++     * correction as the separate residual path (never fake a mains lock).
++     */
++    public static Plan snapVerifiedBPlan(Plan original, long periodNs,
++            long sensorShutterMinNs, int sensorIsoMin, int sensorIsoMax,
++            long sensorFrameDurationMaxNs) {
++        if (original == null || periodNs <= 0L || original.shutterNs < periodNs
++                || sensorIsoMin < 1 || sensorIsoMax < sensorIsoMin) return original;
++        long count = original.shutterNs / periodNs;
++        if (count < 1L || count > Long.MAX_VALUE / periodNs) return original;
++        long snapped = count * periodNs;
++        if (snapped < sensorShutterMinNs || snapped > original.shutterNs) return original;
++        int iso = (int)Math.round(original.targetEnergy / (double)snapped);
++        if (iso < sensorIsoMin || iso > sensorIsoMax) return original;
++        double error = Math.abs(Math.log((double)snapped * iso / original.targetEnergy));
++        if (!Double.isFinite(error) || error >= 0.045) return original;
++        long duration = Math.max(BASE_PREVIEW_FRAME_NS, snapped);
++        if (sensorFrameDurationMaxNs > 0L && duration > sensorFrameDurationMaxNs) return original;
++        return new Plan(snapped, iso, duration, original.targetEnergy,
++                original.shutterFirstUseful);
++    }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 8057c6cc343ec19940a963236341963105b41759..41bb6d4e417e91a68dc28f0c33c9cc3a68cd06c7 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1394,6 +1394,8 @@ public final class MotionV2Render extends Node {
+                             && !basePipeline.mParameters.irisNightActive
+                             && !basePipeline.mParameters.iris26903NightB) ? 1 : 0);
+             glProg.setVar("iris26941BOffHdrqLowZoom", iris26941BOffHdrqLowZoom ? 1 : 0);
++            glProg.setVar("iris26948BUniversalSdrEnabled",
++                    basePipeline.mParameters.iris26906ExperimentBSelected ? 1 : 0);
+             glProg.setVar("iris26944NightMatchedSdrEnabled",
+                     (basePipeline.mParameters.irisNightActive
+                             || basePipeline.mParameters.iris26903NightB) ? 1 : 0);
+@@ -1582,6 +1584,8 @@ public final class MotionV2Render extends Node {
+                                 && !basePipeline.mParameters.irisNightActive
+                                 && !basePipeline.mParameters.iris26903NightB) ? 1 : 0);
+                 glProg.setVar("iris26941BOffHdrqLowZoom", iris26941BOffHdrqLowZoom ? 1 : 0);
++                glProg.setVar("iris26948BUniversalSdrEnabled",
++                        basePipeline.mParameters.iris26906ExperimentBSelected ? 1 : 0);
+                 // 26944 Night highlight gate is applied ONCE after Jin in
+                 // IrisNightUltraHdr, not in the pre-Jin gain-map GLSL.
+                 glProg.setVar("maxGainRatio", encodingMaxGainRatio);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java
+index f3b87d930f7ef95010eb8112e7e5320ff950ed9e..e234c59208216d842c5a7a603618068694932ca7 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java
+@@ -369,6 +369,8 @@ public final class Iris26876BGpuFinalRenderer {
+                 MotionV2Render.IRIS_26824_MOTION_SATURATION_SCALE);
+             uniform1f(program,"uSaturation",Math.max(0f,Math.min(2f,sat)));
+             uniform1i(program,"uIris26932BOnTone",iris26932BOn ? 1 : 0);
++            uniform1i(program,"uIris26948BUniversalSdrEnabled",
++                    params.iris26906ExperimentBSelected ? 1 : 0);
+             uniform1f(program,"uSceneWhite",MotionV2Render.iris26598PublicationSceneWhite(params));
+             uniform1f(program,"uBodyToneStrength",MotionV2Render.iris26704BodyToneStrength(params));
+             uniform1i(program,"uAcr3Enabled",params.irisJpegColorValid?1:0);
+diff --git a/app/version.properties b/app/version.properties
+index fd1c8713691d44ed30627145abd712038746f293..4aeebd93ce621346c015ff310fed262df271c605 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726947
+-VERSION_BUILD=26947
++VERSION_NAME=0.9726948
++VERSION_BUILD=26948
