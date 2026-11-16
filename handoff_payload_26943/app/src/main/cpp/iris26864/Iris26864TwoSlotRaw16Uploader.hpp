@@ -31,7 +31,7 @@ public:
     void uploadInto(uint32_t index, uint32_t slot, const std::vector<Raw16PlaneBorrow>& frames);
     // Optional camera worker: direct AHB, GPU buffer, then CPU mapping.
     // Failed or unresolved submissions quarantine the destination arena.
-    void uploadHardwareBufferInto(uint32_t slot, AHardwareBuffer* source, int cameraFenceFd, uint32_t queueFamily);
+    void uploadHardwareBufferInto(uint32_t slot, AHardwareBuffer* source, int cameraFenceFd, uint32_t queueFamily, VkInstance instance);
     void upload(uint32_t index, uint32_t referenceIndex,
                 const std::vector<Raw16PlaneBorrow>& frames);
     // If a queue/fence failure prevents demonstrating completion, allow the

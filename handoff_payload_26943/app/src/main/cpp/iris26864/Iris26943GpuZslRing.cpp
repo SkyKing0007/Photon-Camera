@@ -33,7 +33,7 @@ void Iris26943GpuZslRing::stage(AHardwareBuffer* ahb,int cameraFenceFd,
     // the same B cache mutex from snapshot through final AMaZE GPU fence.
     frames_[slot].ready=false;
     frames_[slot].timestamp=0;
-    try {images_->uploadHardwareBufferInto(slot,ahb,cameraFenceFd,family_);}
+    try {images_->uploadHardwareBufferInto(slot,ahb,cameraFenceFd,family_,owner_.instance());}
     catch (...) {frames_[slot]={};throw;}
     frames_[slot]={timestamp,true};
     next_=(next_+1u)%capacity_;

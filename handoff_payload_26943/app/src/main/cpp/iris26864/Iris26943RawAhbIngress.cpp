@@ -66,7 +66,7 @@ void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout oldL, VkImageLayout 
     b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0u,1u,0u,1u};
     vkCmdPipelineBarrier(cb,from,to,0,0,nullptr,0,nullptr,1,&b);
 }
-std::unique_ptr<Imported> importDirect(VkPhysicalDevice p,VkDevice d,AHardwareBuffer* ahb,
+std::unique_ptr<Imported> importDirect(VkInstance instance,VkPhysicalDevice p,VkDevice d,AHardwareBuffer* ahb,
                                       uint32_t width,uint32_t height) {
     auto get=reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
         vkGetDeviceProcAddr(d,"vkGetAndroidHardwareBufferPropertiesANDROID"));
@@ -92,7 +92,17 @@ std::unique_ptr<Imported> importDirect(VkPhysicalDevice p,VkDevice d,AHardwareBu
     VkImageFormatProperties2 supported{};
     supported.sType=VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
     supported.pNext=&caps;
-    if (vkGetPhysicalDeviceImageFormatProperties2(p,&fi,&supported)!=VK_SUCCESS ||
+    // Android API 26 libvulkan.so is only a Vulkan 1.0 link-time stub.
+    // The owner explicitly creates a Vulkan 1.1 instance and requires a
+    // Vulkan 1.1 physical device. Resolve this INSTANCE dispatch command
+    // with that live instance, rather than link a missing ELF export.
+    // An unavailable entry point is OPTIONAL ingress failure, not a reason
+    // to bypass the unchanged post-shutter 26942 capture fallback.
+    auto queryFormat2 = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
+        vkGetInstanceProcAddr(instance,"vkGetPhysicalDeviceImageFormatProperties2"));
+    if (!queryFormat2)
+        throw std::runtime_error("26943 Vulkan 1.1 external image format query unavailable");
+    if (queryFormat2(p,&fi,&supported)!=VK_SUCCESS ||
         !(caps.externalMemoryProperties.externalMemoryFeatures&VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT))
         throw std::runtime_error("26943 RAW AHB image transfer-source import unsupported");
     auto imported=std::make_unique<Imported>(d);
@@ -163,8 +173,8 @@ std::unique_ptr<Imported> importGpuBuffer(VkPhysicalDevice p,VkDevice d,AHardwar
     return imported;
 }
 }
-void TwoSlotRaw16Uploader::uploadHardwareBufferInto(uint32_t slot,AHardwareBuffer* ahb,int cameraFenceFd,uint32_t queueFamily) {
-    if (quarantined_ || !ahb || slot>=slots_ || queueFamily==VK_QUEUE_FAMILY_IGNORED)
+void TwoSlotRaw16Uploader::uploadHardwareBufferInto(uint32_t slot,AHardwareBuffer* ahb,int cameraFenceFd,uint32_t queueFamily,VkInstance instance) {
+    if (quarantined_ || !ahb || !instance || slot>=slots_ || queueFamily==VK_QUEUE_FAMILY_IGNORED)
         throw std::invalid_argument("26943 invalid RAW AHB ring slot/queue family");
     AHardwareBuffer_Desc desc{};
     AHardwareBuffer_describe(ahb,&desc);
@@ -176,7 +186,7 @@ void TwoSlotRaw16Uploader::uploadHardwareBufferInto(uint32_t slot,AHardwareBuffe
     waitForCameraFence(cameraFenceFd);
     std::unique_ptr<Imported> source;
     bool imageSource=false;
-    try { source=importDirect(physical_,device_,ahb,width_,height_);imageSource=true; }
+    try { source=importDirect(instance,physical_,device_,ahb,width_,height_);imageSource=true; }
     catch (const std::exception& e) {
         __android_log_print(ANDROID_LOG_INFO,"Iris26943","RAW_DIRECT_IMPORT_UNAVAILABLE why=%s",e.what());
     }

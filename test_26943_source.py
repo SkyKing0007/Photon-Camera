@@ -2,7 +2,8 @@
 """26943 V2: strict native cross-references against 26942 compiled authority.
 Android API26 NDK, original GLSL, Kotlin/Java and full assemble remain mandatory.
 """
-import sys,re
+import sys,re,subprocess,tempfile,ctypes
+from pathlib import Path
 from build_26943_incremental import R,BASE,scope,exact,fail,sha
 DIR='app/src/main/cpp/iris26864/'
 def src(rel,live):
@@ -29,6 +30,52 @@ def main():
  if re.search(r'AHardwareBuffer_lockPlanes\s*\(',ingress):fail('Android API29 lockPlanes would break API26 native compilation')
  if 'AHARDWAREBUFFER_FORMAT_R16_UINT' in ingress:fail('newer AHB R16 enum must not be referenced with API26 NDK headers')
  if ingress.count('AHardwareBuffer_Desc desc{}')!=1:fail('AHB descriptor redeclaration breaks C++ compilation')
+
+ # 26943 V3 regression for failed V2 R2 API26 NDK shared-library linkage.
+ # Vulkan 1.1 instance commands are NOT API26 libvulkan.so global ELF exports.
+ # Require real owning-instance dispatch, not direct linking, and preserve
+ # native :app:assembleDebug (NDK dual ABI) as the mandatory verification.
+ uploader=cp('Iris26864TwoSlotRaw16Uploader.hpp')
+ require(device_h,('VkInstance instance() const noexcept { return instance_; }',
+                   'VkInstance instance_ = VK_NULL_HANDLE;'),'live Vulkan instance owner')
+ require(uploader,('AHardwareBuffer* source, int cameraFenceFd, uint32_t queueFamily, VkInstance instance);',),
+        'AHB importer instance ABI declaration')
+ require(ring,('images_->uploadHardwareBufferInto(slot,ahb,cameraFenceFd,family_,owner_.instance());',),
+        'owning Vulkan instance forwarded to ingress queue')
+ require(ingress,('std::unique_ptr<Imported> importDirect(VkInstance instance,VkPhysicalDevice p',
+                  'int cameraFenceFd,uint32_t queueFamily,VkInstance instance)',
+                  'if (quarantined_ || !ahb || !instance ||',
+                  'source=importDirect(instance,physical_,device_,ahb,width_,height_);',
+                  'PFN_vkGetPhysicalDeviceImageFormatProperties2',
+                  'vkGetInstanceProcAddr(instance,"vkGetPhysicalDeviceImageFormatProperties2")',
+                  'if (!queryFormat2)',
+                  'queryFormat2(p,&fi,&supported)'), 'API26 loadable 1.1 instance dispatch')
+ if re.search(r'\bvkGetPhysicalDeviceImageFormatProperties2\s*\(',ingress):
+  fail('Vulkan 1.1 function is not API26 NDK libvulkan.so exported link-time symbol')
+ if ingress.count('vkGetInstanceProcAddr(instance,"vkGetPhysicalDeviceImageFormatProperties2")')!=1:
+  fail('unexpected Vulkan instance dispatch count')
+ require(device,('app.apiVersion = VK_API_VERSION_1_1;',
+                 'props.apiVersion < VK_API_VERSION_1_1'), 'Vulkan 1.1 owner device admission')
+ # Prove the symbol-resolution mode with host ELF shared linking in the same
+ # fail-closed style as the NDK link. This is NOT a real Android NDK compile.
+ with tempfile.TemporaryDirectory(prefix='photon_26943_api26_link_') as td:
+  tmp=Path(td)
+  (tmp/'stub.cpp').write_text('extern "C" void *vkGetInstanceProcAddr(void *, const char *) {return nullptr;}\n')
+  (tmp/'dynamic.cpp').write_text('extern "C" void *vkGetInstanceProcAddr(void *, const char *);\nusing FormatQuery=int(*)(void *, const void *, void *);\nextern "C" int probe(void *instance, void* physical) {\n auto fn=reinterpret_cast<FormatQuery>(vkGetInstanceProcAddr(instance,"vkGetPhysicalDeviceImageFormatProperties2"));\n return fn ? fn(physical,nullptr,nullptr) : -1;\n}\n')
+  (tmp/'direct.cpp').write_text('extern "C" int vkGetPhysicalDeviceImageFormatProperties2(void *,const void *,void *);\nextern "C" int probe(void* physical) {return vkGetPhysicalDeviceImageFormatProperties2(physical,nullptr,nullptr);}\n')
+  good=subprocess.run(['g++','-std=c++17','-shared','-fPIC','-Wl,--no-undefined',
+             str(tmp/'dynamic.cpp'),str(tmp/'stub.cpp'),'-o',str(tmp/'dynamic.so')],capture_output=True,text=True)
+  if good.returncode:fail('API26 modeled dynamic VkInstance loader did not link '+good.stderr[-900:])
+  loaded=ctypes.CDLL(str(tmp/'dynamic.so'))
+  loaded.probe.argtypes=(ctypes.c_void_p,ctypes.c_void_p)
+  loaded.probe.restype=ctypes.c_int
+  if loaded.probe(None,None)!=-1:
+   fail('API26 optional Vulkan1.1 lookup unexpectedly proceeded with null function pointer')
+  bad=subprocess.run(['g++','-std=c++17','-shared','-fPIC','-Wl,--no-undefined',
+             str(tmp/'direct.cpp'),str(tmp/'stub.cpp'),'-o',str(tmp/'direct.so')],capture_output=True,text=True)
+  if bad.returncode==0 or 'vkGetPhysicalDeviceImageFormatProperties2' not in bad.stderr:
+   fail('API26 modeled Vulkan1.1 direct-link negative regression was not rejected')
+
  require(jni,('Iris26943IngressWorker','pending.size()>=3u','std::try_to_lock','AHardwareBuffer_acquire','AHardwareBuffer_release','bOffCache->ring->select(selected,','req.preStagedGpu','req.initialWaitSemaphore','vkDeviceWaitIdle(ctx.device)','nativeTryZslGpuStage'),'nonblocking camera worker')
  require(device,('const bool twoQueues = photoBOffTwoQueue','queueCount >= 2','q.queueCount = twoQueues ? 2u : 1u','ingressQueue_ = queue','vkGetDeviceQueue(dev, i, 1u, &queue_)','const float priorities[2] = {1.0f, 1.0f}'),'isolated queues')
  require(device_h,('VulkanDeviceOwner(bool photoBOffTwoQueue','ingressQueue()','hasSeparateIngressQueue()'),'queue owner ABI')
@@ -59,7 +106,7 @@ def main():
                     'app/src/main/assets/shaders/motionv2/gainmap.glsl'):
    if old.get(protected)!=new.get(protected):fail('successful 26942 protected path altered '+protected)
    if sha(BASE/protected)!=sha(R/protected):fail('previous compiled runtime protected content mismatch')
- print('PASS 26943 V2 API26 AHB, real pinned StageSink timing ABI, GPU ZSL ownership, shader, 17 changed+4 added, 2033 protected')
+ print('PASS 26943 V3 API26 AHB and modeled Vulkan 1.1 API26 dynamic loader link, real pinned StageSink timing ABI, GPU ZSL ownership, shader, 17 changed+4 added, 2033 protected')
 if __name__=='__main__':
  try:main()
  except Exception as e:print(str(e),file=sys.stderr);sys.exit(1)

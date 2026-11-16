@@ -13,6 +13,7 @@ public:
     VulkanDeviceOwner(const VulkanDeviceOwner&) = delete;
     VulkanDeviceOwner& operator=(const VulkanDeviceOwner&) = delete;
     VulkanContext context() const noexcept;
+    VkInstance instance() const noexcept { return instance_; }
     VkQueue queue() const noexcept { return queue_; }
     VkQueue ingressQueue() const noexcept { return ingressQueue_ ? ingressQueue_ : queue_; }
     bool hasSeparateIngressQueue() const noexcept { return ingressQueue_ && ingressQueue_ != queue_; }
