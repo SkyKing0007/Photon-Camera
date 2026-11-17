@@ -12,6 +12,7 @@ if not new.startswith(prefix):fail('successful 26949 historical step/command gra
 if new.count('actions/upload-artifact@v4')!=1 or new.count('./gradlew --no-daemon --build-cache :app:assembleDebug --stacktrace')!=1:fail('must compile/package exactly once')
 if 'TRIGGER_26950.txt' not in new.split('jobs:',1)[0] or 'TRIGGER_26949.txt' in new.split('jobs:',1)[0]:fail('stale trigger')
 if 'compile_26949_shaders.sh' in new:fail('26949 live validator collision still present')
+if new.count('python3 -S test_26950_source.py --preseed')!=1 or new.index('python3 -S test_26950_source.py --preseed')>new.index('build_26950_incremental.py fetch'):fail('vendor-free source preflight not executed before authority reconstruction')
 for ref in ('replay_26950_inherited_26949_glsl.py','replay_26950_inherited_26948_glsl.py','replay_26950_inherited_26943_glsl.py','replay_26950_inherited_26944_glsl.py','compile_26950_shaders.sh','compile_26950_sdr_shaders.sh','test_26950_highlight.py --live','test_26950_source.py --live','test_26950_math.py --live','test_26950_patch_proof.py --live',
  'build_26950_incremental.py fetch','build_26950_incremental.py prepare','build_26950_incremental.py verify-compiled','build_26950_incremental.py finalize','test_26931_native_integrity.py --cmake','verify_26906_native_cache.py postflight'):
  if ref not in new:fail('missing mandatory new/old regression '+ref)

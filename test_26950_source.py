@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Prove the exact *current* 26949 -> 26950 scope and byte-identical upstream HDRQ math."""
-import hashlib,pathlib,sys,re
+import hashlib,pathlib,sys,re,shutil,tempfile,subprocess
 from build_26950_incremental import R,parse,scope,sha,fail
 B='app/src/main/cpp/iris26864/bridge/'
 V='app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_hdrplus/shaders/'
@@ -18,9 +18,25 @@ def check():
  if '--live' in sys.argv:
   for p,h in new.items():
    if sha(R/p)!=h:fail('live current source changed '+p)
+ # GitHub checkout is intentionally vendor-free before the authority TAR is seeded.
+ # Payload-mode parity MUST use the SHA-sealed original vendor hashes, not a
+ # live disk path that cannot exist before build_26950_incremental.py prepare.
+ # Live-mode later checks the actual successfully-restored vendor bytes as well.
+ protected=parse(R/'26950_PROTECTED_SOURCE.sha256')
  for dst,src in SHADERS.items():
-  if (root/B/dst).read_bytes()!=(R/V/src).read_bytes():fail('not byte-exact upstream RAWR HDRQ shader '+dst)
-  code=(root/B/dst).read_text()
+  vendor_path=V+src; shader_path=B+dst
+  if vendor_path not in old or vendor_path not in new or vendor_path not in protected:
+   fail('sealed upstream RAWR vendor path missing '+vendor_path)
+  upstream=protected[vendor_path]
+  if old[vendor_path]!=upstream or new[vendor_path]!=upstream:
+   fail('upstream RAWR vendor hash changed '+vendor_path)
+  if sha(root/shader_path)!=upstream:
+   fail('source SHA differs from original RAWR HDRQ vendor '+dst)
+  if '--live' in sys.argv:
+   original=R/vendor_path
+   if not original.is_file() or sha(original)!=upstream or (root/shader_path).read_bytes()!=original.read_bytes():
+    fail('not byte-exact upstream RAWR HDRQ shader '+dst)
+  code=(root/shader_path).read_text()
   for name in ('coherent','volatile','restrict','goto','namespace','packed'):
    bare=re.sub(r'//[^\n]*','',re.sub(r'/\*.*?\*/','',code,flags=re.S))
    if re.search(r'\b(?:float|int|vec[234]|ivec[234]|uniform|bool)\s+'+name+r'\b',bare):fail('reserved GLSL identifier '+name)
@@ -42,6 +58,47 @@ def check():
  if 'hdrq_motion_min' in p:fail('obsolete LONG-era motion scratch resource remains')
  if (root/'app/version.properties').read_text().count('VERSION_BUILD=26950')!=1:fail('26950 version invalid')
  print('PASS exact original 4 RAWR shaders, native layout/11 strength for B OFF & Night, 2044 protected')
+def preseed():
+ """Reproduce original 44102586828 vendor-free Actions checkout BEFORE fetch/prepare.
+
+ This is deliberately executed against an isolated stage-only copy, so a
+ previously reconstructed local app/src tree can never make this test pass.
+ """
+ ch,old,new=scope()
+ with tempfile.TemporaryDirectory(prefix='26950_v3_unseeded_checkout_') as td:
+  temp=pathlib.Path(td)
+  required=('build_26950_incremental.py','test_26950_source.py',
+   '26950_BASE_26949_FULL_APP.sha256','26950_EXPECTED_FULL_APP.sha256',
+   '26950_PROTECTED_SOURCE.sha256','26950_CHANGED_RUNTIME_ALLOWLIST.txt',
+   '26950_ADDED_RUNTIME_PATHS.txt','26950_DELETED_RUNTIME_PATHS.txt')
+  for f in required:
+   dst=temp/f;dst.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(R/f,dst)
+  for p in sorted(ch):
+   dst=temp/'handoff_payload_26950'/p;dst.parent.mkdir(parents=True,exist_ok=True)
+   shutil.copy2(R/'handoff_payload_26950'/p,dst)
+  if (temp/V/'hdrq_merge.comp').exists():fail('preseed fixture unexpectedly has vendor source')
+  cmd=[sys.executable,'-S',str(temp/'test_26950_source.py'),'--payload']
+  def run():return subprocess.run(cmd,cwd=temp,text=True,capture_output=True)
+  result=run()
+  if result.returncode!=0:
+   fail('vendor-free Actions preseed positive test failed '+(result.stdout+result.stderr)[-700:])
+  # Hostile reseal test: a changed upstream vendor hash cannot authenticate the
+  # staged originals even when all three protected manifests are altered equally.
+  vendor_path=V+'hdrq_merge.comp'
+  original=old[vendor_path]
+  fake='f'*64 if original!='f'*64 else 'e'*64
+  for manifest in ('26950_BASE_26949_FULL_APP.sha256',
+   '26950_EXPECTED_FULL_APP.sha256','26950_PROTECTED_SOURCE.sha256'):
+   f=temp/manifest;text=f.read_text();line=original+'  '+vendor_path
+   if text.count(line)!=1:fail('preseed negative cannot locate vendor SHA')
+   f.write_text(text.replace(line,fake+'  '+vendor_path,1))
+  bad=run()
+  if bad.returncode==0 or 'source SHA differs from original RAWR HDRQ vendor' not in (bad.stdout+bad.stderr):
+   fail('preseed resealed vendor mismatch escaped')
+  print('PASS 26950 V3 original Actions vendor-free preseed, exact SHA-authenticated four original RAWR shaders, resealed donor mismatch rejected')
+
 if __name__=='__main__':
- try:check()
+ try:
+  if '--preseed' in sys.argv:preseed()
+  else:check()
  except Exception as e:print(e,file=sys.stderr);sys.exit(1)
