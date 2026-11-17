@@ -1,6 +1,34 @@
-# PHOTON 26952 V2 — corrected guarded three-stage vscode.dev handoff
+# PHOTON 26952 V3 — corrected current-shader build handoff
 
 **Classification:** LOCALLY VALIDATED / PREPARED FOR ACTIONS. **NOT 26952 BUILD-PROVEN** until GitHub Actions fully compiles and uploads its new APK. Native phone speed, false-color and sky-fringe image quality remain **NOT RUN / unverified on device**. Do not present these checks as visual acceptance.
+
+## V3: Fix the actual 26952 V2 Actions BLOCKED error without an older build
+
+V2 Actions run `44157366678`, job `134301597432`, successfully fetched
+published successful 26951 artifact **14355356084**, reconstructed actual
+26951 compiled source, proved **2,050 protected source files**, downloaded and
+verified official RawLens 2.3.94 dual-ABI natives, and ran actual pinned
+26904 shader and CMake handoff checks. It then failed at the obsolete
+`test_26939_shader_contract.py --live --extract` in the historical
+`compile_26939_shaders.sh` command: its single-radius exact text
+`p4=c.rb-c.g` was intentionally replaced by 26952's *two-radius* median.
+
+V3 retains EXACT original SHA-pinned 26939, 26941 and 26942 real GLSLang
+16.5/SPIR-V compiler bodies and executes all their actual GPU compilers on
+**live 26952 current SHA-sealed shader inputs**, including both median and
+SDR render. The historical source assertions still run separately against
+their own **sealed historical payload**, where their old exact syntax belongs;
+never run those obsolete source contracts against new live 26952 shader.
+The old 26938 invalid GLSL arity and 26904 V1/V2 failures remain mandatory.
+The next original 26943/44/48/49 compiler regressions, 26951 HDRQ, current
+26952 compiler, and full real dual-ABI NDK/Kotlin/Java/assemble are retained.
+No former build is recovered or rebuilt: authority is ONLY the successful
+26951 published compiled TAR. Original 26952 chroma, 3x2, LKR native 2.3.94,
+SDR bright-rim logic, and **all app/source allowlists are unchanged**.
+
+**Use all three V3 stages in order and V3 Stage3 trigger LAST**, replacing
+prior 26952 Stage1 utilities and Stage2 workflow so there are no stale
+scripts. V1 and V2 failed commits cannot become runtime authority.
 
 ## V2 repair of real 26952 V1 Actions failure
 

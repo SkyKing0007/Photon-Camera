@@ -26,7 +26,7 @@ if new.count('photon-26952-rawlens-2394-two-radius-3x2-sdr-rim')!=1:fail('wrong 
 # Only newly introduced scripts/stage files need be in the handoff.
 oldinv=set(re.findall(r'\b(?:python3\s+-S\s+|bash\s+|\./)([\w.-]+\.(?:py|sh))\b',old))
 newinv=set(re.findall(r'\b(?:python3\s+-S\s+|bash\s+|\./)([\w.-]+\.(?:py|sh))\b',new))
-if not oldinv<=newinv|{'build_26951_incremental.py','test_26951_source.py','test_26951_highlight.py','test_26951_descriptor_abi.py','test_26951_patch_proof.py','test_26951_math.py','replay_26951_inherited_26949_glsl.py','replay_26951_inherited_26948_glsl.py','replay_26951_inherited_26943_glsl.py','replay_26951_inherited_26944_glsl.py','compile_26951_shaders.sh','compile_26951_sdr_shaders.sh','prepare_26951_lkr_from_successful_26949.py'}:fail('historical execution unexpectedly removed')
+if not oldinv<=newinv|{'compile_26939_shaders.sh','compile_26941_shaders.sh','compile_26942_shaders.sh','build_26951_incremental.py','test_26951_source.py','test_26951_highlight.py','test_26951_descriptor_abi.py','test_26951_patch_proof.py','test_26951_math.py','replay_26951_inherited_26949_glsl.py','replay_26951_inherited_26948_glsl.py','replay_26951_inherited_26943_glsl.py','replay_26951_inherited_26944_glsl.py','compile_26951_shaders.sh','compile_26951_sdr_shaders.sh','prepare_26951_lkr_from_successful_26949.py'}:fail('historical execution unexpectedly removed')
 listed=(R/'26952_EXPECTED_ACTION_EXECUTABLES.txt').read_text().splitlines()
 if listed!=sorted(newinv) or len(listed)!=len(set(listed)):fail('missing/unused executable list '+repr(sorted(newinv^set(listed))[:20]))
 if '--on-actions' in sys.argv:
@@ -65,4 +65,32 @@ def transport_valid(code):
 broken=fetch_script.replace(assert_curl,"subprocess.run(['python','urllib-download','no-location',",1)
 if broken==fetch_script or transport_valid(broken):fail('26952 V1 401 negative control unexpectedly accepted')
 print('PASS 26952 V2 actual successful 26951 artifact curl -L transport restored; V1 401 reintroduction rejected')
+# 26952 V2 Actions 44157366678 failed at step 44: the 26939 live-only
+# historical median contract incorrectly rejected the valid NEW 26952 two-
+# radius source at the obsolete single-radius p4=c.rb-c.g exact string.
+# The actual original 26939/41/42 compiler bodies remain mandatory, but their
+# historical source assertions use immutable --payload while the extracted
+# shader inputs are the exact ACTIVE 26952 source, SHA-tested and compiled.
+adapter=(R/'replay_26952_current_legacy_glsl.py').read_text()
+for n,original_blob in (('39','1d5b72ca3b815a44f9ebd907f6d60737df00af99'),
+                        ('41','b9590e3891ff1eeb8f622239967ee3f17039703a'),
+                        ('42','7aaef0de4202005e686caa4ed53a37e18b7bc591')):
+ if new.count('python3 -S replay_26952_current_legacy_glsl.py '+n)!=1:fail('missing actual current 26952 historical real shader compiler '+n)
+ if 'compile_269'+n+'_shaders.sh' not in adapter or original_blob not in adapter:
+  fail('unpinned original real glslang/SPIR-V command body '+n)
+ if 'python3 -S test_269'+n+'_shader_contract.py --live --extract' not in adapter:
+  fail('original stale 269'+n+' historical source contract not explicitly migrated')
+ if 'python3 -S test_269'+n+'_shader_contract.py --payload' not in adapter:
+  fail('269'+n+' historical regression no longer sealed payload checked')
+ if 'bash compile_269'+n+'_shaders.sh' in new:fail('26952 V2 stale historical source live checker returned '+n)
+if 'source SHA' not in adapter and 'sha(src)!=cur[path]' not in adapter:fail('live current shader SHA not pinned')
+if 'out.replace(newcall,oldcall,1)!=txt' not in adapter:fail('original compiler bodies no longer reversible')
+# Static negative: old 26939 literal is intentionally absent in the new
+# two-radius GLSL, yet the new compiler adapter must select the newer source.
+median=(R/'handoff_payload_26952/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932RawLensMedian.kt').read_text()
+if 'highp vec2 p4=center' not in median or 'p4=c.rb-c.g' in median:
+ fail('26952 V2 old-live median rejection negative fixture cannot be reconstructed')
+if 'cc_median(p,m0,2)' not in median or 'cc_median(p,m0,1)' not in median:
+ fail('current median is not the explicitly changed live 26952 source')
+print('PASS 26952 V3 historical 26939 old-live BLOCKED regression corrected; pinned 39/41/42 real compiler bodies now target current source')
 print('PASS 26952 successful 26951 historical graph unchanged, exact live executable manifest, original 26904 V2/V3 regressions and full real compile + two ABI native gates')

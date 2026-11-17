@@ -29,7 +29,7 @@ STAGE1_FILES=['README_PHOTON_26952.md','26952_COMMIT_MESSAGE.txt','26952_LOCAL_V
  '26951_SUCCESSFUL_EXECUTED_WORKFLOW_REFERENCE.yml','26952_BASE_LKR_NATIVE_BRIDGE_REFERENCE.java',
  'build_26952_incremental.py','prepare_26952_native.py','test_26952_native.py','test_26952_source.py',
  'test_26952_chroma.py','test_26952_halo.py','test_26952_patches.py','test_26952_sealed_negatives.py',
- 'test_26952_workflow_refs.py','replay_26952_inherited_glsl.py','replay_26952_26943_contract.py','compile_26952_shaders.sh','26952_BASE_26951_FULL_APP.sha256',
+ 'test_26952_workflow_refs.py','replay_26952_current_legacy_glsl.py','replay_26952_inherited_glsl.py','replay_26952_26943_contract.py','compile_26952_shaders.sh','26952_BASE_26951_FULL_APP.sha256',
  '26952_EXPECTED_FULL_APP.sha256','26952_PROTECTED_SOURCE.sha256','26952_CHANGED_RUNTIME_ALLOWLIST.txt',
  '26952_ADDED_RUNTIME_PATHS.txt','26952_DELETED_RUNTIME_PATHS.txt','26952_NATIVE_RELEASE_ALLOWLIST.txt',
  '26952_FORWARD_FULLINDEX.patch','26952_ROLLBACK_FULLINDEX.patch','26952_STAGE_1_UPLOAD_PATHS.txt',
