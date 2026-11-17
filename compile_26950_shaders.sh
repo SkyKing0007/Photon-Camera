@@ -21,7 +21,7 @@ trap 'rc=$?; trap - ERR; tail -n 120 "$OUT/26950_REAL_GLSL_SPIRV_COMPILER.txt" >
    sha256sum "$p"
    "$COMPILER" -V --target-env vulkan1.1 -S comp -o "$DIR/${name}.spv" "$p"
    spirv-val --target-env vulkan1.1 "$DIR/${name}.spv"
-   spirv-opt --target-env vulkan1.1 -O "$DIR/${name}.spv" -o "$DIR/${name}.opt.spv"
+   spirv-opt --target-env=vulkan1.1 -O "$DIR/${name}.spv" -o "$DIR/${name}.opt.spv"
    spirv-val --target-env vulkan1.1 "$DIR/${name}.opt.spv"
    sha256sum "$DIR/${name}.spv" "$DIR/${name}.opt.spv"
  done

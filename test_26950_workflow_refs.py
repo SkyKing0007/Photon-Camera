@@ -23,4 +23,32 @@ if set(listed)!=invoked:fail('missing/unused executable list '+repr(sorted(invok
 if '--on-actions' in sys.argv:
  for p in listed:
   if not (R/p).is_file():fail('missing actual executable '+p)
+# 26904 V2 historical SPIR-V optimizer failure reproduced in 26950 V3.
+# The real optimizer rejects a separated --target-env argument, treating the
+# value as an additional input filename. The correct format is --target-env=NAME.
+# Unlike a file-seal alone, this preseed check rejects even a newly sealed
+# but semantically invalid compiler command BEFORE fetching a 26949 artifact.
+def require_spirv_cli(src, env, label):
+    cmds=[l.strip() for l in src.splitlines() if re.match(r'^\s*spirv-opt\s+',l)]
+    calls=[l for l in cmds if '--version' not in l]
+    if len(calls)!=1:fail('missing/duplicate SPIR-V optimizer call '+label)
+    cmd=calls[0]
+    expected=r'^spirv-opt\s+--target-env='+re.escape(env)+r'\s+-O\s+\S+\s+-o\s+\S+$'
+    if not re.fullmatch(expected,cmd):fail('26904 V2 optimizer CLI regression or obsolete target env '+label+' '+cmd)
+    if not re.search(r'^\s*spirv-val\s+--target-env\s+'+re.escape(env)+r'\s+',src,re.M):
+        fail('SPIR-V validator gate absent '+label)
+for filename,env in (('compile_26950_shaders.sh','vulkan1.1'),('compile_26950_sdr_shaders.sh','opengl4.5')):
+    source=(R/filename).read_text()
+    require_spirv_cli(source,env,filename)
+    # Negative: model the exact broken 26950 V3 command even if future
+    # metadata or SHA files are re-sealed to conceal this regression.
+    mutated=source.replace('spirv-opt --target-env='+env,'spirv-opt --target-env '+env,1)
+    if mutated==source:fail('could not construct historical 26904 V2 negative '+filename)
+    try:require_spirv_cli(mutated,env,filename+' NEGATIVE')
+    except RuntimeError:pass
+    else:fail('26904 V2 optimizer CLI negative unexpectedly accepted '+filename)
+    import subprocess
+    syntax=subprocess.run(['bash','-n',str(R/filename)],capture_output=True,text=True)
+    if syntax.returncode:fail('current compiler bash syntax invalid '+filename+' '+syntax.stderr)
+print('PASS 26950 both real SPIR-V optimizer CLI forms; historic 26904 V2 positional failures rejected, bash syntax')
 print('PASS exact successful 26949 workflow historical prefix, no stale refs, real 26950 GLSL/NDK/Kotlin/Java/full assemble')

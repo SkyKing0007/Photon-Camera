@@ -1,4 +1,4 @@
-# Photon 26950 V3 — corrected vendor-free preseed verification, original RAWR HDR+ Quality 11, B SDR highlight separation
+# Photon 26950 V4 — corrected SPIR-V optimizer CLI and vendor-free preseed, original RAWR HDR+ Quality 11, B SDR highlight separation
 
 Upload **STAGE_1**, then **STAGE_2**, then **STAGE_3** on `experimental-clean-photon-rebuild`. Do not modify dev, push source, or upload APKs without approval. Use `26950_COMMIT_MESSAGE.txt`.
 
@@ -15,3 +15,9 @@ PREPARED FOR ACTIONS only until successful Android NDK/Kotlin/Java/shader/assemb
 The 26950 V2 source preflight at checkout incorrectly read `app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_hdrplus/shaders/hdrq_merge.comp` BEFORE the authentic compiled 26949 source TAR was downloaded/extracted. Vendor bytes are absent from the lightweight checkout until successful authority reconstruction. V3 checks the four staged original RAWR shaders against original SHA-256 entries in the sealed 26949/26950 protected source manifests during `--payload`, without relying on the vendor tree on disk. `--live` still requires the actual vendor files and checks each byte after reconstruction. The isolated `--preseed` test copies only staged source, confirms the original missing-vendor environment, succeeds, and rejects a forged/resealed vendor hash. It executes BEFORE artifact download in Actions. Historical checks and all real pinned compiler stages are unchanged.
 
 26950 V2 failed at source preflight; no 26950 Kotlin/Java/NDK/assemble/APK was produced. V3 remains only prepared until successful Actions and published APK.
+
+### V4 actual GitHub Actions failure and exact correction (run 44106717762)
+
+The real 26950 V3 Vulkan shader stage failed AFTER glslang and spirv-val on the first of four native shaders because the current **spirv-opt** CLI incorrectly used `--target-env vulkan1.1 -O`. SPIRV-Tools requires `--target-env=vulkan1.1 -O`, as corrected previously by 26904 V3. The 26950 SDR shader compiler already used the correct `--target-env=opengl4.5` form and is kept unchanged. V4 corrects the failing Vulkan command, preserving real glslang 16.5, both Vulkan/GLSL compilers, pre/post spirv-val, optimizer -O, two-ABI NDK, Kotlin, Java, complete assemble and all historical checks. The successful 26949 workflow prefix and the ENTIRE 26950 V3 workflow are byte-for-byte identical.
+
+A new mandatory early check within the existing Actions-invoked `test_26950_workflow_refs.py` requires both corrected SPIRV-Tools argument forms and valid Bash syntax. Its two negative tests deliberately reintroduce the exact positional 26904 V2 error and reject it, even when the staged files are otherwise valid. V4 has ZERO runtime source modifications relative to 26950 V3; all ten changed source SHA-256 values and all 2,044 protected source hashes remain unchanged. Real Android compilation remains mandatory and unproven until a successful Actions job publishes an APK.
