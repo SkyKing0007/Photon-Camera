@@ -38,10 +38,30 @@ def validate_arity(code,name):
     if depth==0:done=True;break
    elif c==',' and depth==1:n+=1
   if not done or n!=ARITY[m.group(1)]:fail('current 26952 illegal GLSL builtin arity '+name+' '+m.group(1)+' '+str(n))
- if re.search(r'\b(?:float|int|bool|vec[234]|ivec[234]|uniform)\s+coherent\b',clean):
-  fail('26904 V1 reserved identifier coherent in current shader '+name)
+ # The successful 26951 compiler accepts legit qualifiers but not GLSL
+ # reserved keywords accidentally used as declarations. This caught the
+ # 26952 V3 `float flat=...` failure before the actual Actions compiler.
+ reserved={'flat','coherent','volatile','restrict','readonly','writeonly',
+           'attribute','varying','centroid','smooth','noperspective','patch',
+           'sample','invariant','precise','layout','buffer','shared','subroutine',
+           'atomic_uint','input','output','partition','active','superp'}
+ typed=r'(?:float|int|uint|bool|double|[ibdu]?vec[234]|d?mat[234](?:x[234])?|sampler\w*|image\w*)'
+ for decl in re.finditer(r'\b'+typed+r'\s+([A-Za-z_][A-Za-z0-9_]*)\b',clean):
+  if decl.group(1) in reserved:fail('26952 V3 real GLSL reserved identifier '+name+' '+decl.group(1))
+ # `flat` must not occur anywhere in these five current fragment programs;
+ # its only prior occurrence was an invalid local variable, never a qualifier.
+ if re.search(r'\bflat\b',clean):fail('26952 V3 unexpected FLAT in current fragment '+name)
+
  if re.search(r'\b(?:readonly|writeonly|restrict|volatile)\s*=',clean):
   fail('reserved GLSL token assigned in '+name)
+
+def reserved_identifier_self_test():
+ for src in ('float flat=abs(a-b);','float coherent=1.0;',
+             'vec3 restrict=vec3(1.0);','highp float flat=1.0;'):
+  try:validate_arity(src,'EXPECTED_NEGATIVE_RESERVED')
+  except RuntimeError:continue
+  fail('reserved GLSL keyword negative escaped: '+src)
+ validate_arity('float plateauDelta=abs(a-b);','VALID_RENAMED_GLSL')
 
 def current_inputs(label):
  cur=parse(R/'26952_EXPECTED_FULL_APP.sha256')
@@ -83,6 +103,7 @@ def main():
  if len(sys.argv)<2 or sys.argv[1] not in HISTORICAL or sys.argv[2:] not in ([],['--extract-only']):
   fail('usage: replay_26952_current_legacy_glsl.py 39|41|42 [--extract-only]')
  label=sys.argv[1]
+ reserved_identifier_self_test()
  if sys.argv[2:]==['--extract-only']:
   current_inputs(label);return
  file,expect,oldcall,history=HISTORICAL[label]

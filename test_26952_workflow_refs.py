@@ -22,6 +22,11 @@ if new.find('prepare_26952_native.py original')>new.find('prepare_26952_native.p
 if new.find('verify-compiled')>new.find(':app:assembleDebug --stacktrace'):fail('compiler proofs run after assemble')
 if 'photon_26951_outputs/26951_gradle_assemble.log' in new or 'TRIGGER_26951.txt' in new.split('jobs:',1)[0] or new.find('26952-SUCCESSFUL')>=0:fail('stale root workflow or invented success')
 if new.count('photon-26952-rawlens-2394-two-radius-3x2-sdr-rim')!=1:fail('wrong publication name')
+# Ensure user-visible Actions labels agree with the actual SHA-proven source scope.
+for stale in ('26952 3 edits 1 GPL asset','2051 protected source identity'):
+ if stale in new:fail('stale Actions workflow step wording '+stale)
+for actual in ('26952 four edits plus one GPL license','2050 protected source files','Check reserved GLSL identifiers and compile LIVE 26952'):
+ if new.count(actual)!=1:fail('missing exact current 26952 workflow stage description '+actual)
 # Actual GitHub checkout already contains old 26951 files and all historical scripts.
 # Only newly introduced scripts/stage files need be in the handoff.
 oldinv=set(re.findall(r'\b(?:python3\s+-S\s+|bash\s+|\./)([\w.-]+\.(?:py|sh))\b',old))
@@ -92,5 +97,15 @@ if 'highp vec2 p4=center' not in median or 'p4=c.rb-c.g' in median:
  fail('26952 V2 old-live median rejection negative fixture cannot be reconstructed')
 if 'cc_median(p,m0,2)' not in median or 'cc_median(p,m0,1)' not in median:
  fail('current median is not the explicitly changed live 26952 source')
+# Actual V3 Actions 44159856517 failed on source `float flat=...`
+# (GLSL 3.00 reserved interpolation qualifier) only after real glslang ran.
+# We now require correct active naming and a pre-compilation negative fixture.
+render=(R/'handoff_payload_26952/app/src/main/assets/shaders/motionv2/render.glsl').read_text()
+active=re.sub(r'/\*.*?\*/|//[^\n]*','',render,flags=re.S)
+if 'float plateauDelta=abs(bright1-bright2);' not in active or re.search(r'\bflat\b',active):
+ fail('26952 V3 unexpected FLAT compiler failure was reintroduced')
+if 'reserved_identifier_self_test()' not in adapter or 'unexpected FLAT' not in adapter:
+ fail('26952 V3 missing live reserved-word negative regression preflight')
+print('PASS 26952 V4 current shader unexpected FLAT regression, legal plateauDelta, live GLSL token negative control')
 print('PASS 26952 V3 historical 26939 old-live BLOCKED regression corrected; pinned 39/41/42 real compiler bodies now target current source')
 print('PASS 26952 successful 26951 historical graph unchanged, exact live executable manifest, original 26904 V2/V3 regressions and full real compile + two ABI native gates')

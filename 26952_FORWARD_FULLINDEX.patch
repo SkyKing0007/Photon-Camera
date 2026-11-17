@@ -1,179 +1,3 @@
-diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
-index 3602efb8ca3e1482f7a27e41354de4d6cfb0a392..5649d3dfab765cf2b6c9a923970c60dc88a400ce 100644
---- a/app/src/main/assets/shaders/motionv2/render.glsl
-+++ b/app/src/main/assets/shaders/motionv2/render.glsl
-@@ -1286,6 +1286,54 @@ float iris26718HighZoomLogDetail(vec2 sourcePixel){
-     return clamp(texture(iris26718HighZoomDetail,uv).r,-0.56,0.56)*trustedInterior;
- }
- 
-+/* IRIS_26952_B_ONLY_BRIGHT_RIM_OVERSHOOT_GUARD
-+ * Suppress a strictly positive, isolated bright ridge when a real dark/bright
-+ * boundary is present.  Use one-sided samples in the *source* (before any
-+ * tone curve) so a bright sky pixel only compares to its bright-side sky
-+ * plateau, never to foliage.  No RGB/chroma mixing or blur, no A/A+B change.
-+ * The actual rendered SDR texture remains the gainmap's exact denominator.
-+ * At most 2.5% source-guide correction; real white plateaus are unchanged.
-+ */
-+float iris26952SourceGuide(vec3 v){
-+    vec3 p=max(v,vec3(0.0));
-+    return max(max3(p),luminance(p));
-+}
-+float iris26952GuideAt(ivec2 p,ivec2 size){
-+    return iris26952SourceGuide(texelFetch(InputBuffer,clamp(p,ivec2(0),size-ivec2(1)),0).rgb);
-+}
-+vec3 iris26952ConstrainRim(ivec2 pixel,vec3 rgb){
-+    if(iris26948BUniversalSdrEnabled==0 || iris26592MotionHdrHandoff==0 || irisOutputZoom>1.00001)
-+        return rgb;
-+    float peak=iris26952SourceGuide(rgb);
-+    if(peak<=0.60)return rgb;
-+    ivec2 size=textureSize(InputBuffer,0);
-+    if(any(lessThan(pixel,ivec2(3))) || any(greaterThanEqual(pixel,size-ivec2(3))))return rgb;
-+    float limited=peak;
-+    for(int axis=0;axis<4;axis++){
-+        ivec2 d=axis==0?ivec2(1,0):(axis==1?ivec2(0,1):(axis==2?ivec2(1,1):ivec2(1,-1)));
-+        for(int side=-1;side<=1;side+=2){
-+            ivec2 u=d*side;
-+            float bright1=iris26952GuideAt(pixel+u,size);
-+            float bright2=iris26952GuideAt(pixel+2*u,size);
-+            float dark1=iris26952GuideAt(pixel-u,size);
-+            float dark2=iris26952GuideAt(pixel-2*u,size);
-+            float plateau=max(bright1,bright2);
-+            float dark=max(dark1,dark2);
-+            float edgeContrast=max(plateau-dark,0.0);
-+            float flat=abs(bright1-bright2);
-+            // Demand a bright-side plateau, a steep actual boundary and
-+            // center-only positive overshoot.  This cannot flatten a genuine
-+            // broad white subject or change a smooth sky gradient.
-+            if(edgeContrast>0.15*max(plateau,0.05) && flat<0.075*max(plateau,0.05) &&
-+               peak>plateau+0.006*max(peak,0.05)){
-+                float cap=plateau+0.003*peak;
-+                limited=min(limited,cap);
-+            }
-+        }
-+    }
-+    return rgb*(max(peak*0.975,limited)/max(peak,1.0e-6));
-+}
-+
- void main() {
-     ivec2 xy=ivec2(gl_FragCoord.xy);
-     ivec2 sourceSize=textureSize(InputBuffer,0);
-@@ -1310,6 +1358,9 @@ void main() {
-         sourceXY=ivec2(clamp(floor(sourcePixel+vec2(0.5)),
-                             vec2(0.0),vec2(sourceSize-ivec2(1))));
-     }
-+    // Repair only narrow positive sky/branch-edge overshoot BEFORE the
-+    // existing color owner; identical scalar for all three RGB channels.
-+    linearSrgb=iris26952ConstrainRim(sourceXY,linearSrgb);
-     if(iris26592MotionHdrHandoff!=0){
-         /* IRIS_26822_SINGLE_OWNER_CALL
-          * Retire the stacked 26797/26798 hue-replacement writers and the 26799/26803 replacement
-diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26931LkrBridge.java b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26931LkrBridge.java
-index 007ca705d4f7b707171ee7e342568a3d3a4aa953..38aa09b3949e14dc83e10414600a27f31a9c36db 100644
---- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26931LkrBridge.java
-+++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26931LkrBridge.java
-@@ -10,7 +10,7 @@ import java.nio.ByteBuffer;
- import java.util.Arrays;
- 
- /**
-- * IRIS_26931_B_SUPER_RES_ON_ONLY — the original RawLens 2.2.86 LKR Vulkan
-+ * IRIS_26931_B_SUPER_RES_ON_ONLY — the original RawLens 2.3.94 LKR Vulkan
-  * release owns ALL noise fit, coarse/tile/subtile LK, guide/temporal/robust
-  * rejection, 3x2 HQS solver, coverage-based noise handling and FinishLook.
-  * Iris owns only immutable RAW admission, linear RGB + physical clip GPU
-@@ -167,7 +167,7 @@ public final class GlesIris26931LkrBridge {
-                 !Float.isFinite(defaults[1]) || defaults[1]!=3.0f) {
-                 throw new IllegalStateException("26931 wrong upstream LKR native default ABI");
-             }
--            // RawLens 2.2.86's ApplyTuning rebuilds the prior schedule from
-+            // RawLens 2.3.94's ApplyTuning rebuilds the prior schedule from
-             // the *new* iteration count: for 3x2, t=1 only (zero-based).
-             // Every other native knob remains the published default, NaN.
-             LkrBridge.nativeSetCacheDir(app.getCodeCacheDir().getAbsolutePath());
-@@ -196,7 +196,7 @@ public final class GlesIris26931LkrBridge {
-             final int err=GLES30.glGetError();
-             if(err!=GLES30.GL_NO_ERROR)throw new IllegalStateException(
-                 "26931 LKR GL/Vulkan publication GL error: "+err);
--            Log.i(TAG,"IRIS_26931_B_SR_ON_REAL_LKR release=2.2.86 " +
-+            Log.i(TAG,"IRIS_26931_B_SR_ON_REAL_LKR release=2.3.94 " +
-                 "T=3 z=2 prior=1 DCT_PRIOR=OFF guide=2.0 " +
-                 "frames="+count+" fullRes="+stats[11]+"x"+stats[12]+
-                 " tiles="+stats[0]+" sigma="+stats[1]+
-diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932RawLensMedian.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932RawLensMedian.kt
-index 6ca8dad17af61bfe04581b831be7f79ea18839e2..307df6d29e70758929dbab59a23ca9aa8f5482af 100644
---- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932RawLensMedian.kt
-+++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932RawLensMedian.kt
-@@ -1,11 +1,13 @@
- package com.hinnka.mycamera.processor
- 
- /**
-- * IRIS_26932_LKR_ONLY_RAWLENS_2_2_86_FALSE_COLOR_MEDIAN.
-- * RawLens 2.2.86 app/src/main/assets/shaders/amaze/cleanup.glsl:
-- * exact 19-exchange Paeth median-of-9 over WB-balanced (R-G, B-G).
-+ * IRIS_26952_B_ON_RAWLENS_2_3_94_TWO_RADIUS_COLOR_DIFFERENCE_MEDIAN.
-+ * RawLens 2.3.94 app/src/main/assets/shaders/amaze/cleanup.glsl:
-+ * exact 19-exchange Paeth medians at radii 1 and 2 over WB-balanced
-+ * (R-G, B-G); choose the smaller color-difference norm.
-  * This part is adapted from RawLens GPL-3.0-or-later app shader;
-- * upstream commit 36e5141df568e74e2708dd4f50413b3aa51dab20.
-+ * upstream release tag 2.3.94, cleanup.glsl Git blob
-+ * 5f53f47c3391273739267146d61b50bf1d3a5b25.
-  * This intentionally does NOT port RawLens purple-defringe because the
-  * existing Iris Lab defringe is preserved by user request.
-  * Native LKR has already demosaiced, and Iris's LSC/WB has already occurred.
-@@ -38,20 +40,32 @@ internal object GlesIris26932RawLensMedian {
-                 clamp(pixel,ivec2(0),uSize-ivec2(1)),0).rgb,vec3(0.0));
-             return c.rb-c.g;
-         }
--        void main(){
--            ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
--            vec4 original=texelFetch(uLkrPostWbRgb,p,0);
--            highp vec3 c=max(original.rgb,vec3(0.0));
--            highp vec2 p0=cc_diff(p+ivec2(-1,-1)),p1=cc_diff(p+ivec2(0,-1));
--            highp vec2 p2=cc_diff(p+ivec2(1,-1)),p3=cc_diff(p+ivec2(-1,0));
--            highp vec2 p4=c.rb-c.g,p5=cc_diff(p+ivec2(1,0));
--            highp vec2 p6=cc_diff(p+ivec2(-1,1)),p7=cc_diff(p+ivec2(0,1));
--            highp vec2 p8=cc_diff(p+ivec2(1,1));
-+        // Paeth's 19-comparator median network, byte-for-byte same ordering
-+        // as RawLens cleanup.glsl.  Only the sampling radius changes.
-+        highp vec2 cc_median(ivec2 p,highp vec2 center,int radius){
-+            highp vec2 p0=cc_diff(p+ivec2(-radius,-radius)),p1=cc_diff(p+ivec2(0,-radius));
-+            highp vec2 p2=cc_diff(p+ivec2(radius,-radius)),p3=cc_diff(p+ivec2(-radius,0));
-+            highp vec2 p4=center,p5=cc_diff(p+ivec2(radius,0));
-+            highp vec2 p6=cc_diff(p+ivec2(-radius,radius)),p7=cc_diff(p+ivec2(0,radius));
-+            highp vec2 p8=cc_diff(p+ivec2(radius,radius));
-             CC_SORT(p1,p2) CC_SORT(p4,p5) CC_SORT(p7,p8) CC_SORT(p0,p1) CC_SORT(p3,p4)
-             CC_SORT(p6,p7) CC_SORT(p1,p2) CC_SORT(p4,p5) CC_SORT(p7,p8) CC_SORT(p0,p3)
-             CC_SORT(p5,p8) CC_SORT(p4,p7) CC_SORT(p3,p6) CC_SORT(p1,p4) CC_SORT(p2,p5)
-             CC_SORT(p4,p7) CC_SORT(p4,p2) CC_SORT(p6,p4) CC_SORT(p4,p2)
--            highp vec3 medianRgb=max(vec3(c.g+p4.x,c.g,c.g+p4.y),vec3(0.0));
-+            return p4;
-+        }
-+        void main(){
-+            ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
-+            vec4 original=texelFetch(uLkrPostWbRgb,p,0);
-+            highp vec3 c=max(original.rgb,vec3(0.0));
-+            // 26952 restores the *current* RawLens two-radius cleanup,
-+            // not a generic color desaturation or green-luma blur.  The
-+            // separate two rings observe the original input, not one another.
-+            highp vec2 m0=cc_diff(p);
-+            highp vec2 fine=cc_median(p,m0,1);
-+            highp vec2 wide=cc_median(p,m0,2);
-+            highp vec2 d=dot(wide,wide)<dot(fine,fine)?wide:fine;
-+            highp vec3 medianRgb=max(vec3(c.g+d.x,c.g,c.g+d.y),vec3(0.0));
-             // RawLens rcd_final.glsl (pinned upstream) operates in camera-
-             // native linear RGB, not the temporary post-WB Lab domain.
-             vec3 wb=max(uAmazeWb,vec3(0.0001));
-diff --git a/app/version.properties b/app/version.properties
-index 8824b4942df5a9d5e6b8ed3455f715b7c82d2aaf..ae061556abfb247f08d3f1a737e8c131d99cc907 100644
---- a/app/version.properties
-+++ b/app/version.properties
-@@ -1,4 +1,4 @@
- VERSION_MAJOR=0
- VERSION_MINOR=9726440
--VERSION_NAME=0.9726951
--VERSION_BUILD=26951
-+VERSION_NAME=0.9726952
-+VERSION_BUILD=26952
 diff --git a/app/src/main/assets/licenses/rawlens_2_3_94_lkr_gpl_notice.txt b/app/src/main/assets/licenses/rawlens_2_3_94_lkr_gpl_notice.txt
 new file mode 100644
 index 0000000000000000000000000000000000000000..c36da245afbe938169c3b707b17070a942c14ab4
@@ -873,3 +697,179 @@ index 0000000000000000000000000000000000000000..c36da245afbe938169c3b707b17070a9
 +the library.  If this is what you want to do, use the GNU Lesser General
 +Public License instead of this License.  But first, please read
 +<https://www.gnu.org/licenses/why-not-lgpl.html>.
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 3602efb8ca3e1482f7a27e41354de4d6cfb0a392..758534184d7b964ca6638d2f2eb25e48b347a4ce 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -1286,6 +1286,54 @@ float iris26718HighZoomLogDetail(vec2 sourcePixel){
+     return clamp(texture(iris26718HighZoomDetail,uv).r,-0.56,0.56)*trustedInterior;
+ }
+ 
++/* IRIS_26952_B_ONLY_BRIGHT_RIM_OVERSHOOT_GUARD
++ * Suppress a strictly positive, isolated bright ridge when a real dark/bright
++ * boundary is present.  Use one-sided samples in the *source* (before any
++ * tone curve) so a bright sky pixel only compares to its bright-side sky
++ * plateau, never to foliage.  No RGB/chroma mixing or blur, no A/A+B change.
++ * The actual rendered SDR texture remains the gainmap's exact denominator.
++ * At most 2.5% source-guide correction; real white plateaus are unchanged.
++ */
++float iris26952SourceGuide(vec3 v){
++    vec3 p=max(v,vec3(0.0));
++    return max(max3(p),luminance(p));
++}
++float iris26952GuideAt(ivec2 p,ivec2 size){
++    return iris26952SourceGuide(texelFetch(InputBuffer,clamp(p,ivec2(0),size-ivec2(1)),0).rgb);
++}
++vec3 iris26952ConstrainRim(ivec2 pixel,vec3 rgb){
++    if(iris26948BUniversalSdrEnabled==0 || iris26592MotionHdrHandoff==0 || irisOutputZoom>1.00001)
++        return rgb;
++    float peak=iris26952SourceGuide(rgb);
++    if(peak<=0.60)return rgb;
++    ivec2 size=textureSize(InputBuffer,0);
++    if(any(lessThan(pixel,ivec2(3))) || any(greaterThanEqual(pixel,size-ivec2(3))))return rgb;
++    float limited=peak;
++    for(int axis=0;axis<4;axis++){
++        ivec2 d=axis==0?ivec2(1,0):(axis==1?ivec2(0,1):(axis==2?ivec2(1,1):ivec2(1,-1)));
++        for(int side=-1;side<=1;side+=2){
++            ivec2 u=d*side;
++            float bright1=iris26952GuideAt(pixel+u,size);
++            float bright2=iris26952GuideAt(pixel+2*u,size);
++            float dark1=iris26952GuideAt(pixel-u,size);
++            float dark2=iris26952GuideAt(pixel-2*u,size);
++            float plateau=max(bright1,bright2);
++            float dark=max(dark1,dark2);
++            float edgeContrast=max(plateau-dark,0.0);
++            float plateauDelta=abs(bright1-bright2);
++            // Demand a bright-side plateau, a steep actual boundary and
++            // center-only positive overshoot.  This cannot flatten a genuine
++            // broad white subject or change a smooth sky gradient.
++            if(edgeContrast>0.15*max(plateau,0.05) && plateauDelta<0.075*max(plateau,0.05) &&
++               peak>plateau+0.006*max(peak,0.05)){
++                float cap=plateau+0.003*peak;
++                limited=min(limited,cap);
++            }
++        }
++    }
++    return rgb*(max(peak*0.975,limited)/max(peak,1.0e-6));
++}
++
+ void main() {
+     ivec2 xy=ivec2(gl_FragCoord.xy);
+     ivec2 sourceSize=textureSize(InputBuffer,0);
+@@ -1310,6 +1358,9 @@ void main() {
+         sourceXY=ivec2(clamp(floor(sourcePixel+vec2(0.5)),
+                             vec2(0.0),vec2(sourceSize-ivec2(1))));
+     }
++    // Repair only narrow positive sky/branch-edge overshoot BEFORE the
++    // existing color owner; identical scalar for all three RGB channels.
++    linearSrgb=iris26952ConstrainRim(sourceXY,linearSrgb);
+     if(iris26592MotionHdrHandoff!=0){
+         /* IRIS_26822_SINGLE_OWNER_CALL
+          * Retire the stacked 26797/26798 hue-replacement writers and the 26799/26803 replacement
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26931LkrBridge.java b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26931LkrBridge.java
+index 007ca705d4f7b707171ee7e342568a3d3a4aa953..38aa09b3949e14dc83e10414600a27f31a9c36db 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26931LkrBridge.java
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26931LkrBridge.java
+@@ -10,7 +10,7 @@ import java.nio.ByteBuffer;
+ import java.util.Arrays;
+ 
+ /**
+- * IRIS_26931_B_SUPER_RES_ON_ONLY — the original RawLens 2.2.86 LKR Vulkan
++ * IRIS_26931_B_SUPER_RES_ON_ONLY — the original RawLens 2.3.94 LKR Vulkan
+  * release owns ALL noise fit, coarse/tile/subtile LK, guide/temporal/robust
+  * rejection, 3x2 HQS solver, coverage-based noise handling and FinishLook.
+  * Iris owns only immutable RAW admission, linear RGB + physical clip GPU
+@@ -167,7 +167,7 @@ public final class GlesIris26931LkrBridge {
+                 !Float.isFinite(defaults[1]) || defaults[1]!=3.0f) {
+                 throw new IllegalStateException("26931 wrong upstream LKR native default ABI");
+             }
+-            // RawLens 2.2.86's ApplyTuning rebuilds the prior schedule from
++            // RawLens 2.3.94's ApplyTuning rebuilds the prior schedule from
+             // the *new* iteration count: for 3x2, t=1 only (zero-based).
+             // Every other native knob remains the published default, NaN.
+             LkrBridge.nativeSetCacheDir(app.getCodeCacheDir().getAbsolutePath());
+@@ -196,7 +196,7 @@ public final class GlesIris26931LkrBridge {
+             final int err=GLES30.glGetError();
+             if(err!=GLES30.GL_NO_ERROR)throw new IllegalStateException(
+                 "26931 LKR GL/Vulkan publication GL error: "+err);
+-            Log.i(TAG,"IRIS_26931_B_SR_ON_REAL_LKR release=2.2.86 " +
++            Log.i(TAG,"IRIS_26931_B_SR_ON_REAL_LKR release=2.3.94 " +
+                 "T=3 z=2 prior=1 DCT_PRIOR=OFF guide=2.0 " +
+                 "frames="+count+" fullRes="+stats[11]+"x"+stats[12]+
+                 " tiles="+stats[0]+" sigma="+stats[1]+
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932RawLensMedian.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932RawLensMedian.kt
+index 6ca8dad17af61bfe04581b831be7f79ea18839e2..307df6d29e70758929dbab59a23ca9aa8f5482af 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932RawLensMedian.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932RawLensMedian.kt
+@@ -1,11 +1,13 @@
+ package com.hinnka.mycamera.processor
+ 
+ /**
+- * IRIS_26932_LKR_ONLY_RAWLENS_2_2_86_FALSE_COLOR_MEDIAN.
+- * RawLens 2.2.86 app/src/main/assets/shaders/amaze/cleanup.glsl:
+- * exact 19-exchange Paeth median-of-9 over WB-balanced (R-G, B-G).
++ * IRIS_26952_B_ON_RAWLENS_2_3_94_TWO_RADIUS_COLOR_DIFFERENCE_MEDIAN.
++ * RawLens 2.3.94 app/src/main/assets/shaders/amaze/cleanup.glsl:
++ * exact 19-exchange Paeth medians at radii 1 and 2 over WB-balanced
++ * (R-G, B-G); choose the smaller color-difference norm.
+  * This part is adapted from RawLens GPL-3.0-or-later app shader;
+- * upstream commit 36e5141df568e74e2708dd4f50413b3aa51dab20.
++ * upstream release tag 2.3.94, cleanup.glsl Git blob
++ * 5f53f47c3391273739267146d61b50bf1d3a5b25.
+  * This intentionally does NOT port RawLens purple-defringe because the
+  * existing Iris Lab defringe is preserved by user request.
+  * Native LKR has already demosaiced, and Iris's LSC/WB has already occurred.
+@@ -38,20 +40,32 @@ internal object GlesIris26932RawLensMedian {
+                 clamp(pixel,ivec2(0),uSize-ivec2(1)),0).rgb,vec3(0.0));
+             return c.rb-c.g;
+         }
+-        void main(){
+-            ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
+-            vec4 original=texelFetch(uLkrPostWbRgb,p,0);
+-            highp vec3 c=max(original.rgb,vec3(0.0));
+-            highp vec2 p0=cc_diff(p+ivec2(-1,-1)),p1=cc_diff(p+ivec2(0,-1));
+-            highp vec2 p2=cc_diff(p+ivec2(1,-1)),p3=cc_diff(p+ivec2(-1,0));
+-            highp vec2 p4=c.rb-c.g,p5=cc_diff(p+ivec2(1,0));
+-            highp vec2 p6=cc_diff(p+ivec2(-1,1)),p7=cc_diff(p+ivec2(0,1));
+-            highp vec2 p8=cc_diff(p+ivec2(1,1));
++        // Paeth's 19-comparator median network, byte-for-byte same ordering
++        // as RawLens cleanup.glsl.  Only the sampling radius changes.
++        highp vec2 cc_median(ivec2 p,highp vec2 center,int radius){
++            highp vec2 p0=cc_diff(p+ivec2(-radius,-radius)),p1=cc_diff(p+ivec2(0,-radius));
++            highp vec2 p2=cc_diff(p+ivec2(radius,-radius)),p3=cc_diff(p+ivec2(-radius,0));
++            highp vec2 p4=center,p5=cc_diff(p+ivec2(radius,0));
++            highp vec2 p6=cc_diff(p+ivec2(-radius,radius)),p7=cc_diff(p+ivec2(0,radius));
++            highp vec2 p8=cc_diff(p+ivec2(radius,radius));
+             CC_SORT(p1,p2) CC_SORT(p4,p5) CC_SORT(p7,p8) CC_SORT(p0,p1) CC_SORT(p3,p4)
+             CC_SORT(p6,p7) CC_SORT(p1,p2) CC_SORT(p4,p5) CC_SORT(p7,p8) CC_SORT(p0,p3)
+             CC_SORT(p5,p8) CC_SORT(p4,p7) CC_SORT(p3,p6) CC_SORT(p1,p4) CC_SORT(p2,p5)
+             CC_SORT(p4,p7) CC_SORT(p4,p2) CC_SORT(p6,p4) CC_SORT(p4,p2)
+-            highp vec3 medianRgb=max(vec3(c.g+p4.x,c.g,c.g+p4.y),vec3(0.0));
++            return p4;
++        }
++        void main(){
++            ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
++            vec4 original=texelFetch(uLkrPostWbRgb,p,0);
++            highp vec3 c=max(original.rgb,vec3(0.0));
++            // 26952 restores the *current* RawLens two-radius cleanup,
++            // not a generic color desaturation or green-luma blur.  The
++            // separate two rings observe the original input, not one another.
++            highp vec2 m0=cc_diff(p);
++            highp vec2 fine=cc_median(p,m0,1);
++            highp vec2 wide=cc_median(p,m0,2);
++            highp vec2 d=dot(wide,wide)<dot(fine,fine)?wide:fine;
++            highp vec3 medianRgb=max(vec3(c.g+d.x,c.g,c.g+d.y),vec3(0.0));
+             // RawLens rcd_final.glsl (pinned upstream) operates in camera-
+             // native linear RGB, not the temporary post-WB Lab domain.
+             vec3 wb=max(uAmazeWb,vec3(0.0001));
+diff --git a/app/version.properties b/app/version.properties
+index 8824b4942df5a9d5e6b8ed3455f715b7c82d2aaf..ae061556abfb247f08d3f1a737e8c131d99cc907 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726951
+-VERSION_BUILD=26951
++VERSION_NAME=0.9726952
++VERSION_BUILD=26952

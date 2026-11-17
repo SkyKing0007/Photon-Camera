@@ -1320,11 +1320,11 @@ vec3 iris26952ConstrainRim(ivec2 pixel,vec3 rgb){
             float plateau=max(bright1,bright2);
             float dark=max(dark1,dark2);
             float edgeContrast=max(plateau-dark,0.0);
-            float flat=abs(bright1-bright2);
+            float plateauDelta=abs(bright1-bright2);
             // Demand a bright-side plateau, a steep actual boundary and
             // center-only positive overshoot.  This cannot flatten a genuine
             // broad white subject or change a smooth sky gradient.
-            if(edgeContrast>0.15*max(plateau,0.05) && flat<0.075*max(plateau,0.05) &&
+            if(edgeContrast>0.15*max(plateau,0.05) && plateauDelta<0.075*max(plateau,0.05) &&
                peak>plateau+0.006*max(peak,0.05)){
                 float cap=plateau+0.003*peak;
                 limited=min(limited,cap);

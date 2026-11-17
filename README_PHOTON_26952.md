@@ -1,6 +1,40 @@
-# PHOTON 26952 V3 — corrected current-shader build handoff
+# PHOTON 26952 V4 — reserved GLSL identifier and current-source verification fix
 
 **Classification:** LOCALLY VALIDATED / PREPARED FOR ACTIONS. **NOT 26952 BUILD-PROVEN** until GitHub Actions fully compiles and uploads its new APK. Native phone speed, false-color and sky-fringe image quality remain **NOT RUN / unverified on device**. Do not present these checks as visual acceptance.
+
+## V4: Actual V3 Actions 44159856517 root cause and fix
+
+The real glslang 16.5.0 ESSL300 compiler failed at step 44 with:
+`ERROR: 0:1323: syntax error, unexpected FLAT, expecting COMMA or SEMICOLON`.
+This was a genuine **26952 NEW active source error**, NOT a historical 26939
+contract problem: the halo source introduced `float flat=abs(bright1-bright2);`
+and uses `flat<...`. `flat` is a **reserved GLSL qualifier**; old local math
+and string checks missed this. The original 26939/41/42 LIVE compiler bodies
+correctly caught it, but too late to avoid yet another Actions failure.
+
+V4 updates **only the existing approved `render.glsl` runtime path** to
+`plateauDelta`, keeping byte-identical numeric math, all 26952 LKR median
+changes, 3x2 (not 8x4), official 2.3.94 dual-ABI native binaries, frame count,
+50MP output, and 2050 other 26951 protected paths. The strict current-source
+reserved-identifier guard is now applied before any live shader compile,
+with negative controls for `flat`, `coherent`, `restrict`, etc., and a
+specific regression in the source, math, workflow and shader extractor tests.
+
+Re-generated **both** full-index forward/rollback patches, expected 2055-file
+candidate SHA manifest, three-stage full seal, unique final trigger and clean-
+extract proofs from the **exact successful published 26951** source foundation.
+Never substitute any 26952 failed commit as runtime authority. The historical
+26904 GLSL/optimizer and V3 CMake regressions remain; all actual pinned
+GLSL/SPIR-V, full dual-ABI NDK/CMake, Kotlin, Java, assembleDebug and native
+packaging checks remain mandatory on Actions.
+
+The non-networked local container does not have pinned glslang/Android NDK;
+**real current shader compilation and full Android assemble remain NOT RUN**
+until Actions executes. All preflight/negative/rollback passes are local, not
+proof of completed compilation; actual phone IQ/speed remains untested.
+
+**Use every V4 Stage1 item, the V4 Stage2 workflow and V4 Stage3 trigger LAST.**
+Earlier 26952 V1/V2/V3 source/build attempts failed and published no APK.
 
 ## V3: Fix the actual 26952 V2 Actions BLOCKED error without an older build
 

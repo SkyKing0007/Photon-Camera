@@ -39,6 +39,7 @@ def check():
  for needle in ('iris26952ConstrainRim(sourceXY,linearSrgb);', 'iris26948BUniversalSdrEnabled==0','iris26592MotionHdrHandoff==0','return rgb*(max(peak*0.975,limited)/max(peak,1.0e-6));'):
   if needle not in render:fail('isolated B-only halo clamp missing '+needle)
  if render.count('iris26952ConstrainRim(sourceXY,linearSrgb);')!=1:fail('halo clamp applied multiple times')
+ if 'float flat=' in render or render.count('float plateauDelta=abs(bright1-bright2);')!=1:fail('26952 V3 real compiler reserved flat regression')
  for name in ('coherent','volatile','restrict'):
   glsl=med.split('"""#version 300 es',1)[1].split('""".trimIndent()',1)[0]
   glsl=re.sub(r'//[^\n]*|/\*.*?\*/','',glsl,flags=re.S)

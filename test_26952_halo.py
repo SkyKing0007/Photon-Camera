@@ -6,8 +6,16 @@ src=R/('app/src/main/assets/shaders/motionv2/render.glsl' if '--live' in sys.arg
 s=src.read_text()
 start=s.index('vec3 iris26952ConstrainRim(');end=s.index('\nvoid main()',start)
 code=s[start:end]
-for needle in ('iris26948BUniversalSdrEnabled==0','iris26592MotionHdrHandoff==0','irisOutputZoom>1.00001','if(peak<=0.60)return rgb;','for(int axis=0;axis<4;axis++)','for(int side=-1;side<=1;side+=2)','edgeContrast>0.15*max(plateau,0.05)','flat<0.075*max(plateau,0.05)','peak>plateau+0.006*max(peak,0.05)','limited=min(limited,cap);','max(peak*0.975,limited)'):
+for needle in ('iris26948BUniversalSdrEnabled==0','iris26592MotionHdrHandoff==0','irisOutputZoom>1.00001','if(peak<=0.60)return rgb;','for(int axis=0;axis<4;axis++)','for(int side=-1;side<=1;side+=2)','edgeContrast>0.15*max(plateau,0.05)','plateauDelta<0.075*max(plateau,0.05)','peak>plateau+0.006*max(peak,0.05)','limited=min(limited,cap);','max(peak*0.975,limited)'):
  if needle not in code:fail('rim gate missing '+needle)
+# 26952 V3 real GLSLang failure: `flat` is a reserved ESSL interpolation keyword.
+# A local numeric test formerly accepted `float flat=...`; enforce valid names
+# on the real production GLSL region and retain an explicit negative control.
+active=re.sub(r'/\*.*?\*/|//[^\n]*','',code,flags=re.S)
+if re.search(r'\bflat\b',active) or re.search(r'\b(?:float|int|bool|vec[234]|ivec[234])\s+(?:coherent|volatile|restrict|readonly|writeonly)\b',active):
+ fail('26952 V3 GLSLang unexpected FLAT/other reserved GLSL identifier regression')
+if code.count('float plateauDelta=abs(bright1-bright2);')!=1:
+ fail('corrected non-reserved halo GLSL plateauDelta variable absent')
 if 'mix(' in code or 'texture(' in code or 'textureLod' in code:fail('rim gate must not resample/color blend')
 if s.index('iris26952ConstrainRim(sourceXY,linearSrgb);')>s.index('linearSrgb=iris26822ApplySingleOwnerFalseColor('):fail('rim correction illegally late')
 # Mathematically mirror the GLSL source on deterministic one-dimensional scenes.
@@ -17,8 +25,8 @@ def bound(g,center,active=True,zoom=1.0):
  limited=peak
  for side in (-1,1):
   b1=g[center+side];b2=g[center+2*side];d1=g[center-side];d2=g[center-2*side]
-  plateau=max(b1,b2);dark=max(d1,d2);step=max(plateau-dark,0);flat=abs(b1-b2)
-  if step>.15*max(plateau,.05) and flat<.075*max(plateau,.05) and peak>plateau+.006*max(peak,.05):
+  plateau=max(b1,b2);dark=max(d1,d2);step=max(plateau-dark,0);plateauDelta=abs(b1-b2)
+  if step>.15*max(plateau,.05) and plateauDelta<.075*max(plateau,.05) and peak>plateau+.006*max(peak,.05):
    limited=min(limited,plateau+.003*peak)
  return max(peak*.975,limited)
 checks=0
