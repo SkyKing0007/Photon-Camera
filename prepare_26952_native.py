@@ -2,7 +2,7 @@
 """Historical original LK-R from successful 26951 APK, then exact official RawLens 2.3.94 dual-ABI.
 The two modes deliberately separate old mandatory regression from current native release override.
 """
-import hashlib,io,pathlib,shutil,subprocess,sys,time,urllib.request,zipfile
+import hashlib,io,pathlib,shutil,subprocess,sys,zipfile
 from build_26952_incremental import R,ART,ART_SHA,RUN,COMMIT,ART_ID,PRIOR_APK_SHA,PRIOR_APK_NAME,TMP,OUT,fail,sha
 TARGET=R/'app/build/verified_rawlens26931/jniLibs'
 RELEASE='https://github.com/matthew777777/RawLens/releases/download/2.3.94/RawLens-2.3.94-release.apk'
@@ -56,15 +56,12 @@ def official():
  apkfile=TMP/'RawLens-2.3.94-release-pinned.apk'
  if apkfile.is_file() and sha(apkfile)!=RELEASE_SHA:apkfile.unlink()
  if not apkfile.exists():
-  for i in range(3):
-   try:
-    req=urllib.request.Request(RELEASE,headers={'User-Agent':'Photon-26952-Actions-verified-source-port','Accept':'application/octet-stream'})
-    with urllib.request.urlopen(req,timeout=180) as res,apkfile.open('wb') as dst:shutil.copyfileobj(res,dst,length=4*1024*1024)
-    break
-   except Exception:
-    if apkfile.exists():apkfile.unlink()
-    if i==2:raise
-    time.sleep(2*(i+1))
+  # Official public RawLens release is a large, cross-host redirected GitHub
+  # asset. Use the same pinned curl -L discipline as the successful 26951
+  # Actions artifact, not urllib redirect streaming; fail closed on HTTP and SHA.
+  subprocess.run(['curl','--fail','--location','--retry','3',
+   '--silent','--show-error','-A','Photon-26952-Actions-verified-source-port',
+   '--connect-timeout','30','--max-time','600',RELEASE,'-o',str(apkfile)],check=True)
  if sha(apkfile)!=RELEASE_SHA:fail('official 2.3.94 APK SHA-256 mismatches GitHub release digest')
  with zipfile.ZipFile(apkfile) as z:
   if z.testzip():fail('official release APK CRC')

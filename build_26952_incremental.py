@@ -102,8 +102,14 @@ def fetch():
  if run.get('id')!=RUN or run.get('conclusion')!='success' or run.get('head_sha')!=COMMIT or run.get('head_branch')!=BRANCH:fail('26951 successful run identity mismatch')
  if art.get('id')!=ART_ID or art.get('expired') or art.get('digest')!='sha256:'+ART_SHA or art.get('workflow_run',{}).get('id') not in (RUN,None):fail('26951 published artifact identity mismatch')
  TMP.mkdir(exist_ok=True)
- req=urllib.request.Request('https://api.github.com/repos/'+REPO+'/actions/artifacts/'+str(ART_ID)+'/zip',headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json'})
- with urllib.request.urlopen(req,timeout=180) as src,ART.open('wb') as dst:shutil.copyfileobj(src,dst,length=4*1024*1024)
+ # Exact transport from BUILD-PROVEN 26951 (run 44140403857): urllib handles
+ # authenticated GitHub REST JSON only; curl -L carries the artifact's
+ # explicit authorization header across GitHub's cross-host ZIP redirect.
+ # 26952 V1 changed this to urllib ZIP streaming and failed HTTP 401.
+ subprocess.run(['curl','--fail','--location','--retry','3','--silent','--show-error',
+  '-H','Authorization: Bearer '+token,'-H','Accept: application/vnd.github+json',
+  'https://api.github.com/repos/'+REPO+'/actions/artifacts/'+str(ART_ID)+'/zip',
+  '-o',str(ART)],check=True)
  if sha(ART)!=ART_SHA:fail('actual 26951 artifact download SHA mismatch')
  print('PASS EXACT successful 26951 published artifact sha256 '+ART_SHA)
 

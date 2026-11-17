@@ -1,6 +1,29 @@
-# PHOTON 26952 — ONE guarded three-stage vscode.dev handoff
+# PHOTON 26952 V2 — corrected guarded three-stage vscode.dev handoff
 
 **Classification:** LOCALLY VALIDATED / PREPARED FOR ACTIONS. **NOT 26952 BUILD-PROVEN** until GitHub Actions fully compiles and uploads its new APK. Native phone speed, false-color and sky-fringe image quality remain **NOT RUN / unverified on device**. Do not present these checks as visual acceptance.
+
+## V2 repair of real 26952 V1 Actions failure
+
+V1 run `44154665517`, job `134292051303`, failed *at the successful-26951
+published artifact fetch*, with HTTP 401, **before** source reconstruction,
+real GLSL, NDK, Kotlin, Java, assemble or APK publication. The V1 builder had
+mistakenly replaced successful 26951's `curl --fail --location --retry 3`
+with `urllib.request.urlopen` to download the authenticated ZIP. V2 restores
+the **exact successful 26951 curl command** with bearer token and GitHub
+API JSON identity checks retained. A new live transport regression rejects
+that V1 401 implementation even after SHA re-sealing.
+
+The new external **public** RawLens release download also uses redirect-safe
+curl, with its same entire-release APK SHA, dual-ABI ELF/JNI checks and
+strict no-fallback behavior. No old source, color logic, native ABI, CMake,
+Gradle, GLSL, verification gates or runtime allowlist has changed for V2.
+
+**Since V1 Stage1 and workflow are already present on the experiment branch,
+replace its updated Stage1 files, retain/reupload the identical Stage2 workflow,
+then upload the *new V2 Stage3 trigger last*.** The trigger's changed bytes
+are essential to start another Actions run; never re-run the failed commit
+without first uploading the corrected builder and seal. Do not upload any
+source `handoff_payload` directly under `app/`.
 
 ## Foundation — actual successful GitHub Actions runtime, not `dev` source
 
@@ -13,7 +36,7 @@
 - **26951 executed workflow:** SHA-256 `40980c9badbe157fab569971f063966360ca9f0b6020792df1f1dd2be069966b`.
 - **26951 actual APK:** SHA-256 `69dc07e3a90286cdf63ac99cae8fe07a15f300aa000a98e12aed2b42fedea4d3`.
 
-The 26952 Actions builder fetches this exact successful artifact with authenticated Github Actions API, verifies source TAR, executed runner/builder/workflow, APK receipts and 2054 entire source hashes **before** overlaying 26952 changes. Repository checkout `app/src` is **NOT runtime authority**. No 26950 source is used.
+The 26952 V2 Actions builder fetches this exact successful artifact through the proven authenticated GitHub Actions API and curl -L redirect chain, verifies source TAR, executed runner/builder/workflow, APK receipts and 2054 entire source hashes **before** overlaying 26952 changes. Repository checkout `app/src` is **NOT runtime authority**. No 26950 source is used.
 
 ## Precisely bounded 26952 changes
 

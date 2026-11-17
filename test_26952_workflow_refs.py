@@ -2,8 +2,7 @@
 """Exact 26951 successful historical workflow prefix, correct new Actions refs,
 real shader/NDK/compiler and release gates, no unused/obsolete executable refs.
 """
-import hashlib,re,subprocess,sys
-from pathlib import Path
+import re,subprocess,sys
 from build_26952_incremental import R,fail,STAGE1_FILES,sha
 PREV_SHA='40980c9badbe157fab569971f063966360ca9f0b6020792df1f1dd2be069966b'
 OLD=R/'26951_SUCCESSFUL_EXECUTED_WORKFLOW_REFERENCE.yml'
@@ -43,4 +42,27 @@ for name in ('compile_26952_shaders.sh',):
  if ret.returncode:fail('real shader bash syntax invalid '+ret.stderr)
 negative=shell.replace('--target-env=opengl4.5','--target-env opengl4.5',1)
 if negative==shell or 'spirv-opt --target-env opengl4.5' not in negative:fail('historical SPIR-V negative malformed')
+# 26952 V1 production failure 44154665517: the newly invented urllib
+# cross-host artifact ZIP transport returned HTTP 401. 26951 used curl -L.
+# This regression is checked BEFORE network access, even on a resealed build.
+fetch_script=(R/'build_26952_incremental.py').read_text()
+fetch_region=fetch_script.split('def fetch():',1)[1].split('def safe_tar(',1)[0]
+assert_curl="subprocess.run(['curl','--fail','--location','--retry','3','--silent','--show-error',"
+if fetch_region.count(assert_curl)!=1 or "'-H','Authorization: Bearer '+token" not in fetch_region or "'-o',str(ART)" not in fetch_region:
+ fail('26952 V1 HTTP 401 regression: not exact successful 26951 curl -L credentialed artifact fetch')
+if 'with urllib.request.urlopen(req,timeout=180)' in fetch_region or "'/zip',headers=" in fetch_region:
+ fail('26952 V1 HTTP 401 regression: untested urllib cross-host artifact stream')
+release_script=(R/'prepare_26952_native.py').read_text()
+if release_script.count("subprocess.run(['curl','--fail','--location','--retry','3',")!=1 or "'--max-time','600',RELEASE,'-o',str(apkfile)" not in release_script:
+ fail('official large release must use redirect-safe curl with full SHA proof')
+if 'with urllib.request.urlopen(req,timeout=180)' in release_script:
+ fail('unverified native release cross-host urllib streaming restored')
+# Negative: reconstruct the rejected V1 downloader in memory. The transport
+# checker MUST fail even if a future handoff is independently SHA re-sealed.
+def transport_valid(code):
+ region=code.split('def fetch():',1)[1].split('def safe_tar(',1)[0]
+ return region.count(assert_curl)==1 and "'-H','Authorization: Bearer '+token" in region and "'-o',str(ART)" in region and 'with urllib.request.urlopen(req,timeout=180)' not in region
+broken=fetch_script.replace(assert_curl,"subprocess.run(['python','urllib-download','no-location',",1)
+if broken==fetch_script or transport_valid(broken):fail('26952 V1 401 negative control unexpectedly accepted')
+print('PASS 26952 V2 actual successful 26951 artifact curl -L transport restored; V1 401 reintroduction rejected')
 print('PASS 26952 successful 26951 historical graph unchanged, exact live executable manifest, original 26904 V2/V3 regressions and full real compile + two ABI native gates')
