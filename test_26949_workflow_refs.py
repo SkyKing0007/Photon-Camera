@@ -12,13 +12,16 @@ orig=a[:a.index('      - name: Fetch successful 26947 Actions run')]
 orig=orig.replace('name: Photon 26948 - B-only SDR highlight fidelity and guarded flicker control','name: Photon 26949 - B OFF original RAWR AMaZE and two-pass FCC restoration')
 orig=orig.replace('      - TRIGGER_26948.txt','      - TRIGGER_26949.txt')
 assert b.startswith(orig),'original 26948 historical workflow graph was altered'
+assert 'bash compile_26948_shaders.sh' not in b, 'old 26948 --live source-only gate cannot be executed on a 26949 live candidate'
+assert b.count('python3 -S replay_26949_inherited_26948_glsl.py\n')==1
+assert b.count('python3 -S replay_26949_inherited_26948_glsl.py --preflight')==1
 assert b.count('actions/upload-artifact@v4')==1
 assert b.count('./gradlew --no-daemon --build-cache :app:assembleDebug --stacktrace')==1
 assert b.count('build_26949_incremental.py prepare')==1
 for s in ['verify_26904_v3_safety.py','verify_26904_v2_safety.py','test_26903_v3_archive_receipt.py',
  'test_26931_native_integrity.py --native','test_26931_native_integrity.py --cmake','test_26931_native_integrity.py --apk',
  'verify_26906_native_cache.py preflight','verify_26906_native_cache.py postflight',
- 'compile_26939_shaders.sh','compile_26941_shaders.sh','compile_26942_shaders.sh','compile_26943_shaders.sh','compile_26944_shaders.sh','compile_26948_shaders.sh','compile_26949_shaders.sh',
+ 'compile_26939_shaders.sh','compile_26941_shaders.sh','compile_26942_shaders.sh','compile_26943_shaders.sh','compile_26944_shaders.sh','replay_26949_inherited_26948_glsl.py','compile_26949_shaders.sh',
  'test_26948_v2_shader_compat.py --payload --on-actions','test_26949_restore.py --payload','test_26949_restore.py --live','test_26949_patch_proof.py --live','test_26949_sealed_negatives.py',
  'build_26949_incremental.py fetch','build_26949_incremental.py verify-compiled','build_26949_incremental.py finalize']:
  assert s in b,'required historical/current gate missing '+s
@@ -36,4 +39,4 @@ if '--on-actions' in sys.argv:
  assert not missing,('missing executable in live checkout',missing)
 assert b.count('runs-on: ubuntu-24.04')==1
 assert 'timeout-minutes: 120' in b
-print('PASS historical successful 26948 workflow prefix IDENTICAL, 258 executable references exact, real compiler/native/assemble kept')
+print('PASS successful 26948 historical prefix IDENTICAL; full inherited real GLSL via sealed 26948 payload; exact executable references; real native/assemble')

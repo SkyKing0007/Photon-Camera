@@ -21,6 +21,6 @@ seal()
 for q,op in [('handoff_payload_26949/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870PostAmazeChroma.kt','append'),
  ('handoff_payload_26949/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt','append'),
  ('26949_EXPECTED_FULL_APP.sha256','append'),('26949_CHANGED_RUNTIME_ALLOWLIST.txt','append'),
- ('26949_FORWARD_FULLINDEX.patch','append'),('26949_STAGE_1_UPLOAD_PATHS.txt','append'),
+ ('replay_26949_inherited_26948_glsl.py','append'),('26949_FORWARD_FULLINDEX.patch','append'),('26949_STAGE_1_UPLOAD_PATHS.txt','append'),
  ('TRIGGER_26949.txt','remove'),('.github/workflows/build-26949-change-aware.yml','append')]:run_neg(q,op)
 print('PASS 26949 sealed negatives: source/manifest/scope/patch/stage/trigger/workflow fail-closed')
