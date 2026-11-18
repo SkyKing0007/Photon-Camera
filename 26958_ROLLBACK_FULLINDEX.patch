@@ -1,0 +1,149 @@
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+index 5bf4fabd09de04d45e3a8f891d789d8e3a0054d3..4ed7e4c25165af278a3103a03420eda996cdf6fd 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+@@ -147,13 +147,9 @@ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
+     }
+     wronski.iris26920Active = sr && frozen.iris26920Active;
+     rawr::raw_merge_hdrplus_gpu::Config hdrq{};
+-    // 26958 controlled parity with the user's adjustable Rawr HDR+ Quality
+-    // strength 11 reference. This is the merge Wiener tuning, not a substitute
+-    // for correctly calibrated displacement/energy rejection.
+-    // Only the borrowed Photo B OFF HDRQ route is part of the 11-strength
+-    // comparison. Keep the original 26957 strength 13 for a fresh Night HDRQ
+-    // coordinator, and preserve SR ON unchanged.
+-    if (!sr) { hdrq.strength = bOffReusable ? 11.0f : 13.0f; hdrq.tileSize = 32u; }
++    // 26957: Rawr 56c1b932 HDR+ Quality fixed 13/32, while preserving the
++    // capture journal and the physically distinct Super Res ON Wronski path.
++    if (!sr) { hdrq.strength = 13.0f; hdrq.tileSize = 32u; }
+     // RAWR's chunk fence can fail after a successful VkQueueSubmit. Keep the
+     // coordinator alive until an explicit queue-idle proof has settled every
+     // possible submission, rather than letting stack unwinding release its
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
+index d94ecfda2e5d979da5c4e6808a54e4164bd5bdda..4e3e7fd2ab1d4351afd10c07d0ea0c4983fe43a6 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
+@@ -876,18 +876,6 @@ BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<Bu
+         const float kb = recorder.brighterCompanion(b) ? recorder.exposureFactor(b) : 0.0f;
+         return ka < kb;
+     });
+-    // Rawr's strict burst fit uses the temporal neighbour of the reference,
+-    // not the oldest available NORMAL when a nonzero reference was selected.
+-    // Iris has a single fenced companion upload slot, so process that adjacent
+-    // NORMAL first; the reference and borrowed images remain unchanged.
+-    // Bracketed/HDRQ Night retains its exposure ordering and is protected.
+-    if (algorithm_ == MergeAlgorithm::HdrPlusFrequency && !order.empty()) {
+-        const std::uint32_t neighbour = ref + 1u < frameCount ? ref + 1u : ref - 1u;
+-        const auto where = std::find(order.begin(), order.end(), neighbour);
+-        if (where == order.end())
+-            throw std::runtime_error("26958 missing adjacent HDRQ noise pair");
+-        std::rotate(order.begin(), where, where + 1u);
+-    }
+     std::uint32_t companions = 0;
+     for (std::uint32_t pass = 0; pass < 4u; ++pass) {
+         recorder.beginPass(pass);
+@@ -946,20 +934,36 @@ BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<Bu
+                     recordTimestamp(1u);
+                 });
+                 timings.noiseEstimateMs = estimated.second.empty() ? estimated.first : estimated.second.front();
+-                // Rawr #122: only a statistically identified full affine RAW
+-                // burst fit is allowed to replace the configured noise model.
+-                // The older Iris 26957 single-quantile, zero-slope fallback
+-                // underestimated shot noise in bright/structured areas and
+-                // made stationary tiles look displaced after noise scaling.
+-                // A failed fit MUST retain the configured noise prior instead
+-                // of inventing a burst-fitted constant variance.
+                 const auto fit = fitBurstNoise(static_cast<const float*>(noiseStats_.mapped), bx * by);
+                 std::array<float, 4> slopes{}, offsets{};
+                 bool measured = false;
+-                if (fit && rawr::raw_merge_wronski_gpu::valid(fit->profile)) {
++                if (fit) {
+                     slopes = fit->profile.slopeBySite;
+                     offsets = fit->profile.offsetBySite;
+                     measured = true;
++                } else {
++                    // A robust, signal-independent BURST fallback remains
++                    // data-derived even when a four-bin slope fit is impossible.
++                    // Do not manufacture Camera2 coefficients or consume A's
++                    // protection controls. If no valid RAW blocks exist, mark
++                    // the motion classifier UNKNOWN and retain the original strength 11.
++                    const float* stats = static_cast<const float*>(noiseStats_.mapped);
++                    bool usable = true;
++                    for (std::size_t s = 0; s < 4u; ++s) {
++                        std::vector<float> variances;
++                        variances.reserve(bx * by);
++                        for (std::uint32_t b = 0; b < bx * by; ++b) {
++                            const float* q = stats + std::size_t(b) * kNoiseBlockFloats + s * 4u;
++                            if (!(q[0] >= 128.0f)) continue;
++                            const float var = (q[3] - q[2] * q[2] / q[0]) / (q[0] - 1.0f) * 0.5f;
++                            if (std::isfinite(var) && var > 0.0f) variances.push_back(var);
++                        }
++                        if (variances.empty()) {usable = false; break;}
++                        const std::size_t q = (variances.size() - 1u) / 5u;
++                        std::nth_element(variances.begin(), variances.begin() + q, variances.end());
++                        offsets[s] = std::max(variances[q], 1.0e-10f);
++                    }
++                    measured = usable;
+                 }
+                 /* An imported .c calibrates the B OFF noise variance model,
+                  * NOT temporal support/RAW capture. No usable RAW-burst pairs
+@@ -974,9 +978,6 @@ BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<Bu
+                     }
+                 }
+                 recorder.setMeasuredRawNoise(slopes, offsets, measured);
+-                // setNoise(configured) was already called before the first pass;
+-                // setMeasuredRawNoise(false) leaves that valid normalized->RAW
+-                // fallback intact, just as Rawr's restored merge Config does.
+                 // The optional post-AMaZE Rawr wavelet consumes the SAME
+                 // measured RAW noise model as the motion gate. Never pass a
+                 // Camera2 placeholder or unvalidated low-information fit.
+@@ -1008,7 +1009,7 @@ BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<Bu
+                         frameCount, ref, i, bx * by,
+                         validBlocks[0], validBlocks[1], validBlocks[2], validBlocks[3],
+                         measured ? 1 : 0, fit.has_value() ? 1 : 0,
+-                        0, measured ? 0 : 1);
++                        (!fit && measured) ? 1 : 0, measured ? 0 : 1);
+             }
+             const bool aligns = recorder.alignsThisPass();
+             const bool profile = std::getenv("RAWR_HDRP_PROFILE") != nullptr;
+@@ -1134,27 +1135,20 @@ BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<Bu
+             const float* support = static_cast<const float*>(noiseStats_.mapped);
+             const std::size_t tileCount = std::size_t(tiles.first) * tiles.second;
+             double inverse = 0.0;
+-            double totalAccepted = 0.0;
+-            std::size_t singleFrameTiles = 0u, lowSupportTiles = 0u;
+             for (std::size_t tile = 0; tile < tileCount; ++tile) {
+                 const float accepted = support[tile];
+                 if (!std::isfinite(accepted) || accepted < -0.0001f ||
+                     accepted > float(frameCount))
+                     throw std::runtime_error("26957 HDRQ invalid effective-frame support");
+                 inverse += 1.0 / (1.0 + double(std::max(accepted, 0.0f)));
+-                totalAccepted += accepted;
+-                if (accepted < 0.5f) ++singleFrameTiles;
+-                if (accepted < 3.0f) ++lowSupportTiles;
+             }
+             hdrqEffectiveFrames = float(double(tileCount) / inverse);
+             if (!std::isfinite(hdrqEffectiveFrames) ||
+                 hdrqEffectiveFrames < 1.0f || hdrqEffectiveFrames > float(frameCount) + 0.001f)
+                 throw std::runtime_error("26957 HDRQ effective-frame harmonic mean out of bounds");
+             __android_log_print(ANDROID_LOG_INFO, "Iris26957",
+-                "B_HDRQ_EFFECTIVE_FRAMES frames=%u effective=%.4f tiles=%zu fitted=%d "
+-                "arithmetic=%.4f single=%zu low=%zu",
+-                frameCount, hdrqEffectiveFrames, tileCount, hdrqMeasuredProfile.has_value() ? 1 : 0,
+-                1.0 + totalAccepted / double(tileCount), singleFrameTiles, lowSupportTiles);
++                "B_HDRQ_EFFECTIVE_FRAMES frames=%u effective=%.4f tiles=%zu fitted=%d",
++                frameCount, hdrqEffectiveFrames, tileCount, hdrqMeasuredProfile.has_value() ? 1 : 0);
+         }
+         timings.finalizeMs += gpuOrWall(executeChunk(15u, ref, 2u, [&] {
+             recordTimestamp(0u);
+diff --git a/app/version.properties b/app/version.properties
+index 2a8268319f420d72217fe7ca6c31d1ab4f29f254..a00468133ecf3f3ef9ac3b53331fd7db405fbe76 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726958
+-VERSION_BUILD=26958
++VERSION_NAME=0.9726957
++VERSION_BUILD=26957
