@@ -1,0 +1,577 @@
+diff --git a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+index baa21bdfa3bff5964dba4d2a709cb8dde309507f..ff20340930af608b15f6e51149e274ef840930df 100644
+--- a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
++++ b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+@@ -29,6 +29,9 @@
+ #include <mutex>
+ #include <exception>
+ 
++namespace rawr::raw_gpu_pipeline {
++extern thread_local float iris26957HdrqEffectiveFrames;
++}
+ namespace {
+ struct Iris26864LscGpu final {
+     VkDevice device=VK_NULL_HANDLE;
+@@ -293,7 +296,8 @@
+     jfloatArray javaLsc,jint lscWidth,jint lscHeight,jint rawWidth,jint rawHeight,
+     jint physicalCfa,jint cropX,jint cropY,jint fullSensorWidth,jint fullSensorHeight,
+     jint referenceIndex,jboolean sr,jint outputRgbTexture,jint outputClipTexture,
+-    jlong physicalLensIdentity,jfloatArray javaBOffNoise,jboolean photoBOffOnly){
++    jlong physicalLensIdentity,jfloatArray javaBOffNoise,jboolean photoBOffOnly,
++    jboolean hdrqEffectiveChroma){
+     if(!assets||!javaNormals||!javaStrides||!javaTimestamps||
+        !javaExposure||!javaBlacks||!javaWhites||!javaWb||
+        rawWidth<32||rawHeight<32||rawWidth>8192||rawHeight>8192||
+@@ -977,6 +981,103 @@
+                     bOffReconcile->record(cmd,b,&a,sizeof(a),outWidth,outHeight);
+                 }
+             }
++            // Rawr 56c1b932: HDR+ Quality uses its OWN independent optional
++            // chroma-only denoiser. The profile is the same measured burst
++            // noise as its motion gate, divided by the harmonic-mean effective
++            // count of frames actually admitted. This is not MGC chroma NR.
++            // The preference defaults OFF like Rawr; never touch SR ON.
++            if(sr == JNI_FALSE && hdrqEffectiveChroma == JNI_TRUE){
++                const float effective=rawr::raw_gpu_pipeline::iris26957HdrqEffectiveFrames;
++                const auto& fitted=result.estimatedNoise;
++                const uint32_t g0=(localCfa==1u||localCfa==2u)?0u:1u;
++                const uint32_t g1=(localCfa==1u||localCfa==2u)?3u:2u;
++                const float a=(fitted.slopeBySite[g0]+fitted.slopeBySite[g1])*0.5f
++                             /std::max(effective,1.0f);
++                const float b=(fitted.offsetBySite[g0]+fitted.offsetBySite[g1])*0.5f
++                             /std::max(effective,1.0f);
++                const bool usable=result.noiseEstimated && std::isfinite(effective) &&
++                    effective>=1.0f && effective<=float(result.frameCount)+0.001f &&
++                    std::isfinite(a) && a>0.f && std::isfinite(b) && b>=0.f;
++                if(usable){
++                    if(!result.output||!result.outputView||result.output==rgb.image()||
++                       result.outputView==rgb.view()||
++                       result.outputFormat!=VK_FORMAT_R16G16B16A16_SFLOAT||
++                       result.outputExtent.width!=outWidth||result.outputExtent.height!=outHeight)
++                        throw std::runtime_error("26957 HDRQ wavelet real scratch ownership invalid");
++                    auto pinnedSpv=[](const unsigned char* data,size_t bytes)->raw_denoise::DenoiseSpirv{
++                        if(!data||bytes<84u||(bytes%4u)!=0u||
++                           (reinterpret_cast<uintptr_t>(data)%alignof(uint32_t))!=0u||
++                           reinterpret_cast<const uint32_t*>(data)[0]!=0x07230203u)
++                            throw std::runtime_error("26957 pinned Rawr wavelet SPIR-V missing");
++                        return {reinterpret_cast<const uint32_t*>(data),bytes/sizeof(uint32_t)};
++                    };
++                    raw_denoise::DenoiseShaders sh{};
++                    sh.precondition=pinnedSpv(iris26880_wavelet_precondition_spv,iris26880_wavelet_precondition_spv_size);
++                    sh.atrous=pinnedSpv(iris26880_wavelet_atrous_spv,iris26880_wavelet_atrous_spv_size);
++                    sh.threshold=pinnedSpv(iris26880_wavelet_threshold_spv,iris26880_wavelet_threshold_spv_size);
++                    sh.backtransform=pinnedSpv(iris26880_wavelet_backtransform_spv,iris26880_wavelet_backtransform_spv_size);
++                    bWavelet.reset(new raw_denoise::DenoisePipeline(ctx.physicalDevice,ctx.device,sh));
++                    const auto copy=pinnedSpv(iris26880_wavelet_copy_spv,iris26880_wavelet_copy_spv_size);
++                    iris26864::ShaderBinary program{};
++                    program.words=copy.words;program.wordCount=copy.wordCount;
++                    program.workgroupX=16u;program.workgroupY=16u;program.workgroupZ=1u;
++                    bWaveletCopy.reset(new iris26864::VulkanKernelExecutor(ctx.device,program,
++                        std::vector<iris26864::ComputeBinding>{
++                            {0,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
++                            {1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
++                            {2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}},80u,1u));
++                    VkMemoryBarrier ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
++                                          VK_ACCESS_SHADER_WRITE_BIT,
++                                          VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT};
++                    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0u,1u,&ready,0u,nullptr,0u,nullptr);
++                    raw_denoise::DenoiseParams params{};
++                    params.strength=1.f;params.shadows=1.f;
++                    params.noiseA=a;params.noiseB=b;
++                    params.whiteBalance={gainsVec[0]/gainsVec[1],1.f,gainsVec[2]/gainsVec[1]};
++                    params.maxScale=7;params.forceY=0.f;params.forceUv=.75f;params.tileSize=1536u;
++                    // AMaZE's output is camera-linear, pre-WB. The legacy
++                    // Rawr wavelet writes into the DEAD HDRQ output scratch.
++                    bWavelet->record(cmd,rgb.view(),result.outputView,outWidth,outHeight,params);
++                    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0u,1u,&ready,0u,nullptr,0u,nullptr);
++                    // The pinned copy shader's shot.a<2 branch is a STRICT
++                    // pointwise copy of denoised RGB, preserving AHB alpha;
++                    // the B-ON-only physical-LSC spatial chroma reconstruction
++                    // is *not* executed here, preventing historical blotches.
++                    struct alignas(16) RawrHdrqCopyPc {
++                        uint32_t extent[4],sensor[4];
++                        float shot[4],readNoise[4],wb[4];
++                    };
++                    static_assert(sizeof(RawrHdrqCopyPc)==80u,"26957 pure wavelet copy ABI");
++                    RawrHdrqCopyPc args{
++                        {outWidth,outHeight,uint32_t(lscWidth),uint32_t(lscHeight)},
++                        {uint32_t(cropX),uint32_t(cropY),
++                         uint32_t(fullSensorWidth),uint32_t(fullSensorHeight)},
++                        {a,a,a,1.0f}, // shot.a < 2 -> copy-only; NO SR ON spatial correction
++                        {b,b,b,0.f},
++                        {gainsVec[0]/gainsVec[1],1.f,gainsVec[2]/gainsVec[1],0.f}};
++                    std::vector<iris26864::BoundResource> bindings;
++                    for (const auto binding: {
++                          std::pair<uint32_t,VkImageView>{0u,result.outputView},
++                          {1u,rgb.view()}}){
++                        iris26864::BoundResource v{};v.binding=binding.first;
++                        v.type=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;v.imageView=binding.second;
++                        bindings.push_back(v);
++                    }
++                    iris26864::BoundResource l{};l.binding=2u;
++                    l.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;l.buffer=lsc.buffer;
++                    l.bufferRange=lsc.bytes;bindings.push_back(l);
++                    bWaveletCopy->record(cmd,bindings,&args,sizeof(args),outWidth,outHeight);
++                    __android_log_print(ANDROID_LOG_INFO,"Iris26957",
++                        "B_HDRQ_RAWR_CHROMA_WAVELET effective=%.3f full=%u a=%.8g b=%.8g",
++                        effective,result.frameCount,double(a),double(b));
++                }else{
++                    __android_log_print(ANDROID_LOG_WARN,"Iris26957",
++                        "B_HDRQ_RAWR_CHROMA_WAVELET_OFF_UNFITTED estimated=%d effective=%.3f a=%g b=%g",
++                        int(result.noiseEstimated),effective,double(a),double(b));
++                }
++            }
+             // The sidecar is computed from ORIGINAL sensor clip bits before
+             // pre-AMaZE LSC. Expand into the full-resolution Iris clip-owner
+             // surface rather than silently discarding its 4 CFA bits.
+@@ -1028,14 +1129,15 @@
+     jint rawWidth,jint rawHeight,jint physicalCfa,jint cropX,jint cropY,
+     jint fullSensorWidth,jint fullSensorHeight,jint referenceIndex,
+     jboolean sr,jint outputRgbTexture,jint outputClipTexture,
+-    jlong physicalLensIdentity,jfloatArray javaBOffNoise,jboolean photoBOffOnly){
++    jlong physicalLensIdentity,jfloatArray javaBOffNoise,jboolean photoBOffOnly,
++    jboolean hdrqEffectiveChroma){
+     try {
+         AAssetManager* assets=javaAssets?AAssetManager_fromJava(env,javaAssets):nullptr;
+         iris26864RunRealBGl(env,assets,normals,strides,exposures,timestamps,
+             blacks,whites,wb,lsc,lscWidth,lscHeight,rawWidth,rawHeight,
+             physicalCfa,cropX,cropY,fullSensorWidth,fullSensorHeight,
+             referenceIndex,sr,outputRgbTexture,outputClipTexture,
+-            physicalLensIdentity,javaBOffNoise,photoBOffOnly);
++            physicalLensIdentity,javaBOffNoise,photoBOffOnly,hdrqEffectiveChroma);
+     }catch(const std::exception& error){
+         if(env->ExceptionCheck())return;
+         const auto cl=env->FindClass("java/lang/IllegalStateException");
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+index 101128cc65aa9c05b4dffb0ad20f4beaf645efce..4ed7e4c25165af278a3103a03420eda996cdf6fd 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+@@ -147,10 +147,9 @@
+     }
+     wronski.iris26920Active = sr && frozen.iris26920Active;
+     rawr::raw_merge_hdrplus_gpu::Config hdrq{};
+-    // 26956 V2: Rawr HDR+ Quality motion gate with original Iris strength 11.
+-    // This applies to every !sr frequency-merge owner, including B Night.
+-    // B Super Res ON uses Wronski and ignores this HDRQ setting.
+-    if (!sr) hdrq.strength = 11.0f;
++    // 26957: Rawr 56c1b932 HDR+ Quality fixed 13/32, while preserving the
++    // capture journal and the physically distinct Super Res ON Wronski path.
++    if (!sr) { hdrq.strength = 13.0f; hdrq.tileSize = 32u; }
+     // RAWR's chunk fence can fail after a successful VkQueueSubmit. Keep the
+     // coordinator alive until an explicit queue-idle proof has settled every
+     // possible submission, rather than letting stack unwinding release its
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp
+index cd29ecb1428673f1c83a07400c1e57334c5e9b1d..70e0625cd2ee1bc9722ea99d42f7ee7bea3c3e36 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp
+@@ -6,9 +6,14 @@
+ layout(set = 0, binding = 0, r32f) uniform image2D mismatch;
+ layout(set = 0, binding = 1, r32f) uniform image2D total;
+ layout(std430, set = 0, binding = 2) readonly buffer Mean { float v[]; } mean;
++layout(set = 0, binding = 3, r32f) readonly uniform image2D zmap;
++layout(set = 0, binding = 4, r32f) uniform image2D neffAcc;
+ layout(push_constant) uniform P {
+     ivec2 tiles;
+     float invFrames;
++    float gateLo;
++    float gateHi;
++    int useMotionGate;
+ } p;
+ 
+ void main() {
+@@ -17,4 +22,10 @@
+     float m = clamp(imageLoad(mismatch, g).x * (0.12 / (mean.v[0] + 1e-12)), 0.0, 1.0);
+     imageStore(mismatch, g, vec4(m));
+     imageStore(total, g, vec4(imageLoad(total, g).x + m * p.invFrames));
++    // Rawr 56c1b932: rejected companion tiles contribute no noise averaging.
++    // Bracketed and non-gated routes retain their protected old behavior.
++    if (p.useMotionGate != 0) {
++        float contribution = 1.0 - smoothstep(p.gateLo, p.gateHi, imageLoad(zmap, g).x);
++        imageStore(neffAcc, g, vec4(imageLoad(neffAcc, g).x + contribution));
++    }
+ }
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+index e47fd1910d650f34325c2f879181b512f01e8c18..37f8727e990fe0fd29a7a50719815033e58d8960 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+@@ -372,9 +372,10 @@
+ };
+ struct MismatchNormPc {
+     std::int32_t tilesX, tilesY;
+-    float invFrames;
+-};
+-static_assert(sizeof(MismatchNormPc)==12u, "RAWR original HDRQ mismatch ABI");
++    float invFrames, gateLo, gateHi;
++    std::int32_t useMotionGate;
++};
++static_assert(sizeof(MismatchNormPc)==24u, "26957 Rawr HDRQ effective-frames push ABI");
+ struct FreqMergePc {
+     std::int32_t tilesX, tilesY;
+     float robustnessNorm, readNoise, maxMotionNorm;
+@@ -431,6 +432,8 @@
+     add("hdrq_rms", tiles, PixelStorage::RGBA32Float, Lifetime::Burst);
+     add("hdrq_mismatch", tiles, PixelStorage::R32Float, Lifetime::Companion);
+     add("hdrq_zmap", tiles, PixelStorage::R32Float, Lifetime::Companion);
++    // Rawr 56c1b932: accumulate effective temporal support per shifted pass.
++    add("hdrq_neff", tiles, PixelStorage::R32Float, Lifetime::Output);
+     add("hdrq_total_mismatch", tiles, PixelStorage::R32Float, Lifetime::Output);
+     add("hdrq_highlights", tiles, PixelStorage::R32Float, Lifetime::Companion);
+     add("hdrq_weight_sum", rgba, PixelStorage::R32Float, Lifetime::Output);
+@@ -576,6 +579,7 @@
+     const VkClearColorValue zero{};
+     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+     vkCmdClearColorImage(c, arena_.image("hdrq_total_mismatch").image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
++    vkCmdClearColorImage(c, arena_.image("hdrq_neff").image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+     // 26944: no per-pass minimum-confidence clear; restored 26942 image math.
+     // Bracketed merges seed each bin's weight sum with the reference's weight.
+     if (!uniformExposure_) {
+@@ -673,9 +677,12 @@
+     computeWriteBarrier(c);
+     // Exact RAWR mean-normalized mismatch scale for uniform and bracketed
+     // HDRQ bursts. No old LONG-era local mismatch override remains.
+-    MismatchNormPc np{std::int32_t(tx), std::int32_t(ty), 1.0f / float(frameCount)};
++    MismatchNormPc np{std::int32_t(tx), std::int32_t(ty), 1.0f / float(frameCount),
++                      kGateLow, kGateHigh, gated ? 1 : 0};
+     executor_.record(c, ShaderId::HdrqMismatchNorm,
+-                     {{ib(0, mismatch), ib(1, arena_.image("hdrq_total_mismatch"))}, {bb(2, arena_.buffer("hdrq_mean"))}},
++                     {{ib(0, mismatch), ib(1, arena_.image("hdrq_total_mismatch")),
++                       ib(3, zmap), ib(4, arena_.image("hdrq_neff"))},
++                      {bb(2, arena_.buffer("hdrq_mean"))}},
+                      &np, sizeof(np), divUp(tx, 16), divUp(ty, 16));
+     computeWriteBarrier(c);
+     if (mark) mark(3u);
+@@ -720,6 +727,27 @@
+     substitutionReady_ = true;
+ }
+ 
++// 26957: match Rawr's per-tile effective-frame readback at the end of
++// the last pass. No image readback of RAW pixels, only tile noise support.
++void HdrPlusFrequencyRecorder::recordEffectiveFramesCopy(VkCommandBuffer c, VkBuffer host) {
++    const auto& neff = arena_.image("hdrq_neff");
++    VkMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
++                              VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
++    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                         0, 1, &toTransfer, 0, nullptr, 0, nullptr);
++    VkBufferImageCopy region{};
++    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++    region.imageExtent = {neff.extent.width, neff.extent.height, 1};
++    vkCmdCopyImageToBuffer(c, neff.image, VK_IMAGE_LAYOUT_GENERAL, host, 1, &region);
++    VkMemoryBarrier toHost{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
++                          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
++    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
++                         0, 1, &toHost, 0, nullptr, 0, nullptr);
++}
++std::pair<std::uint32_t, std::uint32_t> HdrPlusFrequencyRecorder::tileCount() const noexcept {
++    return {geometry_.tilesX, geometry_.tilesY};
++}
++
+ void HdrPlusFrequencyRecorder::recordPassFinish(VkCommandBuffer c, std::uint32_t frameCount) {
+     const std::uint32_t tx = geometry_.tilesX, ty = geometry_.tilesY;
+     const auto& finalFt = arena_.image("hdrq_final_ft");
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
+index 2648823bdfe271363d74df1102643cd3eebd0472..100ede8c0a8853abde00d7aca6d3d5d04e86ca74 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
+@@ -18,6 +18,10 @@
+ #include <utility>
+ namespace rawr::raw_gpu_pipeline {
+ thread_local std::optional<std::array<float,8>> iris26912BOffNoiseOverride;
++// HDR+ Quality effective temporal support is a B-only, synchronously scoped
++// receipt. The published vendor BurstRunResult ABI and its native archive
++// remain byte-identical to the proven 26956 V2 runtime.
++thread_local float iris26957HdrqEffectiveFrames = 0.0f;
+ // Linked to the unchanged 26941 B-OFF Vulkan executor (same namespace).
+ // 26942 V1 NDK failure regression: never use the TLS guard without a declaration.
+ extern thread_local bool iris26941BOffHdrqLazyPoolReset;
+@@ -820,6 +824,9 @@
+     const auto gpuOrWall = [](const ChunkTiming& t) { return t.second.empty() ? t.first : t.second.front(); };
+     const auto geometry = rawr::raw_merge_hdrplus_gpu::makeFrequencyGeometry(width_, height_, hdrplus_);
+     HdrPlusFrequencyRecorder recorder(arena_, executor_, hdrplus_, geometry);
++    iris26957HdrqEffectiveFrames = 0.0f;
++    std::optional<rawr::raw_merge_common::CfaNoiseProfile> hdrqMeasuredProfile;
++    float hdrqEffectiveFrames = 0.0f;
+     // Full matched Rawr HDR+ Quality gate only. Other algorithms and bracketed
+     // HDRQ retain their exact successful 26955 behavior.
+     recorder.setMotionGate(algorithm_==MergeAlgorithm::HdrPlusFrequency);
+@@ -971,6 +978,16 @@
+                     }
+                 }
+                 recorder.setMeasuredRawNoise(slopes, offsets, measured);
++                // The optional post-AMaZE Rawr wavelet consumes the SAME
++                // measured RAW noise model as the motion gate. Never pass a
++                // Camera2 placeholder or unvalidated low-information fit.
++                if (measured) {
++                    rawr::raw_merge_common::CfaNoiseProfile candidate{};
++                    candidate.slopeBySite=slopes;
++                    candidate.offsetBySite=offsets;
++                    if (rawr::raw_merge_wronski_gpu::valid(candidate))
++                        hdrqMeasuredProfile=candidate;
++                }
+                 /* IRIS_26905_B_OFF_NOISE_MODEL_RECEIPT
+                  * The former stderr receipt was absent from Android capture logs.
+                  * Report actual input RAW-block evidence and the model outcome,
+@@ -1095,6 +1112,44 @@
+                 if (frameConsumed) frameConsumed(i);
+             }
+         }
++        // Rawr 56c1b932: after the LAST companion of the LAST shifted
++        // pass, map only per-tile accepted-frame counts. This is deliberately
++        // before the next image lifetime phase, and the executeChunk fence
++        // is mandatory before host reads. No frame-count guess is permitted.
++        if (pass == 3u && algorithm_ == MergeAlgorithm::HdrPlusFrequency) {
++            const auto tiles = recorder.tileCount();
++            const VkDeviceSize bytes = VkDeviceSize(tiles.first) * tiles.second * sizeof(float);
++            if (tiles.first == 0u || tiles.second == 0u || bytes == 0u)
++                throw std::runtime_error("26957 HDRQ effective tiles are empty");
++            // All prior noise-statistics consumers are already fenced.
++            // Reuse the existing host transfer buffer; no vendor ABI changes.
++            ensureHostBuffer(noiseStats_, bytes);
++            executeChunk(32u, ref, 2u, [&] {
++                recordTimestamp(0u);
++                recorder.recordEffectiveFramesCopy(command_, noiseStats_.buffer);
++                recordTimestamp(1u);
++            });
++            check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX),
++                  "26957 HDRQ effective frame fence");
++            submissionInFlight_ = false;
++            const float* support = static_cast<const float*>(noiseStats_.mapped);
++            const std::size_t tileCount = std::size_t(tiles.first) * tiles.second;
++            double inverse = 0.0;
++            for (std::size_t tile = 0; tile < tileCount; ++tile) {
++                const float accepted = support[tile];
++                if (!std::isfinite(accepted) || accepted < -0.0001f ||
++                    accepted > float(frameCount))
++                    throw std::runtime_error("26957 HDRQ invalid effective-frame support");
++                inverse += 1.0 / (1.0 + double(std::max(accepted, 0.0f)));
++            }
++            hdrqEffectiveFrames = float(double(tileCount) / inverse);
++            if (!std::isfinite(hdrqEffectiveFrames) ||
++                hdrqEffectiveFrames < 1.0f || hdrqEffectiveFrames > float(frameCount) + 0.001f)
++                throw std::runtime_error("26957 HDRQ effective-frame harmonic mean out of bounds");
++            __android_log_print(ANDROID_LOG_INFO, "Iris26957",
++                "B_HDRQ_EFFECTIVE_FRAMES frames=%u effective=%.4f tiles=%zu fitted=%d",
++                frameCount, hdrqEffectiveFrames, tileCount, hdrqMeasuredProfile.has_value() ? 1 : 0);
++        }
+         timings.finalizeMs += gpuOrWall(executeChunk(15u, ref, 2u, [&] {
+             recordTimestamp(0u);
+             recorder.recordPassFinish(command_, frameCount);
+@@ -1123,6 +1178,13 @@
+                           timings};
+     result.cfaImage = cfa.image;
+     result.cfaView = cfa.view;
++    // Preserve the original native vendor public struct. The TLS support
++    // receipt is read synchronously by the B-only post-AMaZE consumer.
++    iris26957HdrqEffectiveFrames = hdrqEffectiveFrames;
++    if (hdrqMeasuredProfile) {
++        result.noiseEstimated = true;
++        result.estimatedNoise = *hdrqMeasuredProfile;
++    }
+     return result;
+ }
+ void AndroidBurstCoordinator::releaseScratch() noexcept {
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp
+index db23e3d4db0408a4c5f65faaaa116427685bf826..e72146e0a31883cbd5e7d2f885171204338a4871 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp
+@@ -139,6 +139,10 @@
+     // mismatch normalization (3) for sub-stage GPU timestamps.
+     void recordCompanionMerge(VkCommandBuffer command, std::uint32_t frameCount, std::uint32_t slot,
+                               const std::function<void(std::uint32_t)>& mark = {});
++    // Rawr 56c1b932: read effective temporal support after all companions
++    // of pass three, with compute-to-transfer-to-host synchronization.
++    void recordEffectiveFramesCopy(VkCommandBuffer command, VkBuffer host);
++    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> tileCount() const noexcept;
+     void recordPassFinish(VkCommandBuffer command, std::uint32_t frameCount);
+     void recordFinalize(VkCommandBuffer command) { align_.recordFinalize(command); }
+     // Bracketed bursts: companions brighter than the reference. Merge the
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp
+index fc1ad5f51ce49b64c651e07275040b1b14fe84ef..8adc9a04c453492ebb5b94195dd73899b4b53a89 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp
+@@ -462,7 +462,9 @@
+                                    mf_hdrq_mismatch_norm_prod_spv_size,
+                                    mf_hdrq_mismatch_norm_trace_spv,
+                                    mf_hdrq_mismatch_norm_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
++                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
++                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
++                                    {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+                                   {"hdrq_forward_dft",
+                                    mf_hdrq_forward_dft_prod_spv,
+                                    mf_hdrq_forward_dft_prod_spv_size,
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26864NativeRawr.java b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26864NativeRawr.java
+index aa3c6824c179d253eb6587f4adabb879d0a5a4ff..08c414864fbb7814e0909ea3ff811ac7888dd283 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26864NativeRawr.java
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26864NativeRawr.java
+@@ -83,7 +83,7 @@
+             int referenceNormalIndex, boolean wronskiTrue2x,
+             int outputRgbTexture, int outputClipTexture,
+             long physicalCameraIdentity, float[] bOffNoiseByPhase,
+-            boolean photoBOffOnly) {
++            boolean photoBOffOnly, boolean hdrqEffectiveChroma) {
+         if (app == null || frozen == null || wb == null || wb.length != 3
+                 || physicalBayer < 0 || physicalBayer > 3
+                 || referenceNormalIndex < 0 || referenceNormalIndex >= frozen.getBuffers().length
+@@ -111,7 +111,7 @@
+                 cropX, cropY, fullSensorWidth, fullSensorHeight,
+                 referenceNormalIndex, wronskiTrue2x,
+                 outputRgbTexture, outputClipTexture, physicalCameraIdentity, bOffNoiseByPhase,
+-                photoBOffOnly && !wronskiTrue2x);
++                photoBOffOnly && !wronskiTrue2x, hdrqEffectiveChroma && !wronskiTrue2x);
+     }
+ 
+     private static native void nativeExecuteGpu(AssetManager assets,
+@@ -121,5 +121,6 @@
+             int width, int height, int physicalBayer, int cropX, int cropY,
+             int fullWidth, int fullHeight, int referenceIndex,
+             boolean true2x, int rgbTexture, int clipTexture,
+-            long physicalLensIdentity, float[] bOffNoiseByPhase, boolean photoBOffOnly);
++            long physicalLensIdentity, float[] bOffNoiseByPhase, boolean photoBOffOnly,
++            boolean hdrqEffectiveChroma);
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870GpuSharpest.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870GpuSharpest.kt
+index a32e02ca7369b09412492a057c93009d60c67b6e..8d5b683cd76e60361c02789ba2ffcde3fc93dea1 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870GpuSharpest.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870GpuSharpest.kt
+@@ -100,11 +100,21 @@
+         val v=IntArray(1);GLES30.glGetIntegerv(id,v,0);return v[0]
+     }
+     fun select(frozen:GlesIris26864FrozenRawrIngress,cfa:Int,shutterIndex:Int,
+-               eligibleIndices:Set<Int>?=null):Int {
++               eligibleIndices:Set<Int>?=null, pressWindow26957:Boolean=false):Int {
+         frozen.assertUsable()
+         require(cfa in 0..3 && shutterIndex in frozen.buffers.indices)
+         require(eligibleIndices==null || (shutterIndex in eligibleIndices &&
+             eligibleIndices.all { it in frozen.buffers.indices }))
++        // Rawr 56c1b932 uses the best frame from the preceding 0.25 seconds,
++        // never an arbitrary sharp frame from the entire burst. We score the
++        // *shutter-frozen* GPU RAW ring so no new Camera2 capture/latency or
++        // frame ownership is introduced into this previously proven bridge.
++        val shutterNs=frozen.timestampsNs[shutterIndex]
++        val recent=if(pressWindow26957 && shutterNs>0L) frozen.buffers.indices.filter { i ->
++            val age=shutterNs-frozen.timestampsNs[i]
++            age>=0L && age<=250_000_000L
++        }.toSet()+shutterIndex else frozen.buffers.indices.toSet()
++        val candidates=(eligibleIndices ?: frozen.buffers.indices.toSet()).intersect(recent)+shutterIndex
+         val w=frozen.width;val h=frozen.height
+         val maxTex=state(GLES30.GL_MAX_TEXTURE_SIZE)
+         if(w<128||h<128||w>maxTex||h>maxTex)return shutterIndex
+@@ -180,7 +190,7 @@
+             check(baseline.isFinite() && baseline>0)
+             val host=ByteBuffer.allocateDirect(GRID*GRID*4).order(ByteOrder.nativeOrder())
+             for(i in frozen.buffers.indices){
+-                if(eligibleIndices!=null && i !in eligibleIndices)continue
++                if(i !in candidates)continue
+                 val exp=frozen.exposures[i].toDouble()
+                 // Reference-dependent exposure/black/clip metadata MUST be
+                 // comparable to shutter when downstream capture metadata stays frozen.
+@@ -207,13 +217,21 @@
+                         count++
+                     }
+                 }
+-                if(count>=500){scores[i]=sum/count;supports[i]=count}
++                if(count>=500){
++                    val ageNs=if(pressWindow26957 && shutterNs>0L)
++                        (shutterNs-frozen.timestampsNs[i]).coerceIn(0L,250_000_000L) else 0L
++                    // Existing green-edge/clip/noise score, with a mild
++                    // temporal age penalty for the shutter-press window.
++                    val ageWeight=1.0-0.05*ageNs.toDouble()/250_000_000.0
++                    scores[i]=(sum/count)*ageWeight
++                    supports[i]=count
++                }
+             }
+-            val best=(eligibleIndices ?: scores.indices.toSet()).maxByOrNull { scores[it] } ?: shutterIndex
++            val best=candidates.maxByOrNull { scores[it] } ?: shutterIndex
+             if(supports[best]<500 || scores[best]<0.04 ||
+                (scores[shutterIndex]>0.0 && scores[best]<scores[shutterIndex]*1.10))return shutterIndex
+             val peak=scores[best]
+-            val near=scores.indices.filter { (eligibleIndices==null || it in eligibleIndices) &&
++            val near=scores.indices.filter { (it in candidates) &&
+                 supports[it]>=500 && scores[it]>=peak*0.985 }
+             val t=frozen.timestampsNs[shutterIndex]
+             return near.minByOrNull{ abs(frozen.timestampsNs[it]-t) } ?: shutterIndex
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+index 1e7c74f2ca415cba0f65e463975642bf10e9ebf3..e19823a0c28bd803732293e0c5d370e450be25c6 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+@@ -24,6 +24,9 @@
+      */
+     public static final String KEY_LUMA_DENOISE = "pref_iris_luma_denoise_v2";
+     public static final String KEY_CHROMA_DENOISE = "pref_iris_chroma_denoise";
++    // Rawr 56c1b932: optional HDR+ Quality-only profiled wavelet after
++    // AMaZE. Off by default, independent of Motion's historic MGC slider.
++    public static final String KEY_HDRQ_CHROMA_DENOISE = "pref_iris_hdrq_effective_chroma";
+     /* IRIS_26779_CLAUDE_AB_VISIBLE_CONTROLS: per-lens visible A/B controls placed directly
+      * below Chroma Denoise. Suppressor defaults ON; demosaic sharpness is a 0.0..1.0 multiplier. */
+     public static final String KEY_EDGE_FALSE_COLOR_SUPPRESSOR = "pref_iris_edge_false_color_suppressor";
+@@ -215,6 +218,11 @@
+         }
+     }
+ 
++    public static boolean isHdrqChromaDenoiseEnabled() {
++        SettingsManager manager = PhotonCamera.getSettingsManagerStatic();
++        return manager != null && getBoolean(manager, KEY_HDRQ_CHROMA_DENOISE, false);
++    }
++
+     public static boolean isLocalLaplacianToneEnabled() {
+         /* IRIS_26704_LOCAL_LAPLACIAN_PERMANENT_OFF
+          * The A/B implementation remains available in source for rollback, but the active Iris
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 739d9290acb63bcfbdd070524913a0f81473b00b..77a987699688aebf5a3cf03dd2e7784310d9dad9 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -899,7 +899,8 @@
+                                     bOffLongStaticSafe26889.set(staticSafe26889)
+                                     val chosenRef26870 = com.hinnka.mycamera.processor.GlesIris26870GpuSharpest.select(
+                                         frozen,pattern,nativeReferenceIndex,
+-                                        if(staticSafe26889) null else motion26889?.shutterAdjacent ?: setOf(nativeReferenceIndex))
++                                        if(staticSafe26889) null else motion26889?.shutterAdjacent ?: setOf(nativeReferenceIndex),
++                                        pressWindow26957=true)
+                                     PLog.i(TAG, "IRIS_26889_B_OFF_REFERENCE_POLICY shutter=$nativeReferenceIndex selected=$chosenRef26870 static=$staticSafe26889 longAllowed=$staticSafe26889 compared=${motion26889?.comparedFrames ?: 0} moving=${motion26889?.movingPatches ?: 0} inconsistent=${motion26889?.unexplainedPatches ?: 0} normals=${nativeNormalFrames.size}")
+                                     val recoveredRef26912 = if (mgcBase.motionV2AlternativeHighlight26912 || parameters.iris26903NightB) {
+                                         com.hinnka.mycamera.processor.GlesIris26912HighlightReference.select(
+@@ -929,6 +930,7 @@
+                                         recoveredRef26912,
+                                         false, output, clipTexture, physicalIdentity, bOffNoise26912,
+                                         !parameters.iris26903NightB && !parameters.irisNightActive,
++                                        IrisMotionSettings.isHdrqChromaDenoiseEnabled(),
+                                     )
+                                     if (!parameters.iris26903NightB && !parameters.irisNightActive)
+                                         com.hinnka.mycamera.processor.GlesIris26864NativeRawr.recordTiming(referenceTimestamp)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+index 06a68d3c1f2bb576f258c5a7c124dc3f07d72411..5d31c955f77e87f6ffbde930c34cb5f974be5e8d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+@@ -416,6 +416,7 @@
+                     }
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_LUMA_DENOISE);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_CHROMA_DENOISE);
++                    removePreferenceAnywhere(IrisMotionSettings.KEY_HDRQ_CHROMA_DENOISE);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_CHROMA_CORRECTION_STRENGTH);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_ADAPTIVE_SNR_CHROMA_DENOISE);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_RESIDUAL_CHROMA_CUSTOM);
+diff --git a/app/src/main/res/xml/preferences.xml b/app/src/main/res/xml/preferences.xml
+index 579fc81837caad2825ad7d20c24e631f44ee8a42..d24fe08d34e4f3abe1f5a2e83825ccdec4190afb 100644
+--- a/app/src/main/res/xml/preferences.xml
++++ b/app/src/main/res/xml/preferences.xml
+@@ -35,6 +35,7 @@
+         <Preference ns0:key="pref_iris_import_noise_model" ns0:layout="@layout/preference_with_margin" ns0:title="@string/iris_import_noise_model" ns0:summary="@string/iris_import_noise_model_summary" ns0:icon="@drawable/ic_save" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_luma_denoise_v2" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_luma_denoise" ns0:summary="@string/iris_luma_denoise_summary" ns0:defaultValue="@string/pref_iris_luma_denoise_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_grain_black_24dp" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_chroma_denoise" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_chroma_denoise" ns0:summary="@string/iris_chroma_denoise_summary" ns0:defaultValue="@string/pref_iris_chroma_denoise_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_gradient_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="pref_iris_hdrq_effective_chroma" ns0:defaultValue="false" ns0:layout="@layout/preference_with_margin" ns0:title="HDR+ Quality Chroma Denoise" ns0:summary="Optional original Rawr pre-WB wavelet using burst-fitted noise divided by the motion-gated effective frame count. Experiment B Super Res OFF only (including B Night); off by default." ns0:icon="@drawable/ic_gradient_black_24dp" />
+         <!-- IRIS_26844_RETIRED_DIAGNOSTIC_UI: 11 historical A/B controls removed; runtime defaults fixed in IrisMotionSettings. -->
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_saturation" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_saturation" ns0:summary="@string/iris_saturation_summary" ns0:defaultValue="@string/pref_iris_saturation_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_exposure_ev" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_exposure" ns0:summary="" ns0:defaultValue="@string/pref_iris_exposure_default" ns1:maxValue="1.0" ns1:minValue="-1.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+diff --git a/app/version.properties b/app/version.properties
+index e4b7c6e418ca8677056236783563df1550e3d9ff..a00468133ecf3f3ef9ac3b53331fd7db405fbe76 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726956
+-VERSION_BUILD=26956
++VERSION_NAME=0.9726957
++VERSION_BUILD=26957
