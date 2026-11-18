@@ -46,6 +46,37 @@ def main():
  'imageStore(neffAcc, g, vec4(imageLoad(neffAcc, g).x + contribution));'],'motion gate Neff GLSL')
  require(execute,['{"hdrq_mismatch_norm",','{4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}'],'descriptor binding 4')
  require(head,['void recordEffectiveFramesCopy(VkCommandBuffer command, VkBuffer host);','tileCount() const noexcept','setMotionGate(bool enabled)','setNoise(float slope,float offset)'],'native ABI')
+ # 26957 V1 Actions run 44235276312/job/134569790042: both
+ # rawr::raw_merge_common::CfaNoiseProfile references are invalid. The pinned
+ # 26956 vendor ABI defines this exact type only in raw_merge_wronski_gpu.
+ type_name='rawr::raw_merge_wronski_gpu::CfaNoiseProfile'
+ if coord.count(type_name)!=2 or 'rawr::raw_merge_common::CfaNoiseProfile' in coord:
+  fail('26957 V1 missing/wrong Rawr CfaNoiseProfile namespace in both native use sites')
+ if f'std::optional<{type_name}> hdrqMeasuredProfile;' not in coord or f'{type_name} candidate{{}};' not in coord:
+  fail('26957 failed Actions C++ noise-profile type/option declarations not repaired')
+ # During live source reconstruction, compile against the *real inherited
+ # vendor header*, not a home-made stand-in or textual spelling check.
+ if '--live' in sys.argv:
+  hdr=root/'app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_wronski/include'
+  actual=hdr/'rawr/raw_merge_wronski_gpu/RawMergeWronskiGpu.h'
+  if not actual.is_file():fail('actual successful vendor noise header missing')
+  unit=f'''#include <rawr/raw_merge_wronski_gpu/RawMergeWronskiGpu.h>
+#include <optional>
+void iris26957TypeProof(){{
+ std::optional<{type_name}> hdrqMeasuredProfile;
+ {type_name} candidate{{}};
+ candidate.slopeBySite = {{0.1f,0.1f,0.1f,0.1f}};
+ candidate.offsetBySite = {{0.001f,0.001f,0.001f,0.001f}};
+ if (rawr::raw_merge_wronski_gpu::valid(candidate)) hdrqMeasuredProfile=candidate;
+}}
+'''
+  check=subprocess.run([shutil.which('clang++') or shutil.which('g++'),'-std=c++17','-Wall','-Wextra','-pedantic-errors',
+      '-Werror','-fsyntax-only','-x','c++','-','-I',str(hdr)],input=unit,text=True,capture_output=True)
+  if check.returncode:fail('real 26957 vendor CfaNoiseProfile C++17 compilation failed '+check.stderr[-600:])
+  broken=subprocess.run([shutil.which('clang++') or shutil.which('g++'),'-std=c++17','-fsyntax-only','-x','c++','-','-I',str(hdr)],
+      input=unit.replace(type_name,'rawr::raw_merge_common::CfaNoiseProfile'),text=True,capture_output=True)
+  if broken.returncode==0 or 'raw_merge_common' not in broken.stderr:
+   fail('26957 V1 actual wrong-namespace compiler negative not detected')
  require(coord,['thread_local float iris26957HdrqEffectiveFrames = 0.0f;',
  'recorder.setMotionGate(algorithm_==MergeAlgorithm::HdrPlusFrequency)',
  'recorder.recordEffectiveFramesCopy(command_, noiseStats_.buffer);',

@@ -825,7 +825,7 @@ BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<Bu
     const auto geometry = rawr::raw_merge_hdrplus_gpu::makeFrequencyGeometry(width_, height_, hdrplus_);
     HdrPlusFrequencyRecorder recorder(arena_, executor_, hdrplus_, geometry);
     iris26957HdrqEffectiveFrames = 0.0f;
-    std::optional<rawr::raw_merge_common::CfaNoiseProfile> hdrqMeasuredProfile;
+    std::optional<rawr::raw_merge_wronski_gpu::CfaNoiseProfile> hdrqMeasuredProfile;
     float hdrqEffectiveFrames = 0.0f;
     // Full matched Rawr HDR+ Quality gate only. Other algorithms and bracketed
     // HDRQ retain their exact successful 26955 behavior.
@@ -982,7 +982,7 @@ BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<Bu
                 // measured RAW noise model as the motion gate. Never pass a
                 // Camera2 placeholder or unvalidated low-information fit.
                 if (measured) {
-                    rawr::raw_merge_common::CfaNoiseProfile candidate{};
+                    rawr::raw_merge_wronski_gpu::CfaNoiseProfile candidate{};
                     candidate.slopeBySite=slopes;
                     candidate.offsetBySite=offsets;
                     if (rawr::raw_merge_wronski_gpu::valid(candidate))

@@ -1,6 +1,6 @@
-# Photon Camera 26957 — Rawr HDR+ Quality Two-Commit Source Handoff
+# Photon Camera 26957 V2 — corrected Rawr HDR+ Quality Two-Commit Source Handoff
 
-STATUS: **LOCALLY VALIDATED / PREPARED FOR ACTIONS**. NOT BUILD-PROVEN. NO DEVICE-VISUAL CLAIM.
+STATUS: **V2 LOCALLY VALIDATED / PREPARED FOR ACTIONS**. NOT BUILD-PROVEN. NO DEVICE-VISUAL CLAIM.
 
 ## One three-stage vscode.dev ZIP handoff
 Use only branch `experimental-clean-photon-rebuild`; never touch `dev`, never upload an APK or whole vendor tree, no backup branches.
@@ -9,8 +9,14 @@ Use only branch `experimental-clean-photon-rebuild`; never touch `dev`, never up
 2. **Stage 2**: upload/overwrite `.github/workflows/build-26957-change-aware.yml` alone.
 3. **Stage 3 — LAST**: upload `TRIGGER_26957.txt` alone. Then commit and push ONCE to the experimental branch to trigger GitHub Actions.
 
+## Verified failure and corrective change
+- **26957 V1 Actions run `44235276312`, job `134569790042`, commit `c6ac43208bbc7082a854103c2a40c20e311f5365`: FAILED** real arm64 NDK compilation at `AndroidBurstCoordinator.cpp` lines 828 and 985. Both incorrectly used `rawr::raw_merge_common::CfaNoiseProfile`, which is not defined in Iris's pinned Rawr headers. No APK/artifact was published.
+- **26957 V2 fixes both uses** to the *actual compiled 26956 vendor API*: `rawr::raw_merge_wronski_gpu::CfaNoiseProfile`. The existing `rawr::raw_merge_wronski_gpu::valid()` call is preserved.
+- New fail-closed regression checks both exact call sites, and after live candidate reconstruction, a **real C++17 host compiler includes the unchanged successful 26956 vendor header** and compiles the type declaration, field assignments, `valid()` call and optional assignment. It also rejects the exact prior wrong-namespace variant. Full Android NDK both ABIs remains **mandatory**; C++ host proof alone cannot certify an Android APK.
+- V2 uses the **same successful 26956 V2 guarded 57-step 26957 workflow**, with all 26904 SPIR-V and CMake, NDK, Java/Kotlin, `assembleDebug`, artifact and historical gates preserved. Do not upload V1 again. This is a re-sealed three-stage V2 ZIP, not a patch to apply by hand.
+
 Recommended commit message:
-`26957: Connect Rawr HDRQ noise gate and fine-texture energy to effective-frame chroma; restore tuned 13/32 and press-window reference, preserve +0.4EV and SR ON`
+`26957 V2: Fix native Rawr CfaNoiseProfile namespace using pinned 26956 ABI; preserve complete HDRQ source and guarded build`
 
 ## Exact successful predecessor — 26956 V2 (runtime and build authority)
 - Successful Actions run `44229334000`; job `134550223707`; commit `f36e169b1aa43b6d4694dae0110fc98d42ad4dfd`.
@@ -31,5 +37,5 @@ Recommended commit message:
 ## Validation gates
 - 57-step new Actions workflow preserves the exact prior successful 26956 V2 historical prefix, all original 26886/26887, 26903, 26904 SPIR-V and CMake proof, 26952 reserved identifiers, 26955 SDR/UHDR and 26956 motion checks. No compiler skip or downscoping.
 - Real shader build from pinned GLSLang 16.5 + ESSL300/310 + Vulkan SPIR-V/spirv-opt/spirv-val; real NDK arm64-v8a and armeabi-v7a; full Kotlin, Java, Gradle :app:assembleDebug; actual APK and source TAR SHA receipt; artifact upload is fail-closed.
-- On this handoff, local SHA scope, full-index patches 7/12/40, numerical static/motion/energy/effective-frame and source ABI static checks, Bash/YAML/Python syntax, 299 workflow executable references, historical YAML grammar regression, hostile tampering and clean ZIP extract can be run. **Actual new 26957 shader/NDK/Kotlin/Java/assemble/device visual tests: NOT RUN until a real successful Actions job and published artifact.**
+- On this handoff, local SHA scope, full-index patches 7/12/40, numerical static/motion/energy/effective-frame and source ABI static checks, Bash/YAML/Python syntax, 299 workflow executable references, historical YAML grammar regression, hostile tampering and clean ZIP extract can be run. **Actual 26957 V1 shader compilation PASSED; V1 arm64 NDK FAILED; V2 shader, Android NDK, Kotlin, Java, assemble and device image-quality: NOT RUN until V2 Actions.**
 - If Actions fails, use the actual job logs to correct the cause; **never relax compilation or validations**, and never treat prepared ZIP as a compiled APK.
