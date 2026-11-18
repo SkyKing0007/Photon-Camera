@@ -1,0 +1,111 @@
+#version 450
+// RAWR 2026-11-17 HDR+ Quality spatially varying motion rejection.
+// Matched to current Rawr hdrq_mismatch: sixteen 4x4 noise-calibrated blocks
+// per 16x16 tile window, plus the existing mean mismatch for Wiener weights.
+// Bridge retains the already compiled B-owner RGBA32F/raw-units representation.
+layout(local_size_x = 16, local_size_y = 4) in;
+layout(set = 0, binding = 0, rgba32f) readonly uniform image2D refRgba;
+layout(set = 0, binding = 1, rgba32f) readonly uniform image2D alignedRgba;
+layout(set = 0, binding = 2, rgba32f) readonly uniform image2D rms;
+layout(set = 0, binding = 3, r32f) writeonly uniform image2D mismatch;
+layout(set = 0, binding = 4, r32f) writeonly uniform image2D zmap;
+layout(push_constant) uniform P {
+    ivec2 tiles;
+    ivec2 rgbaSize;
+    float noiseSlope;
+    float noiseOffset;
+    float black;
+    float frameInv;
+    float energyGain;
+    float energyDead;
+    float energyScale;
+    float exposureFactor;
+    int useMotionGate;
+} p;
+const float WIN16[16] = float[16](0.342940479,0.434943816,0.565056184,0.657059521,0.657059521,0.565056184,0.434943816,0.342940479,0.342940479,0.434943816,0.565056184,0.657059521,0.657059521,0.565056184,0.434943816,0.342940479);
+shared vec4 sDiff[64];
+shared float sWeight[64];
+shared float sWeight2[64];
+shared vec4 sSig[64];
+shared vec4 sSigned[64];
+shared vec4 sSq[64];
+shared float sBlockZ[16];
+void main(){
+    ivec2 g=ivec2(gl_WorkGroupID.xy);
+    if(any(greaterThanEqual(g,p.tiles)))return;
+    ivec2 l=ivec2(gl_LocalInvocationID.xy);
+    uint lane=gl_LocalInvocationIndex;
+    ivec2 t0=g*8;
+    ivec2 start=max(ivec2(0),t0-4);
+    ivec2 end=min(p.rgbaSize-1,t0+12);
+    vec4 diffAcc=vec4(0.0),sig=vec4(0.0),signedAcc=vec4(0.0),sq=vec4(0.0);
+    float w=0.0,w2=0.0;
+    for(int k=0;k<4;++k){
+        ivec2 wl=ivec2(l.x,4*l.y+k);
+        ivec2 q=t0-4+wl;
+        if(all(greaterThanEqual(q,start)) && all(lessThan(q,end))){
+            float wk=WIN16[wl.x]*WIN16[wl.y];
+            vec4 r=imageLoad(refRgba,q)*p.frameInv;
+            vec4 a=imageLoad(alignedRgba,q)*p.frameInv;
+            vec4 delta=r-a;
+            diffAcc+=wk*abs(delta);
+            sig+=wk*r;
+            signedAcc+=wk*delta;
+            sq+=wk*delta*delta;
+            w+=wk;w2+=wk*wk;
+        }
+    }
+    // Group-of-four block-contiguous reduction from current Rawr implementation.
+    uint bi=uint((l.y*4+l.x/4)*4+(l.x%4));
+    sDiff[bi]=diffAcc;sWeight[bi]=w;sWeight2[bi]=w2;
+    sSig[bi]=sig;sSigned[bi]=signedAcc;sSq[bi]=sq;
+    barrier();
+    for(uint stride=2u;stride>0u;stride>>=1u){
+        if((bi&3u)<stride){
+            sDiff[bi]+=sDiff[bi+stride];
+            sWeight[bi]+=sWeight[bi+stride];
+            sWeight2[bi]+=sWeight2[bi+stride];
+            sSig[bi]+=sSig[bi+stride];
+            sSigned[bi]+=sSigned[bi+stride];
+            sSq[bi]+=sSq[bi+stride];
+        }
+        barrier();
+    }
+    if((bi&3u)==0u){
+        float score=0.0;
+        if(p.useMotionGate!=0){
+            float sumW=sWeight[bi];
+            float sumW2=sWeight2[bi];
+            if(sumW>1.0e-3){
+                float neff=sumW*sumW/max(sumW2,1.0e-12);
+                vec4 meanSignal=sSig[bi]/sumW;
+                vec4 var2=2.0*(p.noiseSlope*max(meanSignal-p.black,vec4(0.0))+p.noiseOffset);
+                vec4 sigma=sqrt(max(var2,vec4(1.0e-10)))/sqrt(neff);
+                vec4 zc=abs(sSigned[bi]/sumW)/max(sigma,vec4(1.0e-6));
+                score=0.25*(zc.x+zc.y+zc.z+zc.w)/0.7979;
+                if(p.energyGain>0.0){
+                    vec4 qc=(sSq[bi]/sumW)/max(var2,vec4(1.0e-6));
+                    float q=0.25*(qc.x+qc.y+qc.z+qc.w);
+                    float excess=q-1.0-p.energyDead;
+                    if(excess>0.0)score=max(score,1.0+p.energyGain*excess/p.energyScale);
+                }
+            }
+        }
+        sBlockZ[bi>>2]=score;
+    }
+    barrier();
+    if(lane!=0u)return;
+    float acc=0.0;
+    vec4 dsum=vec4(0.0);
+    float wsum=0.0;
+    for(uint b=0u;b<16u;++b){
+        acc+=sBlockZ[b];dsum+=sDiff[b*4u];wsum+=sWeight[b*4u];
+    }
+    imageStore(zmap,g,vec4(p.useMotionGate!=0 ? acc/16.0 : 0.0));
+    vec4 noise=imageLoad(rms,g);
+    vec4 delta=dsum/max(wsum,1.0e-7);
+    // Preserve older Rawr bracketed mismatch variance when gate is inactive.
+    vec4 variance=p.useMotionGate!=0 ? noise+1.0 : 0.5*noise+0.5*noise/max(p.exposureFactor,1.0e-6)+1.0;
+    vec4 m4=delta/sqrt(variance);
+    imageStore(mismatch,g,vec4(0.25*(m4.x+m4.y+m4.z+m4.w)));
+}

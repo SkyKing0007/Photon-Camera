@@ -1,0 +1,486 @@
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+index c037f7c656eed81a88670c9902c299b19dc9b291..3fce14676063fe570d8463fa29739825521a55aa 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+@@ -146,12 +146,12 @@
+         wronski.fallbackChromaMaxSigma=frozen.iris26926Fallback[2];
+     }
+     wronski.iris26920Active = sr && frozen.iris26920Active;
+     rawr::raw_merge_hdrplus_gpu::Config hdrq{};
+-    // 26951: original RAWR HDR+ Higher Quality frequency norms at strength 11.
++    // 26956: Current Rawr HDR+ Quality motion gate and native strength 13.
+     // This applies to every !sr frequency-merge owner, including B Night.
+     // B Super Res ON uses Wronski and ignores this HDRQ setting.
+-    if (!sr) hdrq.strength = 11.0f;
++    if (!sr) hdrq.strength = 13.0f;
+     // RAWR's chunk fence can fail after a successful VkQueueSubmit. Keep the
+     // coordinator alive until an explicit queue-idle proof has settled every
+     // possible submission, rather than letting stack unwinding release its
+     // arena and command pool before the frozen uploader's outer catch runs.
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
+index c18df075e2ddfce5d22d884ae17000647f259eb1..d7525f76cf66ff56fa52bbda96ca48d77eb3363c 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
+@@ -27,15 +27,24 @@
+ // Per-tile clipped-highlights factor (hdrq_highlights_norm; 1 when uniform).
+ layout(set = 0, binding = 6, r32f) readonly uniform image2D highlights;
+ // Per-bin weight sum (bracketed only), one texel per bin at (t*8 + (dm, dn)).
+ layout(set = 0, binding = 7, r32f) uniform image2D weightSum;
++// Same Rawr displacement statistic as hdrq_mismatch; not a chroma suppressor.
++layout(set = 0, binding = 8, r32f) readonly uniform image2D zmap;
+ layout(push_constant) uniform P {
+     ivec2 tiles;
+     float robustnessNorm;
+     float readNoise;
+     float maxMotionNorm;
+     int uniformExposure;
+     float frameWeight;
++    float gateLo;
++    float gateHi;
++    float noiseSlope;
++    float noiseOffset;
++    float black;
++    float shrink;
++    int useMotionGate;
+ } p;
+ 
+ shared vec4 sRefRe[64], sRefIm[64], sAlRe[64], sAlIm[64];  // index dn*8 + dm
+ shared float sDiff[49];
+@@ -60,26 +69,32 @@
+         sA[lane] = a.x + a.y + a.z + a.w;
+         sB[lane] = b.x + b.y + b.z + b.w;
+     }
+     barrier();
+-    if (lane < 49) {
+-        float total = 0.0;
+-        for (int k = 0; k < 64; ++k) {
+-            vec2 cs = shiftTable.v[lane * 64 + k];
+-            total += cs.x * sA[k] + cs.y * sB[k];
++    float gate = p.useMotionGate != 0 ? smoothstep(p.gateLo,p.gateHi,imageLoad(zmap,t).x) : 0.0;
++    if(gate<1.0){
++        if (lane < 49) {
++            float total = 0.0;
++            for (int k = 0; k < 64; ++k) {
++                vec2 cs = shiftTable.v[lane * 64 + k];
++                total += cs.x * sA[k] + cs.y * sB[k];
++            }
++            sDiff[lane] = total;
+         }
+-        sDiff[lane] = total;
+-    }
+-    barrier();
+-    if (lane == 0) {
+-        float best = -1e30;
+-        int bi = 0;
+-        for (int i = 0; i < 49; ++i)
+-            if (sDiff[i] > best) {
+-                best = sDiff[i];
+-                bi = i;
+-            }
+-        sBest = bi;
++        barrier();
++        if (lane == 0) {
++            float best = -1e30;
++            int bi = 0;
++            for (int i = 0; i < 49; ++i)
++                if (sDiff[i] > best) {
++                    best = sDiff[i];
++                    bi = i;
++                }
++            sBest = bi;
++        }
++    } else if(lane==0){
++        // Fully rejected tile: do not perform subpixel shifts on motion.
++        sBest=0;
+     }
+     barrier();
+     vec4 noiseNorm = (imageLoad(rms, t) + p.readNoise) * float(ts * ts) * p.robustnessNorm;
+     float mm = imageLoad(mismatch, t).x;
+@@ -102,8 +117,18 @@
+     w4 = w4 / (w4 + magnitudeNorm * motionNorm * noiseNorm * imageLoad(highlights, t).x);
+     float lo = min(w4.x, min(w4.y, min(w4.z, w4.w))), hi = max(w4.x, max(w4.y, max(w4.z, w4.w)));
+     // Mean of the two central channel weights (upstream's robust variant of Liba's max).
+     float weight = clamp(0.5 * (w4.x + w4.y + w4.z + w4.w - lo - hi), 0.0, 1.0);
++    // Matched current Rawr's complete per-tile temporal rejection: above the
++    // noise-calibrated displacement threshold, the companion contributes zero.
++    weight=max(weight,gate);
++    if(p.uniformExposure!=0 && p.useMotionGate!=0 && gate>0.0 && p.shrink>0.0 && dm+dn>0){
++        vec4 sigma2=p.noiseSlope*max(4.0*imageLoad(rms,t)-p.black,vec4(0.0))+p.noiseOffset;
++        vec4 power=refRe*refRe+refIm*refIm;
++        vec4 g=power/(power+p.shrink*9.0*sigma2+vec4(1.0e-6));
++        refRe *= 1.0-gate+gate*g;
++        refIm *= 1.0-gate+gate*g;
++    }
+     if (p.uniformExposure != 0) {
+         imageStore(outFt, o, imageLoad(outFt, o) + (1.0 - weight) * alRe + weight * refRe);
+         imageStore(outFt, o + ivec2(1, 0), imageLoad(outFt, o + ivec2(1, 0)) + (1.0 - weight) * alIm + weight * refIm);
+     } else {
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+index 201bbf6e1cbda65665f07ca0803cc79719f49236..25bb80098e55b30f1e2c546e436d5a2f6fcacad3 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+@@ -358,10 +358,12 @@
+ // Exact upstream HDR+ mismatch push-constant layout. The former B-only
+ // 26943 support classifier is not consumed by the restored RAWR merge.
+ struct MismatchPc {
+     std::int32_t tilesX, tilesY, rgbaWidth, rgbaHeight;
+-    float exposureFactor;
+-};
++    float noiseSlope, noiseOffset, black, frameInv, energyGain, energyDead, energyScale, exposureFactor;
++    std::int32_t useMotionGate;
++};
++static_assert(sizeof(MismatchPc)==52u,"Rawr HDRQ displacement push-constant ABI");
+ struct HighlightsPc {
+     std::int32_t tilesX, tilesY;
+     float exposureFactor, whiteLevel, blackLevelMean;
+ };
+@@ -377,10 +379,12 @@
+     std::int32_t tilesX, tilesY;
+     float robustnessNorm, readNoise, maxMotionNorm;
+     std::int32_t uniformExposure;
+     float frameWeight;
+-};
+-static_assert(sizeof(FreqMergePc)==28u, "RAWR original HDRQ merge ABI");
++    float gateLo, gateHi, noiseSlope, noiseOffset, black, shrink;
++    std::int32_t useMotionGate;
++};
++static_assert(sizeof(FreqMergePc)==56u,"Rawr HDRQ gated Wiener merge push-constant ABI");
+ struct BackwardPc {
+     std::int32_t tilesX, tilesY;
+     float frames;
+ };
+@@ -425,8 +429,9 @@
+     add("hdrq_aligned_ft", spectrum, PixelStorage::RGBA32Float, Lifetime::Companion);
+     add("hdrq_final_ft", spectrum, PixelStorage::RGBA32Float, Lifetime::Output);
+     add("hdrq_rms", tiles, PixelStorage::RGBA32Float, Lifetime::Burst);
+     add("hdrq_mismatch", tiles, PixelStorage::R32Float, Lifetime::Companion);
++    add("hdrq_zmap", tiles, PixelStorage::R32Float, Lifetime::Companion);
+     add("hdrq_total_mismatch", tiles, PixelStorage::R32Float, Lifetime::Output);
+     add("hdrq_highlights", tiles, PixelStorage::R32Float, Lifetime::Companion);
+     add("hdrq_weight_sum", rgba, PixelStorage::R32Float, Lifetime::Output);
+     add("hdrp_accum", raw, PixelStorage::R32Float, Lifetime::Output);
+@@ -591,8 +596,9 @@
+     const std::uint32_t tx = geometry_.tilesX, ty = geometry_.tilesY;
+     const auto& refRgba = arena_.image("hdrq_ref_rgba");
+     const auto& alignedRgba = arena_.image("hdrq_aligned_rgba");
+     const auto& mismatch = arena_.image("hdrq_mismatch");
++    const auto& zmap = arena_.image("hdrq_zmap");
+     const auto offset = passOffset();
+     const float exposureFactor = frameExposure(slot);
+     const float whiteLevel = slot < whiteLevels_.size() ? whiteLevels_[slot] : 65535.0f;
+     float blackMean = 0.0f;
+@@ -616,14 +622,38 @@
+     computeWriteBarrier(c);
+     if (mark) mark(1u);
+     // RAWR reference/aligned RAW mismatch, without the legacy Iris per-pixel
+     // temporal motion classifier. For both Photo B OFF and B Night HDRQ.
+-    MismatchPc mp{std::int32_t(tx), std::int32_t(ty),
+-                  std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight),
+-                  exposureFactor};
++    // Complete Rawr noise-calibrated displacement/energy rejection for HDR+
++    // Quality only. Original bracketed fusion explicitly retains old behavior.
++    constexpr float kGateLow=1.6f, kGateHigh=2.6f, kGateShrink=1.0f;
++    constexpr float kEnergyGain=1.0f, kEnergyDead=1.0f, kEnergyScale=0.5f;
++    const bool gated=uniformExposure_ && motionGateEnabled_;
++    float slope=noiseSlope_, offset=noiseOffset_;
++    if(rawNoiseMeasured_){
++        // The pinned RAW-pair estimator emits variance in normalized white-range
++        // units. Rawr's HDRQ mismatch runs on RAW code values, so multiply the
++        // slope by range and the variance intercept by range squared.
++        const float refMeanBlack=0.25f*(referenceBlack_[0]+referenceBlack_[1]+referenceBlack_[2]+referenceBlack_[3]);
++        const float range=std::max(1.0f,referenceWhite_-refMeanBlack);
++        slope=0.25f*(rawNoiseSlope_[0]+rawNoiseSlope_[1]+rawNoiseSlope_[2]+rawNoiseSlope_[3])*range;
++        offset=0.25f*(rawNoiseOffset_[0]+rawNoiseOffset_[1]+rawNoiseOffset_[2]+rawNoiseOffset_[3])*range*range;
++    }
++    // Reject nonfinite/invalid calibration instead of mistaking moving objects
++    // for stationary texture. Fallback should originate in the configured
++    // reference sensor noise model, just as in Rawr.
++    if(!std::isfinite(slope)||!std::isfinite(offset)||slope<0.0f||offset<=0.0f){
++        slope=std::max(noiseSlope_,0.0f);
++        offset=std::max(noiseOffset_,1.0e-10f);
++    }
++    const float meanBlack=0.25f*(referenceBlack_[0]+referenceBlack_[1]+referenceBlack_[2]+referenceBlack_[3]);
++    MismatchPc mp{std::int32_t(tx),std::int32_t(ty),
++                  std::int32_t(geometry_.rgbaWidth),std::int32_t(geometry_.rgbaHeight),
++                  slope,offset,meanBlack,1.0f,
++                  kEnergyGain,kEnergyDead,kEnergyScale,exposureFactor,gated?1:0};
+     executor_.record(c, ShaderId::HdrqMismatch,
+-                     {{ib(0, refRgba), ib(1, alignedRgba), ib(2, arena_.image("hdrq_rms")), ib(3, mismatch)}, {}},
+-                     &mp, sizeof(mp), tx, ty);
++                     {{ib(0,refRgba),ib(1,alignedRgba),ib(2,arena_.image("hdrq_rms")),ib(3,mismatch),ib(4,zmap)},{}},
++                     &mp,sizeof(mp),tx,ty);
+     if (mark) {
+         computeWriteBarrier(c);
+         mark(5u);
+     }
+@@ -656,15 +686,15 @@
+                      divUp(tx, 16), divUp(ty, 16));
+     computeWriteBarrier(c);
+     const auto norms = uniformExposure_ ? hp::frequencyNorms(config_.strength)
+                                         : hp::bracketedFrequencyNorms(config_.strength, exposureFactor);
+-    FreqMergePc fm{std::int32_t(tx), std::int32_t(ty), norms.robustnessNorm,
+-                   norms.readNoise, norms.maxMotionNorm, uniformExposure_ ? 1 : 0,
+-                   exposureFactor};
++    FreqMergePc fm{std::int32_t(tx),std::int32_t(ty),norms.robustnessNorm,
++                   norms.readNoise,norms.maxMotionNorm,uniformExposure_?1:0,
++                   exposureFactor,kGateLow,kGateHigh,slope,offset,meanBlack,kGateShrink,gated?1:0};
+     executor_.record(c, ShaderId::HdrqMerge,
+                      {{ib(0, arena_.image("hdrq_ref_ft")), ib(1, arena_.image("hdrq_aligned_ft")),
+                        ib(2, arena_.image("hdrq_final_ft")), ib(3, arena_.image("hdrq_rms")), ib(4, mismatch),
+-                       ib(6, highlights), ib(7, arena_.image("hdrq_weight_sum"))},
++                       ib(6, highlights), ib(7, arena_.image("hdrq_weight_sum")), ib(8, zmap)},
+                       {bb(5, arena_.buffer("hdrq_shift_table"))}},
+                      &fm, sizeof(fm), tx, ty);
+     computeWriteBarrier(c);
+ }
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
+index 76f341d91ac63b8ceb006891cb2c95f0a8966e42..73de2cc6b2f2cbca8030c8db561f8bcb6c15eb77 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
+@@ -819,8 +819,23 @@
+     timings.initializeMs = pendingInitializeMs_;
+     const auto gpuOrWall = [](const ChunkTiming& t) { return t.second.empty() ? t.first : t.second.front(); };
+     const auto geometry = rawr::raw_merge_hdrplus_gpu::makeFrequencyGeometry(width_, height_, hdrplus_);
+     HdrPlusFrequencyRecorder recorder(arena_, executor_, hdrplus_, geometry);
++    // Full matched Rawr HDR+ Quality gate only. Other algorithms and bracketed
++    // HDRQ retain their exact successful 26955 behavior.
++    recorder.setMotionGate(algorithm_==MergeAlgorithm::HdrPlusFrequency);
++    {
++        float alpha=merge_.noiseAlpha,beta=merge_.noiseBeta;
++        if(merge_.sensorNoiseProfile){
++            const auto& n=*merge_.sensorNoiseProfile;
++            alpha=.25f*(n.slopeBySite[0]+n.slopeBySite[1]+n.slopeBySite[2]+n.slopeBySite[3]);
++            beta=.25f*(n.offsetBySite[0]+n.offsetBySite[1]+n.offsetBySite[2]+n.offsetBySite[3]);
++        }
++        const auto& norm=frames[ref].parameters.normalization;
++        const float black=.25f*(norm.blackByPhase[0]+norm.blackByPhase[1]+norm.blackByPhase[2]+norm.blackByPhase[3]);
++        const float range=std::max(1.0f,norm.whiteLevel-black);
++        recorder.setNoise(alpha*range,beta*range*range);
++    }
+     if (algorithm_ == MergeAlgorithm::HdrPlusBracketed) {
+         std::vector<float> factors(frames.size(), 1.0f), whites(frames.size(), 65535.0f);
+         const float refExposure = frames[ref].exposure;
+         for (std::size_t i = 0; i < frames.size(); ++i) {
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+index 73b346b1a87ea043e39ff3f54b6cf7013ace9677..3a2572b15a5026d7bbc845a2963844e1b2392007 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+@@ -1,55 +1,111 @@
+ #version 450
+-// Port of hdr-plus-swift calculate_abs_diff_rgba + calculate_mismatch_rgba
+-// raised-cosine-weighted mean |ref - aligned| over twice
+-// the tile support, relative to the tile's shot noise (Liba 2019 "spatially
+-// varying temporal merging"). One 16x16 workgroup per tile, one lane per
+-// window pixel, tree reduction (upstream sums sequentially in one thread).
+-layout(local_size_x = 16, local_size_y = 16) in;
++// RAWR 2026-11-17 HDR+ Quality spatially varying motion rejection.
++// Matched to current Rawr hdrq_mismatch: sixteen 4x4 noise-calibrated blocks
++// per 16x16 tile window, plus the existing mean mismatch for Wiener weights.
++// Bridge retains the already compiled B-owner RGBA32F/raw-units representation.
++layout(local_size_x = 16, local_size_y = 4) in;
+ layout(set = 0, binding = 0, rgba32f) readonly uniform image2D refRgba;
+ layout(set = 0, binding = 1, rgba32f) readonly uniform image2D alignedRgba;
+ layout(set = 0, binding = 2, rgba32f) readonly uniform image2D rms;
+ layout(set = 0, binding = 3, r32f) writeonly uniform image2D mismatch;
++layout(set = 0, binding = 4, r32f) writeonly uniform image2D zmap;
+ layout(push_constant) uniform P {
+     ivec2 tiles;
+     ivec2 rgbaSize;
+-    float exposureFactor;  // companion exposure / reference exposure (1 = uniform)
++    float noiseSlope;
++    float noiseOffset;
++    float black;
++    float frameInv;
++    float energyGain;
++    float energyDead;
++    float energyScale;
++    float exposureFactor;
++    int useMotionGate;
+ } p;
+-
+-const float PI = 3.14159265358979323846;
+-shared vec4 sDiff[256];
+-shared float sWeight[256];
+-
+-void main() {
+-    ivec2 g = ivec2(gl_WorkGroupID.xy);
+-    if (any(greaterThanEqual(g, p.tiles))) return;
+-    const int ts = 8;
+-    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+-    uint lane = gl_LocalInvocationIndex;
+-    ivec2 t0 = g * ts;
+-    // Upstream clamps the end to size-1 (exclusive), dropping the last row/column.
+-    ivec2 start = max(ivec2(0), t0 - ts / 2);
+-    ivec2 end = min(p.rgbaSize - 1, t0 + ts * 3 / 2);
+-    ivec2 q = t0 - ts / 2 + l;  // window pixel; l is its offset (dx + shift)
+-    float angle = -2.0 * PI / float(ts);
+-    vec4 d = vec4(0.0);
+-    float w = 0.0;
+-    if (all(greaterThanEqual(q, start)) && all(lessThan(q, end))) {
+-        w = (0.5 - 0.17 * cos(-angle * (float(l.x) + 0.5))) * (0.5 - 0.17 * cos(-angle * (float(l.y) + 0.5)));
+-        d = w * abs(imageLoad(refRgba, q) - imageLoad(alignedRgba, q));
++const float WIN16[16] = float[16](0.342940479,0.434943816,0.565056184,0.657059521,0.657059521,0.565056184,0.434943816,0.342940479,0.342940479,0.434943816,0.565056184,0.657059521,0.657059521,0.565056184,0.434943816,0.342940479);
++shared vec4 sDiff[64];
++shared float sWeight[64];
++shared float sWeight2[64];
++shared vec4 sSig[64];
++shared vec4 sSigned[64];
++shared vec4 sSq[64];
++shared float sBlockZ[16];
++void main(){
++    ivec2 g=ivec2(gl_WorkGroupID.xy);
++    if(any(greaterThanEqual(g,p.tiles)))return;
++    ivec2 l=ivec2(gl_LocalInvocationID.xy);
++    uint lane=gl_LocalInvocationIndex;
++    ivec2 t0=g*8;
++    ivec2 start=max(ivec2(0),t0-4);
++    ivec2 end=min(p.rgbaSize-1,t0+12);
++    vec4 diffAcc=vec4(0.0),sig=vec4(0.0),signedAcc=vec4(0.0),sq=vec4(0.0);
++    float w=0.0,w2=0.0;
++    for(int k=0;k<4;++k){
++        ivec2 wl=ivec2(l.x,4*l.y+k);
++        ivec2 q=t0-4+wl;
++        if(all(greaterThanEqual(q,start)) && all(lessThan(q,end))){
++            float wk=WIN16[wl.x]*WIN16[wl.y];
++            vec4 r=imageLoad(refRgba,q)*p.frameInv;
++            vec4 a=imageLoad(alignedRgba,q)*p.frameInv;
++            vec4 delta=r-a;
++            diffAcc+=wk*abs(delta);
++            sig+=wk*r;
++            signedAcc+=wk*delta;
++            sq+=wk*delta*delta;
++            w+=wk;w2+=wk*wk;
++        }
+     }
+-    sDiff[lane] = d;
+-    sWeight[lane] = w;
++    // Group-of-four block-contiguous reduction from current Rawr implementation.
++    uint bi=uint((l.y*4+l.x/4)*4+(l.x%4));
++    sDiff[bi]=diffAcc;sWeight[bi]=w;sWeight2[bi]=w2;
++    sSig[bi]=sig;sSigned[bi]=signedAcc;sSq[bi]=sq;
+     barrier();
+-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+-        if (lane < stride) {
+-            sDiff[lane] += sDiff[lane + stride];
+-            sWeight[lane] += sWeight[lane + stride];
++    for(uint stride=2u;stride>0u;stride>>=1u){
++        if((bi&3u)<stride){
++            sDiff[bi]+=sDiff[bi+stride];
++            sWeight[bi]+=sWeight[bi+stride];
++            sWeight2[bi]+=sWeight2[bi+stride];
++            sSig[bi]+=sSig[bi+stride];
++            sSigned[bi]+=sSigned[bi+stride];
++            sSq[bi]+=sSq[bi+stride];
+         }
+         barrier();
+     }
+-    if (lane != 0u) return;
+-    vec4 noise = imageLoad(rms, g);
+-    vec4 diff = sDiff[0] / sWeight[0];
+-    vec4 m4 = diff / sqrt(0.5 * noise + 0.5 * noise / p.exposureFactor + 1.0);
+-    imageStore(mismatch, g, vec4(0.25 * (m4.x + m4.y + m4.z + m4.w)));
++    if((bi&3u)==0u){
++        float score=0.0;
++        if(p.useMotionGate!=0){
++            float sumW=sWeight[bi];
++            float sumW2=sWeight2[bi];
++            if(sumW>1.0e-3){
++                float neff=sumW*sumW/max(sumW2,1.0e-12);
++                vec4 meanSignal=sSig[bi]/sumW;
++                vec4 var2=2.0*(p.noiseSlope*max(meanSignal-p.black,vec4(0.0))+p.noiseOffset);
++                vec4 sigma=sqrt(max(var2,vec4(1.0e-10)))/sqrt(neff);
++                vec4 zc=abs(sSigned[bi]/sumW)/max(sigma,vec4(1.0e-6));
++                score=0.25*(zc.x+zc.y+zc.z+zc.w)/0.7979;
++                if(p.energyGain>0.0){
++                    vec4 qc=(sSq[bi]/sumW)/max(var2,vec4(1.0e-6));
++                    float q=0.25*(qc.x+qc.y+qc.z+qc.w);
++                    float excess=q-1.0-p.energyDead;
++                    if(excess>0.0)score=max(score,1.0+p.energyGain*excess/p.energyScale);
++                }
++            }
++        }
++        sBlockZ[bi>>2]=score;
++    }
++    barrier();
++    if(lane!=0u)return;
++    float acc=0.0;
++    vec4 dsum=vec4(0.0);
++    float wsum=0.0;
++    for(uint b=0u;b<16u;++b){
++        acc+=sBlockZ[b];dsum+=sDiff[b*4u];wsum+=sWeight[b*4u];
++    }
++    imageStore(zmap,g,vec4(p.useMotionGate!=0 ? acc/16.0 : 0.0));
++    vec4 noise=imageLoad(rms,g);
++    vec4 delta=dsum/max(wsum,1.0e-7);
++    // Preserve older Rawr bracketed mismatch variance when gate is inactive.
++    vec4 variance=p.useMotionGate!=0 ? noise+1.0 : 0.5*noise+0.5*noise/max(p.exposureFactor,1.0e-6)+1.0;
++    vec4 m4=delta/sqrt(variance);
++    imageStore(mismatch,g,vec4(0.25*(m4.x+m4.y+m4.z+m4.w)));
+ }
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp
+index e6c31792c8e019fdcccc960296ed78aedde45e7a..db23e3d4db0408a4c5f65faaaa116427685bf826 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp
+@@ -113,8 +113,14 @@
+     void setMeasuredRawNoise(const std::array<float, 4>& slope, const std::array<float, 4>& offset,
+                              bool measured) noexcept {
+         rawNoiseSlope_ = slope; rawNoiseOffset_ = offset; rawNoiseMeasured_ = measured;
+     }
++    // Main Rawr HDR+ Quality: configured sensor profile fallback converted
++    // from normalized Camera2 signal units into RAW code-value units.
++    void setNoise(float slope,float offset) noexcept {
++        noiseSlope_=slope;noiseOffset_=offset;
++    }
++    void setMotionGate(bool enabled) noexcept {motionGateEnabled_=enabled;}
+     void beginPass(std::uint32_t pass) noexcept;
+     // Align-once mode: companions are aligned (and the reference prepared)
+     // only in pass 0; later passes read through a coordinate offset.
+     [[nodiscard]] bool alignsThisPass() const noexcept { return !config_.frequencyAlignOnce || pass_ == 0u; }
+@@ -164,8 +170,10 @@
+     std::array<float, 4> rawNoiseOffset_{};
+     std::array<float, 4> referenceBlack_{};
+     float referenceWhite_ = 65535.0f;
+     bool rawNoiseMeasured_ = false;
++    float noiseSlope_=0.0f,noiseOffset_=1.0e-10f;
++    bool motionGateEnabled_=false;
+     bool substitutionReady_ = false;  // this pass's hdrq_out_rgba holds the dark-frame estimate
+     float pyramidClamp_ = 0.0f;       // reference pyramid clamp this pass (raw units), 0 = none
+     float frameExposure(std::uint32_t slot) const noexcept {
+         return slot < exposureFactors_.size() ? exposureFactors_[slot] : 1.0f;
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp
+index f2e7287c06847e8c8b41d6496840f46b387107cf..fc1ad5f51ce49b64c651e07275040b1b14fe84ef 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp
+@@ -449,9 +449,9 @@
+                                    mf_hdrq_mismatch_prod_spv,
+                                    mf_hdrq_mismatch_prod_spv_size,
+                                    mf_hdrq_mismatch_trace_spv,
+                                    mf_hdrq_mismatch_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
++                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+                                   {"hdrq_region_mean",
+                                    mf_hdrq_region_mean_prod_spv,
+                                    mf_hdrq_region_mean_prod_spv_size,
+                                    mf_hdrq_region_mean_trace_spv,
+@@ -473,9 +473,9 @@
+                                    mf_hdrq_merge_prod_spv,
+                                    mf_hdrq_merge_prod_spv_size,
+                                    mf_hdrq_merge_trace_spv,
+                                    mf_hdrq_merge_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
++                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+                                   {"hdrq_deconvolute",
+                                    mf_hdrq_deconvolute_prod_spv,
+                                    mf_hdrq_deconvolute_prod_spv_size,
+                                    mf_hdrq_deconvolute_trace_spv,
+diff --git a/app/version.properties b/app/version.properties
+index 1e1561ae93914c79ab9ae122fde498c7e0b0ca10..e4b7c6e418ca8677056236783563df1550e3d9ff 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726955
+-VERSION_BUILD=26955
++VERSION_NAME=0.9726956
++VERSION_BUILD=26956
