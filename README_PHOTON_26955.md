@@ -1,6 +1,12 @@
-# Photon Camera 26955 — Preserve 26954 SDR/UHDR; reduce global editor exposure to +0.4 EV
+# Photon Camera 26955 V2 — Repair GitHub Actions YAML; preserve +0.4 EV SDR/UHDR source
 
-**Build:** 26955 / 0.9726955. **Status:** LOCALLY VALIDATED / PREPARED FOR ACTIONS; **NOT BUILD-PROVEN**. Device photography quality unknown until new APK is built and tested.
+**Build:** 26955 V2 workflow repair / 0.9726955. **Status:** LOCALLY VALIDATED / PREPARED FOR ACTIONS; **NOT BUILD-PROVEN**. Device photography quality unknown until new APK is built and tested.
+
+## V2 correction after the two zero-job GitHub failures
+
+GitHub runs `44217838413` (commit `6e3503ce2bf9118f2cc7f00e6f636a790a0aec25`) and `44217878078` (commit `a8ec8746dc45c474b2317c95b14b56befe464002`) FAILED before any job started. The exact first issue was **unquoted `: ` in workflow line 423** (`- name: Install exactly two 26955 runtime edits: B ...`). It is now correctly double quoted. Local PyYAML successfully parses the full actual V2 workflow with all 55 steps. A new fail-closed workflow-name grammar check is included in the current `test_26955_workflow_refs.py`.
+
+**Important for existing uploaded V1:** Overwrite all V2 Stage-1 files, replace the workflow at Stage 2, and **replace `TRIGGER_26955.txt` with the V2 version at Stage 3 last**. Its content changed deliberately to trigger GitHub's `paths: TRIGGER_26955.txt` filter. Commit and push the THREE stages together; do **not** click rerun on the zero-job invalid V1 run. Do not modify `dev`. The two application source files and their SHA256 hashes are **byte-identical to original 26955**; V2 changes infrastructure and packaging only. No compilation was performed during the repair.
 
 ## Runtime authority (successful 26954, not stale repository app/src)
 
@@ -34,4 +40,4 @@ The new workflow retains the **complete first 34 actually successful 26954 histo
 
 **NOT RUN locally:** actual current 26955 shader/SPIR-V compilers, NDK/CMake dual ABI, Kotlin, Java, Android Gradle assembleDebug. **26955 APK SHA-256 and published Actions artifact SHA are not available until a successful Actions run.** Device SDR/UHDR visual rendering and halo/contrast correctness remain unverified. A successful build alone is not proof of visual quality.
 
-**Commit message:** `26955: Preserve 26954 B OFF/Night SDR and matched UHDR; reduce single global exposure from +1.0 EV to +0.4 EV`
+**Commit message:** `26955 V2: Fix GitHub Actions invalid YAML colon in step name; preserve +0.4 EV B OFF/Night SDR/UHDR source unchanged`

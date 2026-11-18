@@ -7,6 +7,18 @@ from build_26955_incremental import R,fail,WORKFLOW_SHA,BUILDER_SHA,TAR_SHA,ART_
 def main():
  old=(R/'26954_SUCCESSFUL_EXECUTED_WORKFLOW_REFERENCE.yml').read_text()
  new=(R/'.github/workflows/build-26955-change-aware.yml').read_text()
+ # IRIS_26955_V2: GitHub rejects a workflow with an unquoted ': ' in a step name.
+ # The V1 failure happened BEFORE job creation, so Actions could not execute our
+ # existing on-runner static/reference checks. Scan all top-level and step names
+ # for this exact YAML grammar hazard, without requiring PyYAML on the runner.
+ for lineno,line in enumerate(new.splitlines(),1):
+  m=re.match(r'^\s*(?:-\s+)?name:\s*(.+?)\s*$',line)
+  if not m:continue
+  value=m.group(1).strip()
+  if ': ' in value and not (value.startswith('"') and value.endswith('"')) and not (value.startswith("'") and value.endswith("'")):
+   fail(f'unquoted YAML colon in workflow name at line {lineno}; GitHub would reject before any build job starts')
+ if new.count('      - name: "Install exactly two 26955 runtime edits: B OFF/Night global EV shoulder shader and version"')!=1:
+  fail('26955 V2 corrected exact quoted YAML runtime install step missing')
  if hashlib.sha256(old.encode()).hexdigest()!=WORKFLOW_SHA:fail('not exact successful 26954 executed historical workflow SHA')
  oldmark='      - name: Fetch only actually successful 26953 Actions artifact 14370867853 with proven authenticated curl'
  newmark='      # ALL 34 SUCCESSFUL 26954 historical preflight steps above are BYTE-EXACT'
