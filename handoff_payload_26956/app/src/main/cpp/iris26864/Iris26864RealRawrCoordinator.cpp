@@ -147,10 +147,10 @@ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
     }
     wronski.iris26920Active = sr && frozen.iris26920Active;
     rawr::raw_merge_hdrplus_gpu::Config hdrq{};
-    // 26956: Current Rawr HDR+ Quality motion gate and native strength 13.
+    // 26956 V2: Rawr HDR+ Quality motion gate with original Iris strength 11.
     // This applies to every !sr frequency-merge owner, including B Night.
     // B Super Res ON uses Wronski and ignores this HDRQ setting.
-    if (!sr) hdrq.strength = 13.0f;
+    if (!sr) hdrq.strength = 11.0f;
     // RAWR's chunk fence can fail after a successful VkQueueSubmit. Keep the
     // coordinator alive until an explicit queue-idle proof has settled every
     // possible submission, rather than letting stack unwinding release its

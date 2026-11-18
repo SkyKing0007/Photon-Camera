@@ -939,7 +939,7 @@ BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<Bu
                     // data-derived even when a four-bin slope fit is impossible.
                     // Do not manufacture Camera2 coefficients or consume A's
                     // protection controls. If no valid RAW blocks exist, mark
-                    // the motion classifier UNKNOWN and retain strength 13.
+                    // the motion classifier UNKNOWN and retain the original strength 11.
                     const float* stats = static_cast<const float*>(noiseStats_.mapped);
                     bool usable = true;
                     for (std::size_t s = 0; s < 4u; ++s) {

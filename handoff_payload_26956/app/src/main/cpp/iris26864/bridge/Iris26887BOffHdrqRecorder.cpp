@@ -628,7 +628,7 @@ void HdrPlusFrequencyRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint
     constexpr float kGateLow=1.6f, kGateHigh=2.6f, kGateShrink=1.0f;
     constexpr float kEnergyGain=1.0f, kEnergyDead=1.0f, kEnergyScale=0.5f;
     const bool gated=uniformExposure_ && motionGateEnabled_;
-    float slope=noiseSlope_, offset=noiseOffset_;
+    float slope=noiseSlope_, noiseVarianceOffset=noiseOffset_;
     if(rawNoiseMeasured_){
         // The pinned RAW-pair estimator emits variance in normalized white-range
         // units. Rawr's HDRQ mismatch runs on RAW code values, so multiply the
@@ -636,19 +636,19 @@ void HdrPlusFrequencyRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint
         const float refMeanBlack=0.25f*(referenceBlack_[0]+referenceBlack_[1]+referenceBlack_[2]+referenceBlack_[3]);
         const float range=std::max(1.0f,referenceWhite_-refMeanBlack);
         slope=0.25f*(rawNoiseSlope_[0]+rawNoiseSlope_[1]+rawNoiseSlope_[2]+rawNoiseSlope_[3])*range;
-        offset=0.25f*(rawNoiseOffset_[0]+rawNoiseOffset_[1]+rawNoiseOffset_[2]+rawNoiseOffset_[3])*range*range;
+        noiseVarianceOffset=0.25f*(rawNoiseOffset_[0]+rawNoiseOffset_[1]+rawNoiseOffset_[2]+rawNoiseOffset_[3])*range*range;
     }
     // Reject nonfinite/invalid calibration instead of mistaking moving objects
     // for stationary texture. Fallback should originate in the configured
     // reference sensor noise model, just as in Rawr.
-    if(!std::isfinite(slope)||!std::isfinite(offset)||slope<0.0f||offset<=0.0f){
+    if(!std::isfinite(slope)||!std::isfinite(noiseVarianceOffset)||slope<0.0f||noiseVarianceOffset<=0.0f){
         slope=std::max(noiseSlope_,0.0f);
-        offset=std::max(noiseOffset_,1.0e-10f);
+        noiseVarianceOffset=std::max(noiseOffset_,1.0e-10f);
     }
     const float meanBlack=0.25f*(referenceBlack_[0]+referenceBlack_[1]+referenceBlack_[2]+referenceBlack_[3]);
     MismatchPc mp{std::int32_t(tx),std::int32_t(ty),
                   std::int32_t(geometry_.rgbaWidth),std::int32_t(geometry_.rgbaHeight),
-                  slope,offset,meanBlack,1.0f,
+                  slope,noiseVarianceOffset,meanBlack,1.0f,
                   kEnergyGain,kEnergyDead,kEnergyScale,exposureFactor,gated?1:0};
     executor_.record(c, ShaderId::HdrqMismatch,
                      {{ib(0,refRgba),ib(1,alignedRgba),ib(2,arena_.image("hdrq_rms")),ib(3,mismatch),ib(4,zmap)},{}},
@@ -689,7 +689,7 @@ void HdrPlusFrequencyRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint
                                         : hp::bracketedFrequencyNorms(config_.strength, exposureFactor);
     FreqMergePc fm{std::int32_t(tx),std::int32_t(ty),norms.robustnessNorm,
                    norms.readNoise,norms.maxMotionNorm,uniformExposure_?1:0,
-                   exposureFactor,kGateLow,kGateHigh,slope,offset,meanBlack,kGateShrink,gated?1:0};
+                   exposureFactor,kGateLow,kGateHigh,slope,noiseVarianceOffset,meanBlack,kGateShrink,gated?1:0};
     executor_.record(c, ShaderId::HdrqMerge,
                      {{ib(0, arena_.image("hdrq_ref_ft")), ib(1, arena_.image("hdrq_aligned_ft")),
                        ib(2, arena_.image("hdrq_final_ft")), ib(3, arena_.image("hdrq_rms")), ib(4, mismatch),
