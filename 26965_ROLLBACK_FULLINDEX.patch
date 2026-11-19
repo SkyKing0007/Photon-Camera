@@ -1,0 +1,250 @@
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+index 936da8a9b287a6e3db04f95f4117f33b10e4f1f3..bf4b73972c071c79d3ce4f8701dadafa27647c9a 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+@@ -635,12 +635,8 @@ void HdrPlusFrequencyRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint
+     const bool gated=uniformExposure_ && motionGateEnabled_;
+     // Scope by the already proven B-OFF borrowed-owner TLS, NOT global modes.
+     // Night keeps the 26958 gate and original unmodified raw frequency math.
+-    // 26965: the previous B-OFF spatial reference substitution is retired.
+-    // The RAWR HDR+ gate operates only in the Wiener merge; never replace
+-    // motion samples before Fourier subpixel registration, even if a future
+-    // caller accidentally changes the gate control.
+-    if (uniformExposure_ && iris26941BOffHdrqLazyPoolReset && !gated)
+-        throw std::runtime_error("26965 B/OFF HDRQ motion gate unexpectedly disabled");
++    const bool spatialScreen26963 = uniformExposure_ &&
++        iris26941BOffHdrqLazyPoolReset && !motionGateEnabled_;
+     float slope=noiseSlope_, noiseVarianceOffset=noiseOffset_;
+     if(rawNoiseMeasured_){
+         // The pinned RAW-pair estimator emits variance in normalized white-range
+@@ -662,17 +658,24 @@ void HdrPlusFrequencyRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint
+     MismatchPc mp{std::int32_t(tx),std::int32_t(ty),
+                   std::int32_t(geometry_.rgbaWidth),std::int32_t(geometry_.rgbaHeight),
+                   slope,noiseVarianceOffset,meanBlack,1.0f,
+-                  kEnergyGain,kEnergyDead,kEnergyScale,exposureFactor,gated?1:0,0 /* no pre-FFT screen */};
+-    // Keep the historical descriptor slot (5) for the pinned Vulkan pipeline
+-    // layout, but it is NEVER a screen producer or the FFT input. All four
+-    // CFA phases reach the 7x7 Fourier search from the original RAW warp.
++                  kEnergyGain,kEnergyDead,kEnergyScale,exposureFactor,gated?1:0,spatialScreen26963?1:0};
++    // hdrq_out_rgba is not read by uniform Photo B until recordPassFinish;
++    // no allocation or persistent source lifetime changes are necessary.
++    const auto& temporalAligned26963 = arena_.image("hdrq_out_rgba");
+     executor_.record(c, ShaderId::HdrqMismatch,
+                      {{ib(0,refRgba),ib(1,alignedRgba),ib(2,arena_.image("hdrq_rms")),ib(3,mismatch),ib(4,zmap),
+-                       ib(5,arena_.image("hdrq_out_rgba"))},{}},
++                       ib(5,temporalAligned26963)},{}},
+                      &mp,sizeof(mp),tx,ty);
+-    if (mark) { computeWriteBarrier(c); mark(5u); }
++    if (mark) {
++        computeWriteBarrier(c);
++        mark(5u);
++    } else if (spatialScreen26963) {
++        // Mandatory producer->FFT consumer barrier when no timestamp callback.
++        computeWriteBarrier(c);
++    }
+     TilesPc tp{std::int32_t(tx), std::int32_t(ty)};
+-    executor_.record(c, ShaderId::HdrqForwardDft, {{ib(0, alignedRgba), ib(1, arena_.image("hdrq_aligned_ft"))}, {}}, &tp,
++    const auto& fftInput26963 = spatialScreen26963 ? temporalAligned26963 : alignedRgba;
++    executor_.record(c, ShaderId::HdrqForwardDft, {{ib(0, fftInput26963), ib(1, arena_.image("hdrq_aligned_ft"))}, {}}, &tp,
+                      sizeof(tp), tx, ty);
+     computeWriteBarrier(c);
+     if (mark) mark(2u);
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
+index b2fc9b92bc4af22a442d802023bde33311161be6..315741e8532601c9a3b8ed68d67c54ecc83f5ad0 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
+@@ -827,23 +827,17 @@ BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<Bu
+     iris26957HdrqEffectiveFrames = 0.0f;
+     std::optional<rawr::raw_merge_wronski_gpu::CfaNoiseProfile> hdrqMeasuredProfile;
+     float hdrqEffectiveFrames = 0.0f;
+-    // IRIS_26965_B_OFF_RAWR_B6C05A0_HDRQ_MOTION_OWNERSHIP.
+-    // Pin Photo B Super Res OFF to the 2026-11-19 RAWR HDR+ Higher quality
+-    // uniform-burst semantics. The borrowed B-only owner already has RAWR's
+-    // RAW noise fit, four-phase 4x4 displacement/energy statistic, Fourier
+-    // Wiener gate, reference-spectrum shrink, and four overlapping passes.
+-    // The old v0.5.1 exception disabled the gate and activated an independent
+-    // pre-FFT spatial replacement, which RAWR's current HDRQ never performs.
+-    // Night still owns the existing gated path, and bracketed keeps its
+-    // historical ungated path. No capture/tone/AMaZE/chroma settings change.
+-    const bool photoBOffLatestRawr = iris26941BOffHdrqLazyPoolReset &&
++    // IRIS_26959_V2_RAWR051_B_OFF_FREQUENCY_PARITY.
++    // Exact pinned RAWR v0.5.1 HDRQ merge has NO noise-calibrated 4x4
++    // motion-zmap gate or rejected-tile reference-spectrum shrinkage.
++    // The serialized/borrowed Photo B Super Res OFF coordinator is the only
++    // restored owner. Night and all non-borrowed/other modes retain 26958.
++    // In this scope: useMotionGate=0 makes mismatch, normalized mismatch,
++    // Wiener weights and the 7x7 Fourier shift numerically upstream 0.5.1.
++    const bool photoBOffRawr051 = iris26941BOffHdrqLazyPoolReset &&
+         algorithm_ == MergeAlgorithm::HdrPlusFrequency;
+-    recorder.setMotionGate(algorithm_ == MergeAlgorithm::HdrPlusFrequency);
+-    if (photoBOffLatestRawr) {
+-        __android_log_print(ANDROID_LOG_INFO, "Iris26965",
+-            "B_OFF_RAWR_HDRQ active=1 gate=1 preFFTSpatialScreen=0 strength=%.1f frames=%zu",
+-            hdrplus_.strength, frames.size());
+-    }
++    recorder.setMotionGate(algorithm_ == MergeAlgorithm::HdrPlusFrequency &&
++                           !photoBOffRawr051);
+     {
+         float alpha=merge_.noiseAlpha,beta=merge_.noiseBeta;
+         if(merge_.sensorNoiseProfile){
+@@ -1129,11 +1123,12 @@ BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<Bu
+         // pass, map only per-tile accepted-frame counts. This is deliberately
+         // before the next image lifetime phase, and the executeChunk fence
+         // is mandatory before host reads. No frame-count guess is permitted.
+-        // RAWR b6c05a0 HDRQ: the fourth pass reads the actual rejected-tile
+-        // support. A nominal full-15 report must never erase motion rejection
+-        // from the optional downstream noise-scale receipt. The readback uses
+-        // the existing fenced tile buffer; no new RAW image or vendor ABI.
+-        if (pass == 3u && algorithm_ == MergeAlgorithm::HdrPlusFrequency) {
++        // Without the post-0.5.1 per-tile gate, ALL of the supplied companions
++        // participate via Rawr's original per-frequency Wiener weights; there
++        // is no meaningful rejection-based neff map to read from this route.
++        // Keep Night's 26958 readback and optional B chroma preference intact.
++        if (pass == 3u && algorithm_ == MergeAlgorithm::HdrPlusFrequency &&
++            !photoBOffRawr051) {
+             const auto tiles = recorder.tileCount();
+             const VkDeviceSize bytes = VkDeviceSize(tiles.first) * tiles.second * sizeof(float);
+             if (tiles.first == 0u || tiles.second == 0u || bytes == 0u)
+@@ -1202,11 +1197,12 @@ BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<Bu
+                           timings};
+     result.cfaImage = cfa.image;
+     result.cfaView = cfa.view;
+-    // Preserve the native vendor public struct/ABI, but publish RAWR's
+-    // harmonic-mean admitted support rather than claiming all 15 frames were
+-    // independent in moving tiles. Applies to Photo B OFF and unchanged Night
+-    // HDRQ. Other modes do not receive this HDRQ TLS value.
+-    iris26957HdrqEffectiveFrames = hdrqEffectiveFrames;
++    // Preserve the original native vendor public struct. The TLS support
++    // receipt is read synchronously by the B-only post-AMaZE consumer.
++    // Match original frequency merge's full-frame temporal support when no
++    // independent tile-rejection gate exists. The user-optional post-AMaZE
++    // wavelet retains its existing noise fit and works with full support.
++    iris26957HdrqEffectiveFrames = photoBOffRawr051 ? float(frameCount) : hdrqEffectiveFrames;
+     if (hdrqMeasuredProfile) {
+         result.noiseEstimated = true;
+         result.estimatedNoise = *hdrqMeasuredProfile;
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+index ff66afb44eee894b56ca2bdb6ba3e55ca198c51e..4cfc8615392aa1ce930f2c6bf5f178b4686af6f7 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+@@ -101,11 +101,104 @@ void main(){
+         sBlockZ[bi>>2]=score;
+     }
+     barrier();
+-    // 26965 pinned RAWR HDR+ Quality: no independent per-pixel motion
+-    // classifier and no reference-pixel replacement before the Fourier shift.
+-    // The legacy push field and binding 5 remain allocated for ABI parity,
+-    // but only the RAWR 4x4 noise-calibrated tile statistic below feeds the
+-    // downstream shared-four-phase Wiener gate.
++    // IRIS_26964_B_OFF_MOTION_RESIDUAL_AFTER_SUBPIXEL_EXPLANATION
++    // Preserve 26963's per-pixel/no-tile-mask output ownership and the original
++    // 26959 noise/Wiener pipeline. A small independently moving feature can
++    // produce opposite-signed changes (APEX text) and evade the 26963 five-
++    // sample signed mean. Compare RAW difference *energy* after explaining a
++    // bounded residual subpixel translation of stationary texture. No coarse
++    // tile gate or extra reference-spectrum shrink may be enabled.
++    if (p.useSpatialScreen != 0) {
++        ivec2 center = t0 + ivec2(l.x & 7, l.y * 2 + (l.x >> 3));
++        if (all(lessThan(center, p.rgbaSize))) {
++            vec4 alignedCenter = imageLoad(alignedRgba, center);
++            float confidence = 0.0;
++            // Reference and aligned samples are the same CFA four-phase site.
++            // The 3x3 patch uses a one-cell halo across tile boundaries, so
++            // the decision is not discontinuous on the 8x8 Fourier lattice.
++            if (all(greaterThanEqual(center, ivec2(3))) &&
++                all(lessThan(center, p.rgbaSize - ivec2(3))) &&
++                !isnan(p.noiseSlope) && !isinf(p.noiseSlope) &&
++                !isnan(p.noiseOffset) && !isinf(p.noiseOffset) &&
++                p.noiseSlope >= 0.0 && p.noiseOffset > 0.0) {
++                // Fit a maximum half-CFA-cell residual shift using reference
++                // spatial gradients (2x2 regularized Lucas-Kanade). Stationary
++                // microtexture may have a fractional warp after coarse alignment;
++                // count ONLY the RAW residual not explained by that shift.
++                float aa = 0.0, ab = 0.0, bb = 0.0;
++                float ax = 0.0, ay = 0.0;
++                float varEnergy = 0.0, signalSum = 0.0, curvatureEnergy = 0.0;
++                float diffEnergy = 0.0, diffFourth = 0.0;
++                for (int oy = -1; oy <= 1; ++oy) {
++                    for (int ox = -1; ox <= 1; ++ox) {
++                        ivec2 q = center + ivec2(ox, oy);
++                        vec4 r = imageLoad(refRgba, q);
++                        vec4 d = r - imageLoad(alignedRgba, q);
++                        vec4 gx = 0.5 * (imageLoad(refRgba, q + ivec2(1,0)) -
++                                         imageLoad(refRgba, q - ivec2(1,0)));
++                        vec4 gy = 0.5 * (imageLoad(refRgba, q + ivec2(0,1)) -
++                                         imageLoad(refRgba, q - ivec2(0,1)));
++                        aa += dot(gx, gx);
++                        ab += dot(gx, gy);
++                        bb += dot(gy, gy);
++                        ax += dot(gx, d);
++                        ay += dot(gy, d);
++                        vec4 d2 = d * d;
++                        diffEnergy += dot(d2, vec4(1.0));
++                        diffFourth += dot(d2, d2);
++                        vec4 kx = imageLoad(refRgba, q + ivec2(1,0)) +
++                                  imageLoad(refRgba, q - ivec2(1,0)) - 2.0 * r;
++                        vec4 ky = imageLoad(refRgba, q + ivec2(0,1)) +
++                                  imageLoad(refRgba, q - ivec2(0,1)) - 2.0 * r;
++                        curvatureEnergy += dot(kx, kx) + dot(ky, ky);
++                        vec4 var2 = 2.0 * (p.noiseSlope * max(r - vec4(p.black), vec4(0.0)) +
++                                           vec4(p.noiseOffset));
++                        varEnergy += dot(var2, vec4(1.0));
++                        signalSum += dot(max(r - vec4(p.black), vec4(0.0)), vec4(1.0));
++                    }
++                }
++                // Damped invert cannot amplify the near-singular flat-patch
++                // solution. The gradient-energy guard covers unmodeled higher-
++                // order fractional sampling of CFA microstructure.
++                float lambda = 0.1 * (aa + bb) + max(varEnergy * 0.01, 1.0e-5);
++                float a00 = aa + lambda, a11 = bb + lambda;
++                float det = max(a00 * a11 - ab * ab, 1.0e-12);
++                vec2 shift = clamp(vec2((a11 * ax - ab * ay) / det,
++                                        (a00 * ay - ab * ax) / det),
++                                   vec2(-0.5), vec2(0.5));
++                // Algebraic residual energy after the fitted fractional shift:
++                // Σ |d - gx*dx - gy*dy|². All sufficient statistics were
++                // accumulated above; no second 3x3 image-read pass is needed.
++                float energy = max(0.0, diffEnergy - 2.0 * shift.x * ax -
++                        2.0 * shift.y * ay + shift.x * shift.x * aa +
++                        2.0 * shift.x * shift.y * ab + shift.y * shift.y * bb);
++                // In pure noise this ratio is near 1 (36 channel samples);
++                // the 2.2 onset is >five nominal chi-square standard deviations.
++                // Gradient tolerance prevents subpixel stationary foliage
++                // from being classified as motion merely because it's sharp.
++                float expected = varEnergy + 0.10 * (aa + bb);
++                float ratio = energy / max(expected, 1.0e-7);
++                float snr = (signalSum / 36.0) /
++                            sqrt(max(varEnergy / 72.0, 1.0e-8));
++                float motion = smoothstep(2.2, 3.8, ratio);
++                float supported = smoothstep(5.0, 11.0, snr);
++                // Reject isolated hot-pixel evidence, not whole Fourier
++                // blocks: fourth-moment concentration is near 1 for a single
++                // outlier and ~1/36 for a distributed moving texture.
++                float concentration = diffFourth / max(diffEnergy * diffEnergy, 1.0e-8);
++                float spatial = 1.0 - smoothstep(0.20, 0.50, concentration);
++                // The sampled 2-pixel Nyquist pattern has zero first gradient
++                // but large second curvature. Its apparent fractional shift
++                // cannot be distinguished reliably from object motion; do NOT
++                // reject such fine stationary fabric/foliage CFA textures.
++                float aliasRisk = curvatureEnergy / max(aa + bb + varEnergy, 1.0e-7);
++                float textureSafe = 1.0 - smoothstep(4.5, 9.0, aliasRisk);
++                confidence = motion * supported * spatial * textureSafe;
++            }
++            vec4 refCenter = imageLoad(refRgba, center);
++            imageStore(temporalAligned, center, mix(alignedCenter, refCenter, confidence));
++        }
++    }
+     if(lane!=0u)return;
+     float acc=0.0;
+     vec4 dsum=vec4(0.0);
+diff --git a/app/version.properties b/app/version.properties
+index 03d19161349b7c961b7bfc304d6872aa0bc87d44..cbfd940076146674dcddc7a74801a292a521435f 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726965
+-VERSION_BUILD=26965
++VERSION_NAME=0.9726964
++VERSION_BUILD=26964
