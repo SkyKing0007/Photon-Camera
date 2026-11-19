@@ -1,0 +1,216 @@
+#version 450
+// RAWR 2026-11-17 HDR+ Quality spatially varying motion rejection.
+// Matched to current Rawr hdrq_mismatch: sixteen 4x4 noise-calibrated blocks
+// per 16x16 tile window, plus the existing mean mismatch for Wiener weights.
+// Bridge retains the already compiled B-owner RGBA32F/raw-units representation.
+// 26963: only Photo B Super Res OFF may replace demonstrably incoherent
+// aligned companion samples in a separate, already allocated scratch image.
+// The original mismatch/Wiener/strength and Night motion gate remain intact.
+layout(local_size_x = 16, local_size_y = 4) in;
+layout(set = 0, binding = 0, rgba32f) readonly uniform image2D refRgba;
+layout(set = 0, binding = 1, rgba32f) readonly uniform image2D alignedRgba;
+layout(set = 0, binding = 2, rgba32f) readonly uniform image2D rms;
+layout(set = 0, binding = 3, r32f) writeonly uniform image2D mismatch;
+layout(set = 0, binding = 4, r32f) writeonly uniform image2D zmap;
+// Existing hdrq_out_rgba is unused until the pass finishes on uniform Photo B.
+// Write *different* storage from alignedRgba: no overlapping workgroup RW race.
+layout(set = 0, binding = 5, rgba32f) writeonly uniform image2D temporalAligned;
+layout(push_constant) uniform P {
+    ivec2 tiles;
+    ivec2 rgbaSize;
+    float noiseSlope;
+    float noiseOffset;
+    float black;
+    float frameInv;
+    float energyGain;
+    float energyDead;
+    float energyScale;
+    float exposureFactor;
+    int useMotionGate;
+    int useSpatialScreen;
+} p;
+const float WIN16[16] = float[16](0.342940479,0.434943816,0.565056184,0.657059521,0.657059521,0.565056184,0.434943816,0.342940479,0.342940479,0.434943816,0.565056184,0.657059521,0.657059521,0.565056184,0.434943816,0.342940479);
+shared vec4 sDiff[64];
+shared float sWeight[64];
+shared float sWeight2[64];
+shared vec4 sSig[64];
+shared vec4 sSigned[64];
+shared vec4 sSq[64];
+shared float sBlockZ[16];
+void main(){
+    ivec2 g=ivec2(gl_WorkGroupID.xy);
+    if(any(greaterThanEqual(g,p.tiles)))return;
+    ivec2 l=ivec2(gl_LocalInvocationID.xy);
+    uint lane=gl_LocalInvocationIndex;
+    ivec2 t0=g*8;
+    ivec2 start=max(ivec2(0),t0-4);
+    ivec2 end=min(p.rgbaSize-1,t0+12);
+    vec4 diffAcc=vec4(0.0),sig=vec4(0.0),signedAcc=vec4(0.0),sq=vec4(0.0);
+    float w=0.0,w2=0.0;
+    for(int k=0;k<4;++k){
+        ivec2 wl=ivec2(l.x,4*l.y+k);
+        ivec2 q=t0-4+wl;
+        if(all(greaterThanEqual(q,start)) && all(lessThan(q,end))){
+            float wk=WIN16[wl.x]*WIN16[wl.y];
+            vec4 r=imageLoad(refRgba,q)*p.frameInv;
+            vec4 a=imageLoad(alignedRgba,q)*p.frameInv;
+            vec4 delta=r-a;
+            diffAcc+=wk*abs(delta);
+            sig+=wk*r;
+            signedAcc+=wk*delta;
+            sq+=wk*delta*delta;
+            w+=wk;w2+=wk*wk;
+        }
+    }
+    // Group-of-four block-contiguous reduction from current Rawr implementation.
+    uint bi=uint((l.y*4+l.x/4)*4+(l.x%4));
+    sDiff[bi]=diffAcc;sWeight[bi]=w;sWeight2[bi]=w2;
+    sSig[bi]=sig;sSigned[bi]=signedAcc;sSq[bi]=sq;
+    barrier();
+    for(uint stride=2u;stride>0u;stride>>=1u){
+        if((bi&3u)<stride){
+            sDiff[bi]+=sDiff[bi+stride];
+            sWeight[bi]+=sWeight[bi+stride];
+            sWeight2[bi]+=sWeight2[bi+stride];
+            sSig[bi]+=sSig[bi+stride];
+            sSigned[bi]+=sSigned[bi+stride];
+            sSq[bi]+=sSq[bi+stride];
+        }
+        barrier();
+    }
+    if((bi&3u)==0u){
+        float score=0.0;
+        if(p.useMotionGate!=0){
+            float sumW=sWeight[bi];
+            float sumW2=sWeight2[bi];
+            if(sumW>1.0e-3){
+                float neff=sumW*sumW/max(sumW2,1.0e-12);
+                vec4 meanSignal=sSig[bi]/sumW;
+                vec4 var2=2.0*(p.noiseSlope*max(meanSignal-p.black,vec4(0.0))+p.noiseOffset);
+                vec4 sigma=sqrt(max(var2,vec4(1.0e-10)))/sqrt(neff);
+                vec4 zc=abs(sSigned[bi]/sumW)/max(sigma,vec4(1.0e-6));
+                score=0.25*(zc.x+zc.y+zc.z+zc.w)/0.7979;
+                if(p.energyGain>0.0){
+                    vec4 qc=(sSq[bi]/sumW)/max(var2,vec4(1.0e-6));
+                    float q=0.25*(qc.x+qc.y+qc.z+qc.w);
+                    float excess=q-1.0-p.energyDead;
+                    if(excess>0.0)score=max(score,1.0+p.energyGain*excess/p.energyScale);
+                }
+            }
+        }
+        sBlockZ[bi>>2]=score;
+    }
+    barrier();
+    // IRIS_26964_B_OFF_MOTION_RESIDUAL_AFTER_SUBPIXEL_EXPLANATION
+    // Preserve 26963's per-pixel/no-tile-mask output ownership and the original
+    // 26959 noise/Wiener pipeline. A small independently moving feature can
+    // produce opposite-signed changes (APEX text) and evade the 26963 five-
+    // sample signed mean. Compare RAW difference *energy* after explaining a
+    // bounded residual subpixel translation of stationary texture. No coarse
+    // tile gate or extra reference-spectrum shrink may be enabled.
+    if (p.useSpatialScreen != 0) {
+        ivec2 center = t0 + ivec2(l.x & 7, l.y * 2 + (l.x >> 3));
+        if (all(lessThan(center, p.rgbaSize))) {
+            vec4 alignedCenter = imageLoad(alignedRgba, center);
+            float confidence = 0.0;
+            // Reference and aligned samples are the same CFA four-phase site.
+            // The 3x3 patch uses a one-cell halo across tile boundaries, so
+            // the decision is not discontinuous on the 8x8 Fourier lattice.
+            if (all(greaterThanEqual(center, ivec2(3))) &&
+                all(lessThan(center, p.rgbaSize - ivec2(3))) &&
+                !isnan(p.noiseSlope) && !isinf(p.noiseSlope) &&
+                !isnan(p.noiseOffset) && !isinf(p.noiseOffset) &&
+                p.noiseSlope >= 0.0 && p.noiseOffset > 0.0) {
+                // Fit a maximum half-CFA-cell residual shift using reference
+                // spatial gradients (2x2 regularized Lucas-Kanade). Stationary
+                // microtexture may have a fractional warp after coarse alignment;
+                // count ONLY the RAW residual not explained by that shift.
+                float aa = 0.0, ab = 0.0, bb = 0.0;
+                float ax = 0.0, ay = 0.0;
+                float varEnergy = 0.0, signalSum = 0.0, curvatureEnergy = 0.0;
+                float diffEnergy = 0.0, diffFourth = 0.0;
+                for (int oy = -1; oy <= 1; ++oy) {
+                    for (int ox = -1; ox <= 1; ++ox) {
+                        ivec2 q = center + ivec2(ox, oy);
+                        vec4 r = imageLoad(refRgba, q);
+                        vec4 d = r - imageLoad(alignedRgba, q);
+                        vec4 gx = 0.5 * (imageLoad(refRgba, q + ivec2(1,0)) -
+                                         imageLoad(refRgba, q - ivec2(1,0)));
+                        vec4 gy = 0.5 * (imageLoad(refRgba, q + ivec2(0,1)) -
+                                         imageLoad(refRgba, q - ivec2(0,1)));
+                        aa += dot(gx, gx);
+                        ab += dot(gx, gy);
+                        bb += dot(gy, gy);
+                        ax += dot(gx, d);
+                        ay += dot(gy, d);
+                        vec4 d2 = d * d;
+                        diffEnergy += dot(d2, vec4(1.0));
+                        diffFourth += dot(d2, d2);
+                        vec4 kx = imageLoad(refRgba, q + ivec2(1,0)) +
+                                  imageLoad(refRgba, q - ivec2(1,0)) - 2.0 * r;
+                        vec4 ky = imageLoad(refRgba, q + ivec2(0,1)) +
+                                  imageLoad(refRgba, q - ivec2(0,1)) - 2.0 * r;
+                        curvatureEnergy += dot(kx, kx) + dot(ky, ky);
+                        vec4 var2 = 2.0 * (p.noiseSlope * max(r - vec4(p.black), vec4(0.0)) +
+                                           vec4(p.noiseOffset));
+                        varEnergy += dot(var2, vec4(1.0));
+                        signalSum += dot(max(r - vec4(p.black), vec4(0.0)), vec4(1.0));
+                    }
+                }
+                // Damped invert cannot amplify the near-singular flat-patch
+                // solution. The gradient-energy guard covers unmodeled higher-
+                // order fractional sampling of CFA microstructure.
+                float lambda = 0.1 * (aa + bb) + max(varEnergy * 0.01, 1.0e-5);
+                float a00 = aa + lambda, a11 = bb + lambda;
+                float det = max(a00 * a11 - ab * ab, 1.0e-12);
+                vec2 shift = clamp(vec2((a11 * ax - ab * ay) / det,
+                                        (a00 * ay - ab * ax) / det),
+                                   vec2(-0.5), vec2(0.5));
+                // Algebraic residual energy after the fitted fractional shift:
+                // Σ |d - gx*dx - gy*dy|². All sufficient statistics were
+                // accumulated above; no second 3x3 image-read pass is needed.
+                float energy = max(0.0, diffEnergy - 2.0 * shift.x * ax -
+                        2.0 * shift.y * ay + shift.x * shift.x * aa +
+                        2.0 * shift.x * shift.y * ab + shift.y * shift.y * bb);
+                // In pure noise this ratio is near 1 (36 channel samples);
+                // the 2.2 onset is >five nominal chi-square standard deviations.
+                // Gradient tolerance prevents subpixel stationary foliage
+                // from being classified as motion merely because it's sharp.
+                float expected = varEnergy + 0.10 * (aa + bb);
+                float ratio = energy / max(expected, 1.0e-7);
+                float snr = (signalSum / 36.0) /
+                            sqrt(max(varEnergy / 72.0, 1.0e-8));
+                float motion = smoothstep(2.2, 3.8, ratio);
+                float supported = smoothstep(5.0, 11.0, snr);
+                // Reject isolated hot-pixel evidence, not whole Fourier
+                // blocks: fourth-moment concentration is near 1 for a single
+                // outlier and ~1/36 for a distributed moving texture.
+                float concentration = diffFourth / max(diffEnergy * diffEnergy, 1.0e-8);
+                float spatial = 1.0 - smoothstep(0.20, 0.50, concentration);
+                // The sampled 2-pixel Nyquist pattern has zero first gradient
+                // but large second curvature. Its apparent fractional shift
+                // cannot be distinguished reliably from object motion; do NOT
+                // reject such fine stationary fabric/foliage CFA textures.
+                float aliasRisk = curvatureEnergy / max(aa + bb + varEnergy, 1.0e-7);
+                float textureSafe = 1.0 - smoothstep(4.5, 9.0, aliasRisk);
+                confidence = motion * supported * spatial * textureSafe;
+            }
+            vec4 refCenter = imageLoad(refRgba, center);
+            imageStore(temporalAligned, center, mix(alignedCenter, refCenter, confidence));
+        }
+    }
+    if(lane!=0u)return;
+    float acc=0.0;
+    vec4 dsum=vec4(0.0);
+    float wsum=0.0;
+    for(uint b=0u;b<16u;++b){
+        acc+=sBlockZ[b];dsum+=sDiff[b*4u];wsum+=sWeight[b*4u];
+    }
+    imageStore(zmap,g,vec4(p.useMotionGate!=0 ? acc/16.0 : 0.0));
+    vec4 noise=imageLoad(rms,g);
+    vec4 delta=dsum/max(wsum,1.0e-7);
+    // Preserve older Rawr bracketed mismatch variance when gate is inactive.
+    vec4 variance=p.useMotionGate!=0 ? noise+1.0 : 0.5*noise+0.5*noise/max(p.exposureFactor,1.0e-6)+1.0;
+    vec4 m4=delta/sqrt(variance);
+    imageStore(mismatch,g,vec4(0.25*(m4.x+m4.y+m4.z+m4.w)));
+}

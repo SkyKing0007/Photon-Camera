@@ -1,0 +1,294 @@
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+index 8f96c0ce5012ceff25575d9f0a9198ed8adbc6a0..4cfc8615392aa1ce930f2c6bf5f178b4686af6f7 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+@@ -101,56 +101,100 @@ void main(){
+         sBlockZ[bi>>2]=score;
+     }
+     barrier();
+-    // A continuous per-CFA-cell, aligned-RAW temporal-inlier test.  It is NOT
+-    // the rejected 26960 coarse tile zmap gate, nor a chroma/noise filter.
+-    // Keep original aligned values where temporal evidence is ambiguous.
+-    // Every lane owns one of the center 8x8 pixels, independent of adjacent
+-    // workgroups. Read-only reference/aligned source; write to separate output.
++    // IRIS_26964_B_OFF_MOTION_RESIDUAL_AFTER_SUBPIXEL_EXPLANATION
++    // Preserve 26963's per-pixel/no-tile-mask output ownership and the original
++    // 26959 noise/Wiener pipeline. A small independently moving feature can
++    // produce opposite-signed changes (APEX text) and evade the 26963 five-
++    // sample signed mean. Compare RAW difference *energy* after explaining a
++    // bounded residual subpixel translation of stationary texture. No coarse
++    // tile gate or extra reference-spectrum shrink may be enabled.
+     if (p.useSpatialScreen != 0) {
+         ivec2 center = t0 + ivec2(l.x & 7, l.y * 2 + (l.x >> 3));
+         if (all(lessThan(center, p.rgbaSize))) {
+             vec4 alignedCenter = imageLoad(alignedRgba, center);
+             float confidence = 0.0;
+-            // Exclude the border readout; preserve proven 26942/26943 edge math.
+-            if (all(greaterThanEqual(center, ivec2(2))) &&
+-                all(lessThan(center, p.rgbaSize - ivec2(2))) &&
++            // Reference and aligned samples are the same CFA four-phase site.
++            // The 3x3 patch uses a one-cell halo across tile boundaries, so
++            // the decision is not discontinuous on the 8x8 Fourier lattice.
++            if (all(greaterThanEqual(center, ivec2(3))) &&
++                all(lessThan(center, p.rgbaSize - ivec2(3))) &&
+                 !isnan(p.noiseSlope) && !isinf(p.noiseSlope) &&
+                 !isnan(p.noiseOffset) && !isinf(p.noiseOffset) &&
+                 p.noiseSlope >= 0.0 && p.noiseOffset > 0.0) {
+-                const ivec2 cross[5] = ivec2[5](ivec2(0), ivec2(-1,0), ivec2(1,0),
+-                                                 ivec2(0,-1), ivec2(0,1));
+-                vec4 sumDelta = vec4(0.0);
+-                vec4 sumRef = vec4(0.0);
+-                vec4 sumVar = vec4(0.0);
+-                float sumSq = 0.0;
+-                for (int k=0; k<5; ++k) {
+-                    ivec2 at = center + cross[k];
+-                    vec4 ref = imageLoad(refRgba, at);
+-                    vec4 companion = imageLoad(alignedRgba, at);
+-                    vec4 d = ref - companion;
+-                    sumDelta += d;
+-                    sumRef += ref;
+-                    sumSq += dot(d, d);
+-                    sumVar += 2.0 * (p.noiseSlope * max(ref - vec4(p.black), vec4(0.0))
+-                                     + vec4(p.noiseOffset));
++                // Fit a maximum half-CFA-cell residual shift using reference
++                // spatial gradients (2x2 regularized Lucas-Kanade). Stationary
++                // microtexture may have a fractional warp after coarse alignment;
++                // count ONLY the RAW residual not explained by that shift.
++                float aa = 0.0, ab = 0.0, bb = 0.0;
++                float ax = 0.0, ay = 0.0;
++                float varEnergy = 0.0, signalSum = 0.0, curvatureEnergy = 0.0;
++                float diffEnergy = 0.0, diffFourth = 0.0;
++                for (int oy = -1; oy <= 1; ++oy) {
++                    for (int ox = -1; ox <= 1; ++ox) {
++                        ivec2 q = center + ivec2(ox, oy);
++                        vec4 r = imageLoad(refRgba, q);
++                        vec4 d = r - imageLoad(alignedRgba, q);
++                        vec4 gx = 0.5 * (imageLoad(refRgba, q + ivec2(1,0)) -
++                                         imageLoad(refRgba, q - ivec2(1,0)));
++                        vec4 gy = 0.5 * (imageLoad(refRgba, q + ivec2(0,1)) -
++                                         imageLoad(refRgba, q - ivec2(0,1)));
++                        aa += dot(gx, gx);
++                        ab += dot(gx, gy);
++                        bb += dot(gy, gy);
++                        ax += dot(gx, d);
++                        ay += dot(gy, d);
++                        vec4 d2 = d * d;
++                        diffEnergy += dot(d2, vec4(1.0));
++                        diffFourth += dot(d2, d2);
++                        vec4 kx = imageLoad(refRgba, q + ivec2(1,0)) +
++                                  imageLoad(refRgba, q - ivec2(1,0)) - 2.0 * r;
++                        vec4 ky = imageLoad(refRgba, q + ivec2(0,1)) +
++                                  imageLoad(refRgba, q - ivec2(0,1)) - 2.0 * r;
++                        curvatureEnergy += dot(kx, kx) + dot(ky, ky);
++                        vec4 var2 = 2.0 * (p.noiseSlope * max(r - vec4(p.black), vec4(0.0)) +
++                                           vec4(p.noiseOffset));
++                        varEnergy += dot(var2, vec4(1.0));
++                        signalSum += dot(max(r - vec4(p.black), vec4(0.0)), vec4(1.0));
++                    }
+                 }
+-                // χ²-like significance of signed, CFA-phase-matched changes.
+-                // Pure sensor noise and alternating stationary weave/foliage
+-                // generally cancel across the cross; coherent real motion does not.
+-                vec4 phaseZ = sumDelta * inversesqrt(max(sumVar, vec4(1.0e-8)));
+-                float z = sqrt(max(dot(phaseZ, phaseZ) * 0.25, 0.0));
+-                float coherence = dot(sumDelta, sumDelta) / max(5.0 * sumSq, 1.0e-8);
+-                float signal = max(dot(sumRef, vec4(0.05)) - p.black, 0.0);
+-                float sigma = sqrt(max(dot(sumVar, vec4(0.05)), 1.0e-8));
+-                float snr = signal / sigma;
+-                // Deliberately high confidence: unlike 26960's coarse gate,
+-                // ambiguous/low-SNR stationary cells retain all 26959 frames.
+-                confidence = smoothstep(6.0, 9.0, z)
+-                           * smoothstep(0.62, 0.86, coherence)
+-                           * smoothstep(9.0, 15.0, snr);
++                // Damped invert cannot amplify the near-singular flat-patch
++                // solution. The gradient-energy guard covers unmodeled higher-
++                // order fractional sampling of CFA microstructure.
++                float lambda = 0.1 * (aa + bb) + max(varEnergy * 0.01, 1.0e-5);
++                float a00 = aa + lambda, a11 = bb + lambda;
++                float det = max(a00 * a11 - ab * ab, 1.0e-12);
++                vec2 shift = clamp(vec2((a11 * ax - ab * ay) / det,
++                                        (a00 * ay - ab * ax) / det),
++                                   vec2(-0.5), vec2(0.5));
++                // Algebraic residual energy after the fitted fractional shift:
++                // Σ |d - gx*dx - gy*dy|². All sufficient statistics were
++                // accumulated above; no second 3x3 image-read pass is needed.
++                float energy = max(0.0, diffEnergy - 2.0 * shift.x * ax -
++                        2.0 * shift.y * ay + shift.x * shift.x * aa +
++                        2.0 * shift.x * shift.y * ab + shift.y * shift.y * bb);
++                // In pure noise this ratio is near 1 (36 channel samples);
++                // the 2.2 onset is >five nominal chi-square standard deviations.
++                // Gradient tolerance prevents subpixel stationary foliage
++                // from being classified as motion merely because it's sharp.
++                float expected = varEnergy + 0.10 * (aa + bb);
++                float ratio = energy / max(expected, 1.0e-7);
++                float snr = (signalSum / 36.0) /
++                            sqrt(max(varEnergy / 72.0, 1.0e-8));
++                float motion = smoothstep(2.2, 3.8, ratio);
++                float supported = smoothstep(5.0, 11.0, snr);
++                // Reject isolated hot-pixel evidence, not whole Fourier
++                // blocks: fourth-moment concentration is near 1 for a single
++                // outlier and ~1/36 for a distributed moving texture.
++                float concentration = diffFourth / max(diffEnergy * diffEnergy, 1.0e-8);
++                float spatial = 1.0 - smoothstep(0.20, 0.50, concentration);
++                // The sampled 2-pixel Nyquist pattern has zero first gradient
++                // but large second curvature. Its apparent fractional shift
++                // cannot be distinguished reliably from object motion; do NOT
++                // reject such fine stationary fabric/foliage CFA textures.
++                float aliasRisk = curvatureEnergy / max(aa + bb + varEnergy, 1.0e-7);
++                float textureSafe = 1.0 - smoothstep(4.5, 9.0, aliasRisk);
++                confidence = motion * supported * spatial * textureSafe;
+             }
+-            // One identical weight for all four Bayer phases, never chroma-only.
+-            // Smooth partial substitution, no 8x8 rejection rectangles.
+             vec4 refCenter = imageLoad(refRgba, center);
+             imageStore(temporalAligned, center, mix(alignedCenter, refCenter, confidence));
+         }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 65d7aca79de252db974fe6dad824a510869cd21f..79693cfca0a0e1592bd213926e34853ff884fc72 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -5016,10 +5016,39 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION);
+         if (shutterRange == null || isoRange == null || shutterRange.getLower() <= 0L) return;
+         final long iris26948MeasuredPeriodNs = iris26948BVerifiedPeriodNs(result);
+-        Iris26909ShutterIsoMath.Plan plan = Iris26909ShutterIsoMath.solveBrightnessAware(
++        // 26964: exposure remains anchored to converged, highlight-safe sensor
++        // AE, NOT the software-brightened viewfinder. Read the active physical
++        // camera's optical metadata; no Xiaomi/lens-name specific branches.
++        double equivalentFocal26964 = Double.NaN;
++        Float focal26964 = result.get(CaptureResult.LENS_FOCAL_LENGTH);
++        android.util.SizeF size26964 = mCameraCharacteristics.get(
++                CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
++        if (focal26964 != null && Float.isFinite(focal26964) && focal26964 > 0.0f
++                && size26964 != null && size26964.getWidth() > 0.0f
++                && size26964.getHeight() > 0.0f) {
++            double diag26964 = Math.hypot(size26964.getWidth(), size26964.getHeight());
++            equivalentFocal26964 = focal26964 * Math.hypot(36.0, 24.0) / diag26964;
++        }
++        Integer analogMax26964 = mCameraCharacteristics.get(
++                CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY);
++        int[] opticalModes26964 = mCameraCharacteristics.get(
++                CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION);
++        boolean ois26964 = false;
++        if (opticalModes26964 != null) {
++            for (int mode26964 : opticalModes26964) {
++                if (mode26964 == CameraCharacteristics.LENS_OPTICAL_STABILIZATION_MODE_ON) {
++                    ois26964 = true;
++                    break;
++                }
++            }
++        }
++        final boolean cameraMoving26964 = motion26712NavigationConfirmed();
++        Iris26909ShutterIsoMath.Plan plan = Iris26909ShutterIsoMath.solveSceneLensAware(
+                 actualShutterNs, actualIso, isoRange.getLower(), isoRange.getUpper(),
+                 shutterRange.getLower(), shutterRange.getUpper(),
+-                frameDurationMax == null ? 0L : frameDurationMax, 0L);
++                frameDurationMax == null ? 0L : frameDurationMax,
++                equivalentFocal26964, analogMax26964 == null ? 0 : analogMax26964,
++                ois26964, cameraMoving26964);
+         if (plan == null || !plan.shutterFirstUseful) return;
+         // Keep the original brightness-aware allocator and original physical
+         // highlight-safe energy. A period lock may only shorten the shutter.
+@@ -5063,9 +5092,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     + " iris26948SnappedToFullPeriods="
+                     + (iris26948MeasuredPeriodNs > 0L
+                         && plan.shutterNs % iris26948MeasuredPeriodNs == 0L)
+-                    + " allocator=26913_low_iso_brightness_curve noMotionDecision=true"
++                    + " allocator=26964_scene_lens_sensor_quality"
++                    + " focalEquivalentMm=" + equivalentFocal26964
++                    + " analogIsoMax=" + analogMax26964
++                    + " oisAvailable=" + ois26964
++                    + " cameraMotionHint=" + cameraMoving26964
+                     + " oneStableAeOffRequest=true noPreviewSessionRebuild=true"
+-                    + " previewRawSameRepeating=true gyroMotionCeilingBypassed=true"
++                    + " previewRawSameRepeating=true noHardMotionCeiling=true"
+                     + " nightlyCaptureIndependent=true");
+         } catch (IllegalArgumentException | IllegalStateException e) {
+             mIris26909ManualUnavailable = true;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26909ShutterIsoMath.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26909ShutterIsoMath.java
+index 386c308d5db91809ffd54d5d8928f38d44e168bf..0dd76415e4dd5b66ea37ea1512add3abd4cbd083 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26909ShutterIsoMath.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26909ShutterIsoMath.java
+@@ -119,6 +119,71 @@ public final class Iris26909ShutterIsoMath {
+         return new Plan(shutter, iso, duration, energy, useful);
+     }
+ 
++    /**
++     * IRIS_26964_B_SCENE_LENS_SENSOR_EXPOSURE_ALLOCATION.
++     * Use the actual converged, highlight-safe Camera2 AE exposure energy;
++     * never use display-brightened preview pixels as a sensor light meter.
++     * A continuous focal-length shutter preference is traded against the
++     * camera's own analog gain capability and the same physical scene energy.
++     * The 1/10 second cap is retained as a last resort for truly dark scenes.
++     * Unknown/malformed lens or analog metadata falls back conservatively.
++     * This only returns a candidate; CaptureController retains manual request
++     * echo, highlight-full-well guard, scene continuity and anti-flicker rules.
++     */
++    public static Plan solveSceneLensAware(long halShutterNs, int halIso,
++                                           int sensorIsoMin, int sensorIsoMax,
++                                           long sensorShutterMinNs, long sensorShutterMaxNs,
++                                           long maxSensorFrameDurationNs,
++                                           double equivalentFocalMm, int analogIsoMax,
++                                           boolean oisAvailable, boolean cameraMoving) {
++        if (halShutterNs <= 0L || halIso <= 0 || sensorIsoMin <= 0
++                || sensorIsoMax < sensorIsoMin || sensorShutterMinNs <= 0L
++                || sensorShutterMaxNs < sensorShutterMinNs) return null;
++        long cap = Math.min(MAX_AUTO_SHUTTER_NS, sensorShutterMaxNs);
++        if (maxSensorFrameDurationNs > 0L) cap = Math.min(cap, maxSensorFrameDurationNs);
++        if (cap < sensorShutterMinNs) return null;
++        double energy = (double)halShutterNs * (double)halIso;
++        if (!Double.isFinite(energy) || energy <= 0.0
++                || energy > (double)cap * sensorIsoMax * 1.01) return null;
++        double focal = Double.isFinite(equivalentFocalMm)
++                && equivalentFocalMm >= 8.0 && equivalentFocalMm <= 500.0
++                ? equivalentFocalMm : 30.0;
++        // Focal-length dependence is gradual, not a telephoto mode switch.
++        double fps = 30.0 * Math.pow(focal / 30.0, 0.37);
++        if (oisAvailable) fps *= 0.94; // OIS helps camera shake, not subject motion.
++        if (cameraMoving) fps *= 1.15; // bounded hint, never overrides noise limits.
++        double wantedNs = 1.0e9 / Math.max(12.0, Math.min(100.0, fps));
++        // Max analog sensitivity is a *capability*, not a measured SNR curve.
++        // Permit less ISO than the sensor's max; absent metadata fail soft to
++        // a modest physical ISO ratio. No device-brand or lens-type guesses.
++        double analog = analogIsoMax >= sensorIsoMin
++                ? Math.min(sensorIsoMax, analogIsoMax)
++                : Math.min(sensorIsoMax, Math.max(1200.0, 20.0 * sensorIsoMin));
++        double quiet = Math.max(100.0, (double)sensorIsoMin);
++        double qualityIsoCeiling = Math.min(sensorIsoMax,
++                Math.max(4.0 * quiet, 0.65 * analog));
++        qualityIsoCeiling = Math.max(sensorIsoMin, qualityIsoCeiling);
++        // Dark scenes that need more ISO than this soft budget may still reach
++        // 1/10s; unlike a hard noise ceiling we never sacrifice AE brightness.
++        wantedNs = Math.max(wantedNs, energy / qualityIsoCeiling);
++        wantedNs = Math.min(wantedNs, energy / sensorIsoMin);
++        long shutter = (long)Math.round(Math.min((double)cap,
++                Math.max((double)sensorShutterMinNs, wantedNs)));
++        shutter = Math.max(sensorShutterMinNs, Math.min(cap, shutter));
++        double isoReal = energy / shutter;
++        if (!Double.isFinite(isoReal) || isoReal < sensorIsoMin * 0.999
++                || isoReal > sensorIsoMax * 1.001) return null;
++        int iso = (int)Math.round(isoReal);
++        if (iso < sensorIsoMin || iso > sensorIsoMax) return null;
++        double error = Math.abs(Math.log((double)shutter * iso / energy));
++        if (!Double.isFinite(error) || error >= 0.045) return null;
++        long duration = Math.max(BASE_PREVIEW_FRAME_NS, shutter);
++        if (maxSensorFrameDurationNs > 0L && duration > maxSensorFrameDurationNs) return null;
++        boolean useful = shutter >= halShutterNs * 1.20
++                || shutter <= halShutterNs * 0.80;
++        return new Plan(shutter, iso, duration, energy, useful);
++    }
++
+     public static Plan solve(long halShutterNs, int halIso, int sensorIsoMin, int sensorIsoMax,
+                              long sensorShutterMinNs, long sensorShutterMaxNs,
+                              long maxSensorFrameDurationNs, long flickerPeriodNs) {
+diff --git a/app/version.properties b/app/version.properties
+index da7ca3bd76f8094c740ab2af334b8910af15ee85..cbfd940076146674dcddc7a74801a292a521435f 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726963
+-VERSION_BUILD=26963
++VERSION_NAME=0.9726964
++VERSION_BUILD=26964
