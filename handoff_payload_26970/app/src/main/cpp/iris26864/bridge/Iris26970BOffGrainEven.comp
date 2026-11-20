@@ -1,0 +1,113 @@
+#version 450
+// IRIS_26970_RAWR_HDRQ_NOISE_INFORMED_GRAIN_EVEN.
+// ONLY Photo Experiment B, Super Res OFF, lens-local zoom <1.10x.
+// The HDR+ Fourier/Wiener merge publishes a conservative per-tile bound on
+// remaining sensor noise *after* motion gating and frequency shrinkage.
+// This shader NEVER infers its target from finished-image pixel variance.
+// It only lowers excess local noise toward similarly illuminated neighbor
+// tiles that had cleaner RAW fusion. Luma (green) and R-G/B-G use separate
+// noise floors. Strong local signal above the RAW model remains untouched.
+// Camera-linear, pre-white-balance RGB after AMaZE. No grain injection.
+layout(local_size_x=16,local_size_y=16,local_size_z=1) in;
+layout(set=0,binding=0,rgba16f) readonly uniform image2D inputRGB;
+layout(set=0,binding=1,rgba16f) writeonly uniform image2D outputRGB;
+layout(std430,set=0,binding=2) readonly buffer WienerNoise {
+    float residualM[];
+};
+layout(push_constant) uniform P {
+    uvec4 extent;      // full image w/h, HDRQ tile-grid w/h
+    ivec4 geometry;    // pass-3 raw x/y offsets, frame count, reserved
+    vec4 noise;        // actual RAW Green shot slope, read offset; reserved
+} p;
+const float TARGET_L=0.25, TARGET_C=0.08, TOL=1.25, MIN_GAIN=0.42;
+const ivec2 C4[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+const int RADII[3]=int[3](1,3,9);
+const float STRENGTH[3]=float[3](0.57,0.30,0.13);
+ivec2 bounds(){return ivec2(p.extent.xy)-ivec2(1);}
+bool finite3(vec3 v){return !any(isnan(v)) && !any(isinf(v));}
+vec3 toLC(vec3 c){return vec3(c.g,c.r-c.g,c.b-c.g);}
+vec3 fromLC(vec3 v){return vec3(v.x+v.y,v.x,v.x+v.z);}
+vec3 lcAt(ivec2 at){return toLC(imageLoad(inputRGB,clamp(at,ivec2(0),bounds())).rgb);}
+float mAt(ivec2 pos){
+    // HDRQ Fourier tiles are 8 packed RGBA (=16 physical Bayer RAW) wide.
+    // The final pass's pad offset maps raw image to that pass's tile grid.
+    const ivec2 grid=ivec2(p.extent.zw);
+    const vec2 q=(vec2(pos+p.geometry.xy)+vec2(0.5))/16.0-vec2(0.5);
+    const vec2 f=fract(q);
+    const ivec2 b=ivec2(floor(q));
+    const ivec2 a=clamp(b,ivec2(0),grid-1);
+    const ivec2 c=clamp(b+ivec2(1,0),ivec2(0),grid-1);
+    const ivec2 d=clamp(b+ivec2(0,1),ivec2(0),grid-1);
+    const ivec2 e=clamp(b+ivec2(1,1),ivec2(0),grid-1);
+    return mix(mix(residualM[a.y*grid.x+a.x],residualM[c.y*grid.x+c.x],f.x),
+               mix(residualM[d.y*grid.x+d.x],residualM[e.y*grid.x+e.x],f.x),f.y);
+}
+float nearCleanNoise(ivec2 pos,float centerLight){
+    float minimum=mAt(pos);
+    // Noise evidence, not RGB texture variance, is the sole neighbor target.
+    // Check real surface brightness before accepting distant comparisons.
+    for(int i=0;i<8;++i){
+        const int d=i<4?64:160;
+        const ivec2 step=C4[i&3]*d;
+        const ivec2 q=clamp(pos+step,ivec2(0),bounds());
+        const float y=imageLoad(inputRGB,q).g;
+        if(!isnan(y) && !isinf(y) &&
+           abs(y-centerLight)<max(0.045,0.36*max(centerLight,0.02)))
+            minimum=min(minimum,mAt(q));
+    }
+    return minimum;
+}
+void main(){
+    const ivec2 q=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(q,ivec2(p.extent.xy))))return;
+    const vec4 orig=imageLoad(inputRGB,q);
+    if(!finite3(orig.rgb) || orig.g<0.00035 ||
+       max(orig.r,max(orig.g,orig.b))>0.97 ||
+       p.geometry.z<2 || p.extent.z==0u || p.extent.w==0u ||
+       (isnan(p.noise.x)||isinf(p.noise.x)) || (isnan(p.noise.y)||isinf(p.noise.y)) ||
+       p.noise.x<=0.0 || p.noise.y<0.0){
+        imageStore(outputRGB,q,orig);return;
+    }
+    const float m=clamp(mAt(q),1.0/float(p.geometry.z),1.0);
+    const float nearM=clamp(nearCleanNoise(q,orig.g),1.0/float(p.geometry.z),1.0);
+    if(!(m>1.25*nearM && m>0.19)){
+        imageStore(outputRGB,q,orig);return;
+    }
+    const float tL=min(m,min(TARGET_L,1.25*nearM))/m;
+    const float tC=min(m,min(TARGET_C,1.25*nearM))/m;
+    const float varRaw=(p.noise.x*max(orig.g,0.0)+p.noise.y)*m;
+    if(!(varRaw>0.0) || (isnan(varRaw)||isinf(varRaw))){
+        imageStore(outputRGB,q,orig);return;
+    }
+    vec3 center=toLC(orig.rgb);
+    vec3 corrected=center;
+    // Conservative luma/chroma noise ratios compensate for the different
+    // sample correlations introduced by AMaZE and keep separate channels.
+    const vec3 expected=vec3(1.625,3.25,3.25)*varRaw;
+    for(int j=0;j<3;++j){
+        const int r=RADII[j];
+        vec3 sum=vec3(0.0),delta2=vec3(0.0);
+        for(int i=0;i<4;++i){
+            const vec3 v=lcAt(q+C4[i]*r);
+            const vec3 d=center-v;
+            sum+=v;
+            delta2+=d*d;
+        }
+        const vec3 band=center-sum*0.25;
+        // E estimates detail above modeled noise, not the noise target.
+        // A coherent edge has strong signal and is therefore preserved.
+        const vec3 E=0.5*(band*band+0.25*delta2);
+        const vec3 detail=max(E-expected,vec3(0.0));
+        const vec3 ratio=vec3(tL,tC,tC);
+        vec3 gain=sqrt((detail+ratio*expected)/max(detail+expected,vec3(1.e-25)));
+        gain=clamp(gain,vec3(MIN_GAIN),vec3(1.0));
+        corrected+=STRENGTH[j]*(gain-vec3(1.0))*band;
+    }
+    vec3 out=fromLC(corrected);
+    const float sigma=sqrt(max(varRaw,1.e-14));
+    // Limit any local delta to a bounded sensor-noise envelope. Prevent
+    // brightness/chroma reshaping of significant reconstructed structures.
+    out=clamp(out,orig.rgb-vec3(2.2*sigma),orig.rgb+vec3(2.2*sigma));
+    if(!finite3(out))out=orig.rgb;
+    imageStore(outputRGB,q,vec4(out,orig.a));
+}
