@@ -1,0 +1,1077 @@
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870PostAmazeChroma.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870PostAmazeChroma.kt
+@@ -37,6 +37,10 @@
+         uniform sampler2D uIris26924SensorClip;
+         uniform int uIris26924ClipPresent;
+         uniform int uIris26924BOff;
++        // 26969 is B OFF only. The map is actual post-AMaZE camera-linear
++        // variation, not Rexture's rejected-frame/noise-estimate map.
++        uniform sampler2D uIris26969NoiseVariance;
++        uniform int uIris26969NoiseEven;
+         layout(location=0) out vec4 oPostWbCameraRgb;
+         const vec3 kY=vec3(0.25,0.50,0.25);
+         float yy(vec3 x){return dot(max(x,vec3(0.0)),kY);}
+@@ -218,6 +222,76 @@
+           vec3 candidate=vec3(g+corrected.x*span,g,g+corrected.y*span);
+           return min(candidate.r,min(candidate.g,candidate.b))>=0.0?candidate:c;
+         }
++        // IRIS_26969_B_OFF_HDRQ_NEIGHBOUR_LUMA_CHROMA_NOISE_EVENING.
++        // Rexture #132's essential principle is to reduce EXCESS grain toward
++        // clean neighbouring regions independently for luminance and chroma,
++        // at multiple frequencies. HDRQ is a different merge: infer a compact
++        // output-variance map from the ACTUAL four-pass reconstructed pixels.
++        // Losing weak texture is acceptable here. Never equalise absolute
++        // scene brightness or force colours to neutral; retain the broadest
++        // base and shrink only the residual bands (1, 4, 16, 32 px).
++        vec3 iris26969LC(vec3 c){return vec3(c.g,c.r-c.g,c.b-c.g);}
++        vec3 iris26969Rgb(vec3 c){return vec3(c.x+c.y,c.x,c.x+c.z);}
++        vec3 iris26969Blur(ivec2 p,int step){
++          const float edge=0.125,corner=0.0625;
++          vec3 sum=0.25*iris26969LC(src(p));
++          sum+=edge*(iris26969LC(src(p+ivec2(step,0)))+
++                     iris26969LC(src(p-ivec2(step,0)))+
++                     iris26969LC(src(p+ivec2(0,step)))+
++                     iris26969LC(src(p-ivec2(0,step))));
++          sum+=corner*(iris26969LC(src(p+ivec2(step,step)))+
++                       iris26969LC(src(p+ivec2(-step,step)))+
++                       iris26969LC(src(p+ivec2(step,-step)))+
++                       iris26969LC(src(p+ivec2(-step,-step))));
++          return sum;
++        }
++        vec4 iris26969Var(ivec2 cell){
++          ivec2 sz=textureSize(uIris26969NoiseVariance,0);
++          return texelFetch(uIris26969NoiseVariance,
++                 clamp(cell,ivec2(0),sz-1),0);
++        }
++        vec3 iris26969Even(ivec2 p,vec3 c){
++          // Fully reconstructed camera-linear image; variance evaluated at
++          // 1/8 scale with no claim of calibrated HDRQ Neff per tile.
++          ivec2 q=p/8;
++          vec4 local=iris26969Var(q);
++          vec3 ref=local.rgb;
++          // ~256px neighbourhood: use the cleaner *comparably exposed*
++          // members; a flat/motion-rejected zone gets the grain of its neighbours.
++          // A single clean neighbour can authorise a reduction; this is
++          // intentionally more aggressive on texture than the old B OFF code.
++          for(int k=0;k<2;k++){
++            int reach=k==0?10:30;
++            for(int d=0;d<4;d++){
++              ivec2 o=d==0?ivec2(reach,0):d==1?ivec2(-reach,0):
++                        d==2?ivec2(0,reach):ivec2(0,-reach);
++              vec4 n=iris26969Var(q+o);
++              if(abs(n.a-local.a)<=max(0.015,0.35*max(local.a,n.a)))
++                ref=min(ref,n.rgb);
++            }
++          }
++          vec3 present=max(local.rgb,vec3(1.0e-9));
++          // A moderate tolerance leaves already-even regions untouched;
++          // floors prevent complete erasure of the original band signal.
++          vec3 target=min(present,1.25*ref);
++          vec3 gain=clamp(sqrt(max(target,vec3(1.0e-10))/present),
++                          vec3(0.30,0.18,0.18),vec3(1.0));
++          // Do not blur clipped/near-white HDR highlights; their RAW noise
++          // cannot be estimated reliably from saturated reconstructed RGB.
++          if(rawClipped(p) || yy(c)>0.88)return c;
++          vec3 b0=iris26969Blur(p,1);
++          vec3 b1=iris26969Blur(p,4);
++          vec3 b2=iris26969Blur(p,16);
++          vec3 b3=iris26969Blur(p,32);
++          vec3 v0=iris26969LC(c);
++          // Reconstruct bands without modifying the coarse local mean.
++          // Chroma is allowed to receive stronger attenuation than green.
++          vec3 coarseGain=mix(gain,vec3(1.0),0.62);
++          vec3 middleGain=mix(gain,vec3(1.0),0.22);
++          vec3 evened=b3+coarseGain*(b2-b3)+middleGain*(b1-b2)+
++                      gain*(b0-b1)+gain*(v0-b0);
++          return max(iris26969Rgb(evened),vec3(0.0));
++        }
+         // Original RAWR Highlight Reconstruction OFF, not its ON guide/repair:
+         // the camera-linear RGB is already normalized to sensor-white. Apply
+         // temporary WB once, then cap ALL three post-WB channels by the SAME
+@@ -239,7 +313,10 @@
+           // WB and shared-ceiling clipping exactly as in successful 26948.
+           // B Super Res ON retains its byte-identical original path.
+           if(uIris26924BOff!=0){
+-            oPostWbCameraRgb=vec4(rawrHighlightOff(raw.rgb),raw.a);
++            vec3 sourceRgb=raw.rgb;
++            if(uIris26969NoiseEven!=0)
++              sourceRgb=iris26969Even(p,sourceRgb);
++            oPostWbCameraRgb=vec4(rawrHighlightOff(sourceRgb),raw.a);
+             return;
+           }
+           vec3 c=max(raw.rgb,vec3(0.0));
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -696,6 +696,7 @@
+     private var iris26857ApplyAmazeWbProgram = 0
+     // Never alias the native post-AMaZE shader with legacy B WB program cache.
+     private var iris26870NativePostAmazeWbProgram = 0
++    private var iris26969HdrqNoiseMeasureProgram = 0
+     /* IRIS_26858_B_PRIVATE_PROGRAM_LIFETIME: linkProgram registers each program
+      * in inherited release(); never link any of these on Experiment A. */
+     private var iris26861BWeightedIdentityProgram = 0
+@@ -7159,6 +7160,7 @@
+         // temporary WB interval must surround Lab/FCC; it must not leak into
+         // the final Iris calibrated sensor-RGB renderer. 1.0x/zoom/2x share it.
+         var temporaryPostWb = 0
++        var iris26969NoiseVariance = 0
+         var bLensCorrected26859 = 0
+         var bNoiseCorrected26863 = 0
+         var bRecovered26858 = 0
+@@ -7217,6 +7219,31 @@
+                 iris26857ApplyAmazeWbProgram
+             }
+             temporaryPostWb = createTexture(processingWidth, processingHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++            // 26969: HDRQ B OFF only, measured CAMERA-LINEAR grain. Low-res
++            // variance map is produced BEFORE binding the reconstructed RGB
++            // sampler for the existing temporary-WB pass; texture creation
++            // must not unbind the latter. No Rexture frame map is invented.
++            val iris26969HdrqBOff = rawrNativeReceipt26864 != null &&
++                !iris26856BTrue2x && !lkrNativeFullRgb26931 &&
++                processingWidth == width && processingHeight == height
++            if (iris26969HdrqBOff) {
++                if (iris26969HdrqNoiseMeasureProgram == 0) {
++                    iris26969HdrqNoiseMeasureProgram = linkProgram(
++                        GlesIris26969HdrqNoiseEven.measure,
++                        "iris_26969_hdrq_b_off_actual_grain_measure")
++                }
++                iris26969NoiseVariance = createTexture(
++                    (processingWidth + 7) / 8, (processingHeight + 7) / 8,
++                    GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++                val measure = iris26969HdrqNoiseMeasureProgram
++                GLES30.glUseProgram(measure)
++                bindTexture(measure, "uIris26969CameraLinear", 0, amazePostWbCameraRgb)
++                uniform2i(measure, "uIris26969Size", processingWidth, processingHeight)
++                draw(measure, (processingWidth + 7) / 8, (processingHeight + 7) / 8,
++                    intArrayOf(iris26969NoiseVariance))
++                GlesGpuScheduler.memoryBarrier()
++                checkGlError("26969 HDRQ B OFF neighbour noise measurement")
++            }
+             GLES30.glUseProgram(applyProgram)
+             // 26927 B ON: the LSC map upload temporarily binds then unbinds the
+             // current GL_TEXTURE_2D unit. Allocate the map BEFORE the shader's
+@@ -7237,6 +7264,11 @@
+                 val safeClip26924 = nativeSensorClipFullRes26866!=0 &&
+                     processingWidth==width && processingHeight==height
+                 uniform1i(applyProgram,"uIris26924BOff",if(!iris26856BTrue2x) 1 else 0)
++                uniform1i(applyProgram,"uIris26969NoiseEven",if(iris26969HdrqBOff) 1 else 0)
++                if(iris26969HdrqBOff) {
++                    check(iris26969NoiseVariance != 0) { "26969 B OFF noise-map ownership missing" }
++                    bindTexture(applyProgram,"uIris26969NoiseVariance",4,iris26969NoiseVariance)
++                }
+                 uniform1i(applyProgram,"uIris26924ClipPresent",if(safeClip26924) 1 else 0)
+                 if(safeClip26924) bindTexture(applyProgram,"uIris26924SensorClip",2,
+                     nativeSensorClipFullRes26866)
+@@ -7398,6 +7430,8 @@
+             succeeded = true
+             return neutral
+         } finally {
++            if (iris26969NoiseVariance != 0) releaseOwnedTexture(iris26969NoiseVariance,
++                "26969 HDRQ B OFF measured neighbour noise consumed")
+             if (temporaryPostWb != 0) releaseOwnedTexture(temporaryPostWb, "26857 consumed Lab temporary WB input")
+             if (bNoiseCorrected26863 != 0) releaseOwnedTexture(bNoiseCorrected26863,
+                 "26863 B noise-aware post-LSC RGB consumed")
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -893,12 +893,17 @@
+                  * NO AE-OFF/manual preview loop, FPS mutation, post-shutter wait
+                  * or competing RAW histogram AE controller. */
+                 if (iris26871BExposureSelected()) {
+-                    iris26909ObserveBContinuousShutterFirst(request, result);
++                    if (iris26969RawrAeSelected()) {
++                        iris26969AuditAeResult(request, result);
++                    } else {
++                        iris26909ObserveBContinuousShutterFirst(request, result);
++                    }
+                     /* IRIS_26910_DISPLAY_ONLY_DARK_B_PREVIEW
+                      * Record a per-physical-frame preview gain, never write
+                      * HAL metering/shutter or RAW/JPEG, only after real sensor
+                      * manual ownership is proven by this result's request. */
+-                    iris26910RecordDarkBPreviewGain(request, result);
++                    if (!iris26969RawrAeSelected())
++                        iris26910RecordDarkBPreviewGain(request, result);
+                     iris26911RecordPreviewStage(request, result);
+                 } else {
+                     iris26908ObserveContinuousZslShutterPriority(result);
+@@ -1001,6 +1006,9 @@
+                         mZslResultMap.remove(oldest);
+                     }
+                 }
++                // The ImageReader and TotalCaptureResult can be delivered in
++                // either order. Consume only the exact SENSOR_TIMESTAMP pair.
++                if (iris26969RawrAeSelected()) iris26969DriveAeFromExactRawResult();
+                 Long requestedExposure =
+                         request.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
+                 Long actualMotionExposure =
+@@ -2001,8 +2009,10 @@
+         synchronized (mMotion26662PreviewResultLock) {
+             int slot = mMotion26662PreviewResultWriteIndex % MOTION_26662_PREVIEW_RESULT_HISTORY;
+             mMotion26662PreviewResultTimestampNs[slot] = sensorTimestampNs;
+-            mMotion26662PreviewResultProtectionEv[slot] = Math.max(-MOTION_26709_MAX_RELATIVE_EV,
+-                    Math.min(MOTION_26709_MAX_RELATIVE_EV, protectionEv));
++            final float iris26969Limit = iris26969RawrAeSelected()
++                    ? 2.0f : MOTION_26709_MAX_RELATIVE_EV;
++            mMotion26662PreviewResultProtectionEv[slot] = Math.max(-iris26969Limit,
++                    Math.min(iris26969Limit, protectionEv));
+             mMotion26662PreviewResultWriteIndex++;
+         }
+     }
+@@ -3159,9 +3169,23 @@
+             double signalSum = 0.0;
+             double[] iris26711TileSum = new double[MOTION_26711_SCENE_TILES];
+             int[] iris26711TileCount = new int[MOTION_26711_SCENE_TILES];
++            // 26969: one green/quad histogram and one max-channel histogram
++            // measured on the exact RAW whose timestamp later matches its
++            // Camera2 result; never use the last requested exposure as if
++            // it were the physical exposure of this image.
++            final boolean iris26969SampleAe = iris26969RawrAeSelected();
++            final int[] iris26969KeyBins = iris26969SampleAe
++                    ? new int[Iris26969RawrAeMetering.BINS] : null;
++            final int[] iris26969ChannelBins = iris26969SampleAe
++                    ? new int[Iris26969RawrAeMetering.BINS] : null;
++            int iris26969ClippedQuads = 0;
++            int iris26969ObservedQuads = 0;
+ 
+             for (int y = 2; y < height - 2; y += stepY) {
+                 for (int x = 2; x < width - 2; x += stepX) {
++                    float iris26969QuadSignal = 0.0f;
++                    float iris26969QuadMax = 0.0f;
++                    int iris26969QuadSamples = 0;
+                     for (int dy = 0; dy < 2; dy++) {
+                         for (int dx = 0; dx < 2; dx++) {
+                             int sx = x + dx;
+@@ -3185,6 +3209,11 @@
+ 
+                             signalSum += signal;
+                             count++;
++                            if (iris26969SampleAe) {
++                                iris26969QuadSignal += signal;
++                                iris26969QuadMax = Math.max(iris26969QuadMax, signal);
++                                iris26969QuadSamples++;
++                            }
+                             int iris26711TileX = Math.min(3, Math.max(0, (sx * 4) / Math.max(1, width)));
+                             int iris26711TileY = Math.min(3, Math.max(0, (sy * 4) / Math.max(1, height)));
+                             int iris26711Tile = iris26711TileY * 4 + iris26711TileX;
+@@ -3195,6 +3224,13 @@
+                             if (signal <= 0.040f) shadowCount++;
+                             if (signal >= 0.980f) highlightCount++;
+                         }
++                    }
++                    if (iris26969SampleAe && iris26969QuadSamples == 4) {
++                        final float key = iris26969QuadSignal * 0.25f;
++                        iris26969KeyBins[iris26969RawBin(key)]++;
++                        iris26969ChannelBins[iris26969RawBin(iris26969QuadMax)]++;
++                        iris26969ObservedQuads++;
++                        if (iris26969QuadMax >= 0.95f) iris26969ClippedQuads++;
+                     }
+                 }
+             }
+@@ -3210,6 +3246,12 @@
+             mMotion26380RawMeanSignal = (float) (signalSum / count);
+             mMotion26380RawSampleCount =
+                     (int) Math.min(Integer.MAX_VALUE, count);
++            if (iris26969SampleAe && iris26969ObservedQuads >= 96) {
++                iris26969PublishRawMeter(new Iris26969RawHistogram(
++                        mIris26548CameraHealthGeneration, image.getTimestamp(),
++                        iris26969KeyBins, iris26969ChannelBins,
++                        iris26969ClippedQuads / (double)iris26969ObservedQuads));
++            }
+ 
+             /* IRIS_26711_WHOLE_FRAME_SCENE_SIGNATURE
+              * Exposure-normalized 4x4 RAW structure. Requiring 12/16 tiles to change makes TV,
+@@ -4674,6 +4716,309 @@
+      * This preserves one RAW + preview repeating stream and avoids the old
+      * 26412/26710 competing reactive writers and their visible flashing.
+      */
++    /* IRIS_26969_RAWR_AE_B_OFF_EXACT_RAW_HISTOGRAM_OWNER
++     * Camera2 RAW ImageReader and TotalCaptureResult callback ordering is not
++     * guaranteed. The only legal AE observation is a matched physical result
++     * and RAW histogram from one sensor timestamp in the same lens generation.
++     * RAWR AE is active without a flicker precondition; Camera2-reported
++     * scene flicker changes only the optional 50/60-Hz shutter snap.
++     * This controller never touches A, B Super Res ON, Night, user manual,
++     * vendor/sensor code or the HDRQ merge itself. */
++    private static final class Iris26969RawHistogram {
++        final long generation, sensorTimestampNs;
++        final int[] keyBins, channelBins;
++        final double clippedFraction;
++        Iris26969RawHistogram(long generation, long ts, int[] key, int[] channel,
++                              double clipped) {
++            this.generation=generation; this.sensorTimestampNs=ts;
++            keyBins=key.clone();channelBins=channel.clone();clippedFraction=clipped;
++        }
++    }
++    private static final class Iris26969RequestedPair {
++        final long generation, shutterNs;
++        final int iso;
++        final double logTarget;
++        Iris26969RequestedPair(long g,long s,int i,double t) {
++            generation=g;shutterNs=s;iso=i;logTarget=t;
++        }
++    }
++    private final Object mIris26969AeLock = new Object();
++    private final java.util.HashMap<Long,Iris26969RawHistogram> mIris26969AeRaw =
++            new java.util.HashMap<>();
++    private final java.util.HashMap<Long,Float> mIris26969AeResultGain =
++            new java.util.HashMap<>();
++    private final java.util.ArrayDeque<Iris26969RequestedPair> mIris26969AeRequests =
++            new java.util.ArrayDeque<>();
++    private final Iris26969RawrAeLoop mIris26969AeLoop = new Iris26969RawrAeLoop();
++    private long mIris26969AeGeneration = -1L;
++    private long mIris26969LastProcessedRawTs = 0L;
++    private long mIris26969LastRequestElapsedMs = 0L;
++    private int mIris26969LastFlickerCode = 0;
++    private int mIris26969ManualMismatchCount = 0;
++    private static final int IRIS_26969_AE_MAX_RAW_HISTORY = 40;
++    private static final int IRIS_26969_AE_MAX_GAIN_HISTORY = 80;
++
++    private boolean iris26969RawrAeSelected() {
++        return iris26871BExposureSelected() && !PreferenceKeys.isIrisSuperResOn()
++                && !mIrisNight26540CaptureActive && !mIsRecordingVideo && isZslMode();
++    }
++
++    private static int iris26969RawBin(float normalized) {
++        double ev = Math.log(Math.max(1.0 / 65536.0, normalized)) / Math.log(2.0);
++        return (int)Math.max(0,Math.min(Iris26969RawrAeMetering.BINS-1,
++                Math.floor((ev+16.0) * Iris26969RawrAeMetering.BINS / 17.0)));
++    }
++
++    private void iris26969PublishRawMeter(@NonNull Iris26969RawHistogram histogram) {
++        synchronized (mIris26969AeLock) {
++            if (histogram.generation != mIris26548CameraHealthGeneration ||
++                    histogram.sensorTimestampNs <= mIris26969LastProcessedRawTs) return;
++            mIris26969AeRaw.put(histogram.sensorTimestampNs, histogram);
++            while (mIris26969AeRaw.size() > IRIS_26969_AE_MAX_RAW_HISTORY)
++                mIris26969AeRaw.remove(java.util.Collections.min(mIris26969AeRaw.keySet()));
++        }
++    }
++
++    private void iris26969ResetAeGeneration(long generation) {
++        synchronized (mIris26969AeLock) {
++            mIris26969AeRaw.clear();mIris26969AeResultGain.clear();
++            mIris26969AeRequests.clear();mIris26969AeLoop.reset();
++            mIris26969AeGeneration=generation;mIris26969LastProcessedRawTs=0L;
++            mIris26969LastFlickerCode=0;mIris26969LastRequestElapsedMs=0L;
++            mIris26969ManualMismatchCount=0;
++        }
++    }
++
++    /* The next actual Camera2 result may arrive before or after the RAW;
++     * scan only exact matching timestamps and never re-apply an old sample. */
++    private void iris26969DriveAeFromExactRawResult() {
++        if (!iris26969RawrAeSelected() || iris26909UserManualExposure() ||
++                mIsRecordingVideo || mZslCapturing || burst || isProcessing ||
++                mState != STATE_PREVIEW || mPreviewRequestBuilder == null ||
++                mCaptureSession == null || mCameraCharacteristics == null ||
++                mIris26909ManualUnavailable) return;
++        final long generation=mIris26548CameraHealthGeneration;
++        if (generation != mIris26969AeGeneration) {
++            iris26969ResetAeGeneration(generation);
++            // Set 26909's per-physical-generation state only for this B OFF
++            // owner; it is not a second parallel AE writer.
++            mIris26909ManualGeneration=generation;
++            mIris26909ManualActive=false;
++            mIris26909ManualUnavailable=false;
++            mIris26909ManualSeen=0;
++            mIris26909ManualViolations=0;
++        }
++        final java.util.HashMap<Long,TotalCaptureResult> available;
++        synchronized (mZslBufferLock) { available=new java.util.HashMap<>(mZslResultMap); }
++        Iris26969RawHistogram raw=null;
++        TotalCaptureResult matched=null;
++        synchronized (mIris26969AeLock) {
++            long newest=mIris26969LastProcessedRawTs;
++            for (java.util.Map.Entry<Long,Iris26969RawHistogram> e : mIris26969AeRaw.entrySet()) {
++                final long ts=e.getKey();
++                final TotalCaptureResult candidate=available.get(ts);
++                if (ts>newest && candidate != null &&
++                        e.getValue().generation==generation &&
++                        candidate.getRequest()!=null && candidate.getRequest().getTag()==null) {
++                    newest=ts;raw=e.getValue();matched=candidate;
++                }
++            }
++            if (raw==null) return;
++            mIris26969LastProcessedRawTs=newest;
++            final long consumed=newest;
++            mIris26969AeRaw.keySet().removeIf(x->x<=consumed);
++        }
++        final Long observedShutter=matched.get(CaptureResult.SENSOR_EXPOSURE_TIME);
++        final Integer observedIso=matched.get(CaptureResult.SENSOR_SENSITIVITY);
++        final Integer aeMode=matched.get(CaptureResult.CONTROL_AE_MODE);
++        if (observedShutter==null||observedShutter<=0L||observedIso==null||observedIso<=0||
++                aeMode==null) return;
++        // HAL is a permitted short initial metering state. Once RAWR AE
++        // engages, accept only physical AE-OFF matched repeating samples.
++        if (!mIris26909ManualActive && aeMode != CaptureResult.CONTROL_AE_MODE_ON)
++            return;
++        if (mIris26909ManualActive && aeMode != CaptureResult.CONTROL_AE_MODE_OFF)
++            return;
++        if (!mIris26909ManualActive &&
++                (!mMotion26713RecipeReady || mMotion26713ObservationPending ||
++                 mMotion26713RecipeGeneration != generation ||
++                 !motion26713ManualSensorAvailable())) return;
++        final Range<Long> shutterRange=mCameraCharacteristics.get(
++                CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
++        final Range<Integer> isoRange=mCameraCharacteristics.get(
++                CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
++        final Long frameMax=mCameraCharacteristics.get(
++                CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION);
++        if (shutterRange==null || isoRange==null || shutterRange.getLower()<=0L ||
++                isoRange.getLower()<=0) return;
++        final Iris26969RawrAeMath.Limits limits=new Iris26969RawrAeMath.Limits();
++        limits.isoMin=isoRange.getLower();limits.isoMax=isoRange.getUpper();
++        final Integer analogMax=mCameraCharacteristics.get(
++                CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY);
++        limits.isoAnalogMax=analogMax!=null&&analogMax>=limits.isoMin
++                ?Math.min(analogMax,limits.isoMax):limits.isoMax;
++        limits.shutterMinNs=shutterRange.getLower();
++        limits.shutterMaxNs=Math.min(shutterRange.getUpper(),
++                Iris26969RawrAeMath.DEFAULT_MAX_STILL_SHUTTER_NS);
++        if (frameMax!=null&&frameMax>limits.shutterMinNs)
++            limits.shutterMaxNs=Math.min(limits.shutterMaxNs,frameMax-1L);
++        if (limits.shutterMaxNs<limits.shutterMinNs) return;
++        limits.shutterStartNs=Math.min(limits.shutterMaxNs,
++                Iris26969RawrAeMath.DEFAULT_START_SHUTTER_NS);
++        limits.maxDigitalGainEv=2.0f;
++        final Float apertureResult=matched.get(CaptureResult.LENS_APERTURE);
++        final int sceneFlicker=matched.get(CaptureResult.STATISTICS_SCENE_FLICKER)==null
++                ?0:matched.get(CaptureResult.STATISTICS_SCENE_FLICKER);
++        if (sceneFlicker==CaptureResult.STATISTICS_SCENE_FLICKER_50HZ ||
++                sceneFlicker==CaptureResult.STATISTICS_SCENE_FLICKER_60HZ)
++            mIris26969LastFlickerCode=sceneFlicker; // RAWR: sticky as AE OFF may cease reporting it
++        final long period=mIris26969LastFlickerCode==CaptureResult.STATISTICS_SCENE_FLICKER_50HZ
++                ?Iris26969RawrAeMath.PERIOD_50_HZ_NS:
++                mIris26969LastFlickerCode==CaptureResult.STATISTICS_SCENE_FLICKER_60HZ
++                        ?Iris26969RawrAeMath.PERIOD_60_HZ_NS:0L;
++        final Iris26969RawrAeMetering.Frame frame;
++        try {
++            frame=new Iris26969RawrAeMetering.Frame(raw.sensorTimestampNs,
++                    observedShutter,observedIso,
++                    apertureResult!=null?apertureResult:1.8f,
++                    raw.keyBins,raw.channelBins,raw.clippedFraction);
++        } catch (IllegalArgumentException e) { return; }
++        final Iris26969RawrAeLoop.Step step;
++        try { step=mIris26969AeLoop.update(frame,limits,period,0.0f,0.0); }
++        catch (IllegalArgumentException e) {
++            Log.w(TAG,"IRIS_26969_RAWR_AE_INVALID_INPUT reason="+e.getClass().getSimpleName());
++            return;
++        }
++        if (step==null) return;
++        final long nextShutter=step.request.shutterNs;
++        final int nextIso=step.request.iso;
++        if (nextShutter<=0L||nextIso<limits.isoMin||nextIso>limits.isoAnalogMax) return;
++        final long marginNs=1_000_000L;
++        final long nextDuration=Math.max(nextShutter+marginNs,limits.shutterStartNs);
++        if (frameMax!=null&&nextDuration>frameMax) return;
++        // Do not interrupt an ongoing shutter batch; the same pair must
++        // remain stable for a normal ZSL epoch. RAWR's critically damped
++        // filter continues tracking the scene between eligible submissions.
++        final long now=android.os.SystemClock.elapsedRealtime();
++        if (mIris26909ManualActive) {
++            if (now-mIris26969LastRequestElapsedMs<175L) return;
++            final double oldLog=Math.log(mIris26909ManualShutterNs*(double)mIris26909ManualIso)/Math.log(2.0);
++            final double newLog=Math.log(nextShutter*(double)nextIso)/Math.log(2.0);
++            if (Math.abs(oldLog-newLog)<0.085 &&
++                    Math.abs(nextShutter/(double)mIris26909ManualShutterNs-1.0)<0.09 &&
++                    Math.abs(nextIso/(double)mIris26909ManualIso-1.0)<0.09) return;
++        }
++        final long prevShutter=mIris26909ManualShutterNs;
++        final int prevIso=mIris26909ManualIso;
++        final long prevDuration=mIris26909ManualFrameDurationNs;
++        final boolean prevActive=mIris26909ManualActive;
++        final Range<Integer> oldFps=mPreviewRequestBuilder.get(
++                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE);
++        try {
++            mIris26909ManualShutterNs=nextShutter;
++            mIris26909ManualIso=nextIso;
++            mIris26909ManualFrameDurationNs=nextDuration;
++            mIris26909ManualGeneration=generation;
++            mIris26909ManualActive=true;
++            iris26909PutBManualOnBuilder();
++            if(!rebuildPreviewBuilder()) throw new IllegalStateException("RAWR_AE_submit_failure");
++            mIris26969LastRequestElapsedMs=now;
++            synchronized(mIris26969AeLock) {
++                mIris26969AeRequests.addLast(new Iris26969RequestedPair(
++                        generation,nextShutter,nextIso,step.targetLogExposure));
++                while(mIris26969AeRequests.size()>24)mIris26969AeRequests.removeFirst();
++            }
++            Log.i(TAG,"IRIS_26969_RAWR_AE_APPLIED shutterNs="+nextShutter+
++                    " iso="+nextIso+" digitalEv="+step.request.digitalGainEv+
++                    " sceneEv100="+step.scene.sceneEv100+
++                    " highlightGuardEv="+step.scene.guardEv+
++                    " flickerPeriodNs="+period+
++                    " rawTimestamp="+frame.timestampNs+
++                    " shutterMaxNs="+limits.shutterMaxNs+
++                    " preserveZslPairEpoch=true");
++        } catch (IllegalArgumentException|IllegalStateException e) {
++            mIris26909ManualShutterNs=prevShutter;
++            mIris26909ManualIso=prevIso;
++            mIris26909ManualFrameDurationNs=prevDuration;
++            mIris26909ManualActive=prevActive;
++            if(prevActive){
++                iris26909PutBManualOnBuilder();
++                if(!rebuildPreviewBuilder()) iris26909ReleaseBManualToHal("26969_submit_failure",true);
++            }else{
++                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,CaptureRequest.CONTROL_AE_MODE_ON);
++                mPreviewRequestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME,null);
++                mPreviewRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY,null);
++                mPreviewRequestBuilder.set(CaptureRequest.SENSOR_FRAME_DURATION,null);
++                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,oldFps);
++                rebuildPreviewBuilder();
++                mIris26909ManualUnavailable=true;
++            }
++            Log.e(TAG,"IRIS_26969_RAWR_AE_REVERT reason="+e.getClass().getSimpleName());
++        }
++    }
++
++    private void iris26969AuditAeResult(@NonNull CaptureRequest req,
++                                       @NonNull TotalCaptureResult result) {
++        if (!iris26969RawrAeSelected()) return;
++        final Long ts=result.get(CaptureResult.SENSOR_TIMESTAMP);
++        final Long shutter=result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
++        final Integer iso=result.get(CaptureResult.SENSOR_SENSITIVITY);
++        final Long requestedShutter=req.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
++        final Integer requestedIso=req.get(CaptureRequest.SENSOR_SENSITIVITY);
++        final Integer requestedAe=req.get(CaptureRequest.CONTROL_AE_MODE);
++        if(ts==null||ts<=0L||shutter==null||shutter<=0L||iso==null||iso<=0||
++                requestedShutter==null||requestedIso==null||requestedAe==null||
++                requestedAe!=CaptureRequest.CONTROL_AE_MODE_OFF ||
++                (req.getTag()!=null && !(req.getTag() instanceof Motion26598NormalTopUpTag)))
++            return;
++        final boolean repeating = req.getTag()==null;
++        final Integer actualAe=result.get(CaptureResult.CONTROL_AE_MODE);
++        final boolean honored=actualAe!=null && actualAe==CaptureResult.CONTROL_AE_MODE_OFF &&
++                Math.abs(shutter/(double)requestedShutter-1.0)<=0.08 &&
++                Math.abs(iso/(double)requestedIso-1.0)<=0.20;
++        if (!honored) {
++            if (repeating && ++mIris26969ManualMismatchCount>=4) {
++                iris26909ReleaseBManualToHal("26969_hal_rejects_rawr_ae",true);
++                motion26713CancelRecipe("26969_manual_rejected");
++            }
++            return;
++        }
++        if (repeating) {
++            mIris26969ManualMismatchCount=0;
++            mIris26909ManualSeen++;
++        }
++        Iris26969RequestedPair activePlan=null;
++        synchronized(mIris26969AeLock) {
++            for(Iris26969RequestedPair p:mIris26969AeRequests) {
++                if(p.generation==mIris26548CameraHealthGeneration &&
++                        p.shutterNs==requestedShutter && p.iso==requestedIso) activePlan=p;
++            }
++        }
++        if(activePlan==null) return;
++        final double logActual=Math.log(shutter*(double)iso)/Math.log(2.0);
++        final float gain=(float)Math.max(0.0,Math.min(2.0,activePlan.logTarget-logActual));
++        synchronized(mIris26969AeLock) {
++            mIris26969AeResultGain.put(ts,gain);
++            while(mIris26969AeResultGain.size()>IRIS_26969_AE_MAX_GAIN_HISTORY)
++                mIris26969AeResultGain.remove(java.util.Collections.min(mIris26969AeResultGain.keySet()));
++        }
++        if (repeating) recordMotion26662PreviewProtection(ts,gain);
++    }
++
++    private boolean iris26969HasPhotoGainAt(long sensorTimestampNs) {
++        synchronized(mIris26969AeLock) {
++            return sensorTimestampNs>0L && mIris26969AeResultGain.containsKey(sensorTimestampNs);
++        }
++    }
++
++    private float iris26969PhotoDigitalGainAt(long sensorTimestampNs) {
++        if(sensorTimestampNs<=0L)return 0.0f;
++        synchronized(mIris26969AeLock) {
++            final Float gain=mIris26969AeResultGain.get(sensorTimestampNs);
++            return gain==null?0.0f:Math.max(0.0f,Math.min(2.0f,gain));
++        }
++    }
++
+     private volatile long mIris26909ManualGeneration = -1L;
+     private volatile boolean mIris26909ManualActive = false;
+     private boolean mIris26909ManualUnavailable = false;
+@@ -6008,6 +6353,11 @@
+      * The capture recipe's still requests are separate builders and untouched. */
+     public boolean iris26910PreserveBManualExposure() {
+         return iris26909OwnsManualPreview() && !iris26909UserManualExposure();
++    }
++    /** 26969: bypass legacy 26911 HAL-brightness overlay when RAWR AE
++     * already supplies the exact frame's sensor/postRAW brightness target. */
++    public boolean iris26969PreviewAeActive() {
++        return iris26969RawrAeSelected() && iris26910PreserveBManualExposure();
+     }
+     private void iris26910GuardPreviewExposure() {
+         if (iris26910PreserveBManualExposure()) iris26909PutBManualOnBuilder();
+@@ -9554,6 +9904,20 @@
+         frame.motionV2ReferenceProtectionEv = shortRole ? 0.0f
+                 : Math.max(0.0f, Math.min(MOTION_26709_MAX_RELATIVE_EV,
+                         mMotion26709FrozenCaptureProtectionEv));
++        // 26969: only exact physical B-off NORMAL may carry the AE target's
++        // shortfall beyond analog ISO. SHORT and all other modes remain zero.
++        boolean iris26969OwnedNormal = !shortRole &&
++                "B".equals(frame.motionV2ReconstructionExperiment26856) &&
++                !mMotion26575SuperResAtShutter && ts!=null &&
++                iris26969HasPhotoGainAt(ts);
++        frame.motionV2RawrAeDigitalGainEv26969 = iris26969OwnedNormal
++                ? iris26969PhotoDigitalGainAt(ts) : 0.0f;
++        if (iris26969OwnedNormal) {
++            // RAWR AE's matched histogram is already the sensor-exposure
++            // target. The old frozen HAL underexposure is no longer a second
++            // brightness authority for a RAWR-owned NORMAL.
++            frame.motionV2ReferenceProtectionEv=0.0f;
++        }
+         if(ts!=null)frame.motionV2ResultSensorTimestampNs=ts;frame.motionV2FrameNumber=result.getFrameNumber();
+         if(skew!=null)frame.motionV2RollingShutterSkewNs=skew;if(focus!=null)frame.motionV2FocusDistanceDiopters=focus;
+         if(lens!=null)frame.motionV2LensState=lens;
+@@ -10695,6 +11059,10 @@
+                     return;
+                 }
+                 plan.recordTopUpResult(ticket, result);
++                // A top-up is a frozen NORMAL at the same physical pair, not
++                // a new AE observation. Retain its matched RAWR digital target
++                // for JPEG/optional DNG metadata just like repeating NORMALs.
++                if(plan.iris26906BOffAllNormal) iris26969AuditAeResult(request,result);
+                 synchronized (mZslBufferLock) {
+                     mZslResultMap.put(ts, result);
+                     while (mZslResultMap.size() > MAX_ZSL_RESULT_METADATA) {
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+@@ -64,6 +64,8 @@
+      * This never changes RAW normalization or bracket ratios; presentation may compensate it once.
+      */
+     public float motionV2ReferenceProtectionEv = 0.0f;
++    /* 26969: exact timestamp-owned RAWR AE digital shortfall, B SR OFF NORMAL only. */
++    public float motionV2RawrAeDigitalGainEv26969 = 0.0f;
+     public float motionV2NoiseS = Float.NaN;
+     public float motionV2NoiseO = Float.NaN;
+     /* IRIS_26490_PER_FRAME_RADIOMETRIC_CALIBRATION
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1257,8 +1257,11 @@
+                 ? Math.max(0.0f, Math.min(1.50f,
+                         basePipeline.mParameters.motionV2ReferenceProtectionEv))
+                 : 0.0f;
++        final float iris26969DigitalEv = basePipeline.mParameters.motionV2Active
++                ? Math.max(0.0f,Math.min(2.0f,
++                        basePipeline.mParameters.motionV2RawrAeDigitalGainEv26969)) : 0.0f;
+         final float iris26662ReferenceRestoreGain =
+-                (float)Math.pow(2.0, iris26662ReferenceProtectionEv);
++                (float)Math.pow(2.0, iris26662ReferenceProtectionEv + iris26969DigitalEv);
+         if (basePipeline.mParameters.motionV2Active
+                 && iris26662ReferenceRestoreGain > 1.0001f) {
+             /* IRIS_26662_CANONICAL_HDR_REFERENCE_NORMALIZATION
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -155,7 +155,10 @@
+             ArrayList<Float> previewLuma = collectPreviewMidtones(preview);
+             float referenceProtectionEv = iris26550Night ? 0.0f : clamp(
+                     basePipeline.mParameters.motionV2ReferenceProtectionEv, 0.0f, 1.50f);
+-            float referenceRestoreGain = (float)Math.pow(2.0, referenceProtectionEv);
++            final float iris26969ReferenceDigitalEv = Math.max(0.0f,Math.min(2.0f,
++                    basePipeline.mParameters.motionV2RawrAeDigitalGainEv26969));
++            float referenceRestoreGain = (float)Math.pow(2.0,
++                    referenceProtectionEv+iris26969ReferenceDigitalEv);
+             ArrayList<RgbSample> candidate = collectCandidateSamples(
+                     previousNode.WorkingTexture, preview.getWidth(), preview.getHeight(),
+                     referenceRestoreGain);
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -265,6 +265,13 @@
+                 0.0f
+             } else {
+                 reference.motionV2ReferenceProtectionEv.coerceIn(0.0f, 1.50f)
++            }
++            parameters.motionV2RawrAeDigitalGainEv26969 = if (parameters.irisNightActive ||
++                reference.motionV2ReconstructionExperiment26856 != "B" ||
++                !java.lang.Float.isFinite(reference.motionV2RawrAeDigitalGainEv26969)) {
++                0.0f
++            } else {
++                reference.motionV2RawrAeDigitalGainEv26969.coerceIn(0.0f, 2.0f)
+             }
+             PLog.i(TAG, "IRIS_26709_ADAPTIVE_NORMAL_REFERENCE_HANDOFF " +
+                 "night=${parameters.irisNightActive} referenceTimestamp=${mgcBase.timestamp} " +
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -66,6 +66,8 @@
+      * It is presentation metadata only: RAW/Sabre/DNG/long-frame exposure ratios never consume it.
+      */
+     public float motionV2ReferenceProtectionEv = 0.0f;
++    /* B OFF 26969 RAWR AE: per-reference physical digital target, not source exposure. */
++    public float motionV2RawrAeDigitalGainEv26969 = 0.0f;
+     /* IRIS_26582_SCENE_ADAPTIVE_GLOBAL_TONE_STATE
+      * Decision-only presentation state produced by MotionV2ViewfinderExposureMatcher from its
+      * existing low-resolution candidate probe. No RAW/capture/DNG owner consumes these fields.
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+@@ -249,13 +249,15 @@
+                     iris26553FrameTimestamp);
+             if (Float.isFinite(exactEv)) {
+                 float targetEv = Math.max(0.0f, exactEv);
+-                if (iris26872Eligible && iris26663Controller.iris26910PreserveBManualExposure()) {
++                if (iris26872Eligible && iris26663Controller.iris26910PreserveBManualExposure()
++                        && !iris26663Controller.iris26969PreviewAeActive()) {
+                     /* Preserve the *observed* bright HAL appearance across
+                      * the 26909 AE-ON -> AE-OFF transition. Only a measured
+                      * low-light preview ISP brightness drop may add EV. */
+                     targetEv = Math.max(targetEv, mIris26911Preview.liftEv());
+                 }
+-                if (iris26663Controller.iris26910PreserveBManualExposure()) {
++                if (iris26663Controller.iris26910PreserveBManualExposure()
++                        && !iris26663Controller.iris26969PreviewAeActive()) {
+                     /* IRIS_26910_DARK_B_PREVIEW_ONLY_SLEW
+                      * Smooth only new B manual low-light presentation lift;
+                      * A/HAL Auto and all preexisting preview behavior remain
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726968
+-VERSION_BUILD=26968
++VERSION_NAME=0.9726969
++VERSION_BUILD=26969
+--- /dev/null
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26969HdrqNoiseEven.kt
+@@ -0,0 +1,42 @@
++package com.hinnka.mycamera.processor
++
++/**
++ * IRIS_26969_HDRQ_B_OFF_NEIGHBOUR_GRAIN_EVENING.
++ * The Rexture merge's effective-frame map is NOT an HDR+ Quality map. We do not
++ * borrow it or invent per-pixel HDRQ frame counts. Instead this source-domain
++ * 1/8-resolution texture measures actual output grain by neighbouring camera-
++ * linear green and R-G/B-G variance after the four-pass HDRQ merge + AMaZE.
++ * The temporary texture is only ~1/64 of a full RGBA image. The consumer is
++ * B Super Res OFF only, prior to WB/Lab/SDR/UHDR; A, B ON, Night and Spektra
++ * never use it. Adapts the noise-equalisation PRINCIPLE of RAWR Rexture #132,
++ * not Rexture's confidence semantics or shader implementation.
++ */
++internal object GlesIris26969HdrqNoiseEven {
++    val measure = """#version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uIris26969CameraLinear;
++        uniform ivec2 uIris26969Size;
++        layout(location=0) out vec4 oVariance;
++        vec3 lc(ivec2 p) {
++            vec3 v=max(texelFetch(uIris26969CameraLinear,
++                clamp(p,ivec2(0),uIris26969Size-1),0).rgb,vec3(0.0));
++            return vec3(v.g,v.r-v.g,v.b-v.g);
++        }
++        void main() {
++            ivec2 base=ivec2(gl_FragCoord.xy)*8;
++            vec3 mean=vec3(0.0);
++            for(int y=0;y<4;y++) for(int x=0;x<4;x++)
++                mean+=lc(base+ivec2(x*2+1,y*2+1));
++            mean*=0.0625;
++            vec3 v=vec3(0.0);
++            for(int y=0;y<4;y++) for(int x=0;x<4;x++) {
++                vec3 d=lc(base+ivec2(x*2+1,y*2+1))-mean;
++                v+=d*d;
++            }
++            // Alpha is the actual local green mean, used for a brightness-
++            // compatible reference. No zero-noise claim about flat textures.
++            oVariance=vec4(max(v*0.0625,vec3(0.0)),mean.x);
++        }
++    """.trimIndent()
++}
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26969RawrAeLoop.java
+@@ -0,0 +1,60 @@
++package com.particlesdevs.photoncamera.capture;
++
++/**
++ * IRIS_26969_RAWR_AE_FRAME_LOOP. Uses RAWR's scene-referred histogram metering,
++ * critically damped temporal target, analog ISO ceiling, and optional full-
++ * period flicker shutter snap. RawImage/Camera2 request ownership is kept by
++ * CaptureController; this class has no Android or camera-side effects.
++ *
++ * Algorithm adapted from RAWR https://github.com/adityawarmanfw/rawr
++ * RawrAutoExposure.h at 5b9f5cef0f03dbef2dab7fdc9d2664bbcc518078
++ * (upstream GPL-3.0). Default still shutter modified to 1/14 second.
++ */
++public final class Iris26969RawrAeLoop {
++    private final Iris26969RawrAeMetering.Filter filter =
++            new Iris26969RawrAeMetering.Filter();
++    private final Iris26969RawrAeMetering.Policy policy =
++            new Iris26969RawrAeMetering.Policy();
++    private long lastTimestamp = 0L;
++
++    public static final class Step {
++        public final Iris26969RawrAeMath.Solution request;
++        /** Log2 of the intended frame brightness, including bounded postRAW gain. */
++        public final double targetLogExposure;
++        public final Iris26969RawrAeMetering.Reading scene;
++        private Step(Iris26969RawrAeMath.Solution req, double log,
++                Iris26969RawrAeMetering.Reading scene) {
++            this.request = req;
++            this.targetLogExposure = log;
++            this.scene = scene;
++        }
++    }
++
++    public synchronized void reset() {
++        filter.reset();
++        lastTimestamp = 0L;
++    }
++
++    public synchronized Step update(Iris26969RawrAeMetering.Frame frame,
++            Iris26969RawrAeMath.Limits limits, long flickerPeriodNs,
++            float shutterIsoBalanceEv, double userEv) {
++        if (frame == null || limits == null || frame.timestampNs <= lastTimestamp) return null;
++        if (flickerPeriodNs != 0L && !Iris26969RawrAeMath.validPeriod(flickerPeriodNs))
++            return null;
++        final Iris26969RawrAeMetering.Reading m =
++                Iris26969RawrAeMetering.meter(frame, policy, userEv);
++        if (m == null || !Double.isFinite(m.desiredLogExposure)) return null;
++        // RAWR's request space is shutter(ns)*ISO; only the photo boundary
++        // controls additional digital display gain. The smoother must never
++        // chase a metered target that sensor + permitted gain cannot reach.
++        final Iris26969RawrAeMath.Solution reachable =
++                Iris26969RawrAeMath.solve(Math.pow(2.0, m.desiredLogExposure),
++                        limits, shutterIsoBalanceEv, flickerPeriodNs);
++        final double filteredTarget = filter.update(reachable.logTotalExposure(), frame.timestampNs);
++        final Iris26969RawrAeMath.Solution request =
++                Iris26969RawrAeMath.solve(Math.pow(2.0, filteredTarget),
++                        limits, shutterIsoBalanceEv, flickerPeriodNs);
++        lastTimestamp = frame.timestampNs;
++        return new Step(request, request.logTotalExposure(), m);
++    }
++}
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26969RawrAeMath.java
+@@ -0,0 +1,90 @@
++package com.particlesdevs.photoncamera.capture;
++
++/**
++ * IRIS_26969_RAWR_AE_MATH — pure host-testable exposure allocation.
++ * Algorithm adapted from RAWR RawrAutoExposure.h, GPL-3.0, upstream
++ * https://github.com/adityawarmanfw/rawr (commit 5b9f5cef0f03dbef2dab7fdc9d2664bbcc518078).
++ * Camera2 ownership and scene-specific gain are managed separately by CaptureController.
++ */
++public final class Iris26969RawrAeMath {
++    public static final long DEFAULT_MAX_STILL_SHUTTER_NS = 71_428_571L; // 1/14s, user specified
++    public static final long DEFAULT_START_SHUTTER_NS = 33_333_333L; // 1/30s
++    public static final long PERIOD_50_HZ_NS = 10_000_000L;
++    public static final long PERIOD_60_HZ_NS = 8_333_333L;
++    public static final double CAP_RAMP_EV = 4.0;
++    private Iris26969RawrAeMath() {}
++
++    public static final class Limits {
++        public int isoMin = 50, isoMax = 6400, isoAnalogMax = 1600;
++        public long shutterMinNs = 100_000L;
++        public long shutterMaxNs = DEFAULT_MAX_STILL_SHUTTER_NS;
++        public long shutterStartNs = DEFAULT_START_SHUTTER_NS;
++        public float maxDigitalGainEv = 2.0f;
++    }
++    public static final class Solution {
++        public final long shutterNs;
++        public final int iso;
++        public final float digitalGainEv;
++        public final boolean underexposed, overexposed;
++        public final double requestedEnergy;
++        private Solution(long t, int i, float d, boolean u, boolean o, double e) {
++            shutterNs=t; iso=i; digitalGainEv=d; underexposed=u; overexposed=o; requestedEnergy=e;
++        }
++        public double logTotalExposure() {
++            return Math.log(shutterNs*(double)iso)/Math.log(2.0) + digitalGainEv;
++        }
++    }
++    static double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi,v)); }
++    static long clamp(long v, long lo, long hi) { return Math.max(lo, Math.min(hi,v)); }
++    public static boolean validPeriod(long p) {
++        return p==PERIOD_50_HZ_NS || p==PERIOD_60_HZ_NS;
++    }
++    /** RAWR uses whole exposure-cycle multiples, rounding DOWN to avoid added blur. */
++    public static long snapDown(long t, long period, long min, long max) {
++        if (period==0 || t<period) return clamp(t,min,max);
++        if (!validPeriod(period) || min<=0 || max<min) throw new IllegalArgumentException("unverified period");
++        long count=Math.max(1,t/period);
++        while(count>1 && count*period>max) count--;
++        return clamp(count*period,min,max);
++    }
++    /**
++     * RAWR Auto solver with 1/14s still cap. Sensor ISO is bounded by its *analog*
++     * ceiling. Residual exposure is returned as digitalGainEv and MUST be
++     * implemented on a frame-matched, camera-linear display + photo path
++     * before this math may control the camera. It must not be silently ignored.
++     */
++    public static Solution solve(double exposureNsTimesIso, Limits l,
++                                 float balanceEv, long verifiedFlickerPeriodNs) {
++        if (l==null || l.isoMin<1 || l.isoMax<l.isoMin || l.isoAnalogMax<l.isoMin ||
++                l.shutterMinNs<=0 || l.shutterMaxNs<l.shutterMinNs ||
++                l.shutterStartNs<=0 || !Double.isFinite(exposureNsTimesIso) ||
++                exposureNsTimesIso<=0 || !Float.isFinite(balanceEv) ||
++                (verifiedFlickerPeriodNs!=0 && !validPeriod(verifiedFlickerPeriodNs)))
++            throw new IllegalArgumentException("invalid AE input");
++        final int analog=Math.min(l.isoMax,l.isoAnalogMax);
++        final double e=Math.max(1.0,exposureNsTimesIso);
++        final long start=clamp(Math.round(l.shutterStartNs *
++                Math.pow(2.0,Math.max(0.0,-(double)balanceEv))),l.shutterMinNs,l.shutterMaxNs);
++        double cap=start;
++        double eStart=start*(double)l.isoMin;
++        if (e>eStart && l.shutterMaxNs>start) {
++            double ramp=clamp(Math.log(e/eStart)/Math.log(2.0)/CAP_RAMP_EV,0,1);
++            cap=start*Math.pow(l.shutterMaxNs/(double)start,ramp);
++        }
++        double shutter=clamp(e/l.isoMin,l.shutterMinNs,cap);
++        shutter=clamp(shutter*Math.pow(2.0,-Math.max(0.0,(double)balanceEv)),l.shutterMinNs,cap);
++        shutter=Math.min(shutter,Math.max(l.shutterMinNs,e/l.isoMin));
++        long t=snapDown(Math.round(shutter),verifiedFlickerPeriodNs,
++                l.shutterMinNs,(long)cap);
++        double rawIso=e/t;
++        if (rawIso<l.isoMin) {
++            t=clamp(Math.round(e/l.isoMin),l.shutterMinNs,l.shutterMaxNs);
++            rawIso=e/t;
++        }
++        int iso=(int)Math.round(clamp(rawIso,l.isoMin,analog));
++        double remainder=Math.log(e/(t*(double)iso))/Math.log(2.0);
++        float digital=(float)clamp(remainder,0,Math.max(0,l.maxDigitalGainEv));
++        return new Solution(t,iso,digital,remainder-digital>1.0/16.0,
++                remainder< -1.0/16.0,e);
++    }
++}
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26969RawrAeMetering.java
+@@ -0,0 +1,142 @@
++package com.particlesdevs.photoncamera.capture;
++
++/**
++ * IRIS_26969_RAWR_AE_METERING. Host-testable, camera-independent exposure
++ * metering and temporal response. Adapted from RAWR RawrAutoExposure.h,
++ * GPL-3.0, upstream https://github.com/adityawarmanfw/rawr at
++ * 5b9f5cef0f03dbef2dab7fdc9d2664bbcc518078.
++ *
++ * Sensor
++ * samples must be normalized, lens-shading calibrated and timestamp-matched
++ * to the exposure that generated them. This class cannot authorize use of
++ * HDRQ, vendor or display gain paths.
++ */
++public final class Iris26969RawrAeMetering {
++    private Iris26969RawrAeMetering() {}
++    public static final int BINS = 128;
++    private static final double MIN_EV=-16.0, MAX_EV=1.0;
++    private static final double LOG2=Math.log(2.0);
++
++    public static final class Frame {
++        public final long timestampNs;
++        public final long shutterNs;
++        public final int requestIso;
++        public final float aperture;
++        public final int[] histogram;
++        public final int[] channelClipHistogram;
++        public final double clippedFraction;
++        public Frame(long timestampNs,long shutterNs,int requestIso,float aperture,
++                     int[] histogram,int[] channelClipHistogram,double clippedFraction) {
++            if(timestampNs<=0||shutterNs<=0||requestIso<=0||histogram==null||histogram.length!=BINS||
++                    channelClipHistogram==null||channelClipHistogram.length!=BINS||
++                    !Double.isFinite(clippedFraction)||clippedFraction<0||clippedFraction>1)
++                throw new IllegalArgumentException("untrusted RAW AE observation");
++            this.timestampNs=timestampNs; this.shutterNs=shutterNs; this.requestIso=requestIso;
++            this.aperture=aperture; this.histogram=histogram.clone();
++            this.channelClipHistogram=channelClipHistogram.clone();this.clippedFraction=clippedFraction;
++        }
++        public double logExposure(){return Math.log(shutterNs*(double)requestIso)/LOG2;}
++    }
++
++    public static final class Policy {
++        public double targetKey=0.10;
++        public double highlightPercentile=0.99;
++        public double channelMarginEv=0.25;
++        public double maxGuardEv=1.5;
++        public double clippedGuardMaxEv=1.25;
++        public double guardGiveUpEv=4;
++        public double guardReleaseEv=0.5;
++        public double nightKeyEv=-1.7;
++        public double nightStartEv100=7.0;
++        public double nightEndEv100=0.0;
++    }
++
++    public static final class Reading {
++        public final double desiredLogExposure, sceneEv100, guardEv, nightOffsetEv;
++        Reading(double d,double s,double g,double n){desiredLogExposure=d;sceneEv100=s;guardEv=g;nightOffsetEv=n;}
++    }
++
++    private static double clamp(double v,double a,double b){return Math.max(a,Math.min(b,v));}
++    private static double smooth(double v){v=clamp(v,0,1);return v*v*(3-2*v);}
++    private static double log2(double v){return Math.log(v)/LOG2;}
++    private static double percentile(int[] histogram,double pct) {
++        long n=0;for(int x:histogram){if(x<0)throw new IllegalArgumentException("negative count");n+=x;}
++        if(n<=0)return Double.NaN;
++        final long target=Math.max(1,(long)Math.ceil(n*clamp(pct,0.0,1.0)));
++        long s=0;
++        for(int i=0;i<BINS;i++){
++            s+=histogram[i];
++            if(s>=target)return MIN_EV+(i+0.5)*(MAX_EV-MIN_EV)/BINS;
++        }
++        return Double.NaN;
++    }
++    public static Reading meter(Frame f, Policy p,double userEv) {
++        if(f==null||p==null||!Double.isFinite(userEv)||p.targetKey<=0||p.targetKey>=1)
++            return null;
++        // The frame has real camera-linear RAW values, with its physical sensor
++        // exposure removed; no AE target is inferred from the last request.
++        double key=percentile(f.histogram,0.5);
++        double peak=percentile(f.channelClipHistogram,p.highlightPercentile);
++        if(!Double.isFinite(key)||!Double.isFinite(peak))return null;
++        double exposure=f.logExposure();
++        double aperture=f.aperture>0.5?f.aperture:1.8;
++        double ev100=log2(aperture*aperture/(f.shutterNs*1e-9))-
++                log2(f.requestIso/100.0)+(key-log2(0.18));
++        double night=smooth((p.nightStartEv100-ev100)/
++                Math.max(1e-6,p.nightStartEv100-p.nightEndEv100))*p.nightKeyEv;
++        double desired=log2(p.targetKey)+night-(key-exposure);
++        double channelClipEv=log2(0.95);
++        // The clipped percentile is ambiguous: limit the darkening so a bright
++        // window in a dark scene doesn't destroy the room's exposure.
++        boolean clipped=f.clippedFraction>0.01 || peak>=channelClipEv-0.05;
++        double nearPeak=clipped?channelClipEv+0.3:peak;
++        double highlight=channelClipEv-p.channelMarginEv-(nearPeak-exposure);
++        double needed=Math.max(0,desired-highlight);
++        double darken;
++        if(needed<=p.maxGuardEv) darken=needed;
++        else {
++            double x=smooth((needed-p.maxGuardEv)/
++                    Math.max(1e-3,p.guardGiveUpEv-p.maxGuardEv));
++            darken=p.maxGuardEv+(p.guardReleaseEv-p.maxGuardEv)*x;
++        }
++        if(clipped){
++            // In dark indoor scenes cap the clipped guard. Outdoor scenes keep
++            // all available headroom, following upstream RAWR AE policy.
++            double day=smooth((ev100-8.0)/3.0);
++            darken=Math.min(darken,p.clippedGuardMaxEv+
++                    (p.maxGuardEv-p.clippedGuardMaxEv)*day);
++        }
++        return new Reading(desired-darken+userEv,ev100,-darken,night);
++    }
++
++    /** Critically damped exposure target; monotone timestamp, bounded dt. */
++    public static final class Filter {
++        public double measureTau=0.12,startEv=0.15,stopEv=0.03;
++        public double tau=0.35,darkenTau=0.25,sceneChangeEv=1.5,sceneChangeTau=0.12;
++        private double output,measure,goal,velocity;
++        private long lastNs;
++        private boolean primed,moving;
++        public synchronized void reset(){output=measure=goal=velocity=0;lastNs=0;primed=moving=false;}
++        public synchronized boolean primed(){return primed;}
++        public synchronized double current(){return output;}
++        public synchronized double update(double desired,long timestampNs){
++            if(!Double.isFinite(desired)||timestampNs<=0)throw new IllegalArgumentException("invalid AE target");
++            if(!primed){primed=true;output=measure=goal=desired;lastNs=timestampNs;return output;}
++            if(timestampNs<=lastNs)return output;
++            double dt=Math.min((timestampNs-lastNs)*1e-9,0.2);lastNs=timestampNs;
++            measure+=(desired-measure)*(1-Math.exp(-dt/measureTau));
++            if(Math.abs(desired-measure)>sceneChangeEv)measure=desired;
++            double err=measure-output;
++            if(!moving&&Math.abs(err)>startEv)moving=true;
++            if(moving)goal=measure;
++            if(moving&&Math.abs(err)<stopEv&&Math.abs(velocity)<0.05)moving=false;
++            double gap=goal-output;
++            double decayTau=Math.abs(gap)>sceneChangeEv?sceneChangeTau:
++                    gap<0?darkenTau:tau;
++            double w=1.0/decayTau,decay=Math.exp(-w*dt),y=output-goal,c=velocity+w*y;
++            output=goal+(y+c*dt)*decay;
++            velocity=(c-w*(y+c*dt))*decay;
++            return output;
++        }
++    }
++}
