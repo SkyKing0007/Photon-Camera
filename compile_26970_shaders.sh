@@ -7,6 +7,8 @@ python3 -S test_26970_ae.py --live
 python3 -S test_26970_noise.py --live
 # Run required V2 native/GLSL ownership and reserved-name checks before querying optional local compiler tools.
 python3 -S test_26970_glsl_preflight.py --live
+# V3: native recorder private-CMake shadow source and -Wunused-variable regression before compilation.
+python3 -S test_26970_hdrq_native_preflight.py --live
 OUT="$PWD/photon_26970_outputs"
 TOOLS="$PWD/.photon_26904_incremental_work/real_shader_tools"
 DIR="$TOOLS/26970_real_current_source_shader_compile"

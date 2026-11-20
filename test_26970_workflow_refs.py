@@ -20,6 +20,8 @@ assert 'Fetch ONLY exact successful 26968 Actions artifact 14601236629' in now
 assert 'Compile exact successful 26968 current shaders before changed 26970 source' in now
 assert 'bash compile_26968_shaders.sh' in now and 'bash compile_26970_shaders.sh' in now
 assert 'python3 -S test_26970_glsl_preflight.py --live' in now
+assert 'python3 -S test_26970_hdrq_native_preflight.py --live' in now
+assert 'python3 -S test_26970_hdrq_native_preflight.py --payload' in now
 assert 'bash compile_26904_shaders_v2.sh' in now and 'python3 -S verify_26904_v3_cmake_handoff.py --handoff' in now
 assert 'python3 -S test_26903_modes.py .' in now
 assert now.count('      - name: One mandatory real 26970 Android NDK dual-ABI Kotlin Java and full app assembleDebug')==1

@@ -1,6 +1,8 @@
-# Photon 26970 V2 — guarded three-stage vscode.dev corrective handoff (PREPARED FOR ACTIONS)
+# Photon 26970 V3 — guarded three-stage vscode.dev corrective handoff (PREPARED FOR ACTIONS)
 
 ## STATUS
+**V3:** Failed V2 Actions run `44807631086` (job `136535664979`) passed shader gates but failed mandatory arm64 C++/NDK with a dead `TilesPc tp` declaration in the Iris-owned HDRQ recorder compiled from a CMake private shadow. Exactly one C++ line has now been removed in that already-allowlisted source file, and a new physically executed precompiler Clang unused-variable / CMake shadow COPYONLY regression is sealed and required. The four original real shader/NDK/Kotlin/Java/full assemble stages are NOT weakened. No source change from 26968 is introduced outside the original 26970 allowlist. This V3 handoff has NOT passed the full Android build yet.
+
 26970 V1 was REJECTED by real Actions run `44802373107` (job `136517516845`) for declaring illegal GLSL `vec3 out` in the newly added grain shader. V2 renames only that local to `correctedRgb` and **adds a physically executed fail-fast GLSL reserved-word / CMake native-reference test** before optional compiler discovery. The original mandatory 26968/26970 real full compiler gates remain unchanged. This V2 handoff is not compile-certified.
 
 **Not BUILD-PROVEN.** Local SHA/patch, actual host JDK javac+java and Python synthetic regressions passed; real glslang 16.5 / SPIR-V optimizer+validator, full Android Java/Kotlin/NDK and :app:assembleDebug are **not installed in this isolated local workspace** and MUST PASS on GitHub Actions before claiming success or publishing an APK. On-device AE/flicker/noise image quality remains UNKNOWN. **Do not treat this as a compiled APK.** The workflow must fail closed without successful real compiler receipts.
@@ -39,3 +41,6 @@ No source commit/push or GitHub Actions trigger was performed by this workspace;
 
 ## V2 REGRESSION EVIDENCE
 Physically re-created the 2,056-file source tree, replayed the 26968/26970 exact source manifest and 2,044-file protection tests, actual host Java AE regression, synthetic noise regression, git forward/rollback 7/12/40, YAML/parser/static native-reference tests, and GLSL reserved-name negative probes. Corrected live shader passes; deliberate reinsertion of `vec3 out` fails. Pinned glslang 16.5 and Android NDK/SDK are absent locally, so the real compiled gates remain NOT RUN LOCALLY and unchanged in Actions. V2 is a prepared candidate, not BUILD-PROVEN.
+
+### V3 correction against V2
+The only runtime delta between rejected 26970 V2 and V3 is deletion of the unused `TilesPc tp{std::int32_t(tx),std::int32_t(ty)};` in `HdrPlusFrequencyRecorder::recordPassFinish`. The original two other used `TilesPc` declarations in the same source are untouched. The changed-file allowlist remains 12 entries, candidate universe 2056 and 2044 protected source files unchanged. V3 runner/compilers and seals add a fail-fast real-source CMake shadow/unused-variable test, but full C++/NDK compile remains mandatory in Actions.

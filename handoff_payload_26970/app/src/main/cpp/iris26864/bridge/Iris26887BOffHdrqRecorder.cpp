@@ -800,7 +800,6 @@ void HdrPlusFrequencyRecorder::recordPassFinish(VkCommandBuffer c, std::uint32_t
     const std::uint32_t tx = geometry_.tilesX, ty = geometry_.tilesY;
     const auto& finalFt = arena_.image("hdrq_final_ft");
     const auto& out = arena_.image("hdrq_out_rgba");
-    TilesPc tp{std::int32_t(tx), std::int32_t(ty)};
     if (!uniformExposure_) {
         NormalizePc np{std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight), 0};
         executor_.record(c, ShaderId::HdrqNormalize, {{ib(0, finalFt), ib(1, arena_.image("hdrq_weight_sum"))}, {}}, &np,
