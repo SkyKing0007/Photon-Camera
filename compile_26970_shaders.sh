@@ -5,11 +5,13 @@ cd "$(dirname "$0")"
 python3 -S test_26970_source.py --live
 python3 -S test_26970_ae.py --live
 python3 -S test_26970_noise.py --live
+# Run required V2 native/GLSL ownership and reserved-name checks before querying optional local compiler tools.
+python3 -S test_26970_glsl_preflight.py --live
 OUT="$PWD/photon_26970_outputs"
 TOOLS="$PWD/.photon_26904_incremental_work/real_shader_tools"
 DIR="$TOOLS/26970_real_current_source_shader_compile"
 mkdir -p "$OUT" "$DIR"
-COMPILER="$(find "$TOOLS/glslang" -type f \( -name glslang -o -name glslangValidator \) -print -quit)"
+COMPILER="$(find "$TOOLS/glslang" -type f \( -name glslang -o -name glslangValidator \) -print -quit 2>/dev/null || true)"
 [ -x "$COMPILER" ] || { echo '26970 BLOCKED: real pinned glslang 16.5.0 missing' >&2; exit 4; }
 "$COMPILER" --version | grep -F '16.5.0'
 command -v spirv-val >/dev/null || { echo '26970 BLOCKED: SPIR-V validator missing'; exit 4; }

@@ -40,7 +40,7 @@ NATIVE_SHA={
 }
 FILES=['README_PHOTON_26970.md','26970_COMMIT_MESSAGE.txt','26970_LOCAL_VERIFICATION.txt',
  '26968_SUCCESSFUL_EXECUTED_WORKFLOW_REFERENCE.yml','build_26970_incremental.py',
- 'test_26970_source.py','test_26970_ae.py','test_26970_noise.py',
+ 'test_26970_source.py','test_26970_ae.py','test_26970_noise.py','test_26970_glsl_preflight.py',
  'test_26970_patches.py','test_26970_sealed_negatives.py','test_26970_workflow_refs.py',
  'compile_26970_shaders.sh','26970_BASE_26968_FULL_APP.sha256','26970_EXPECTED_FULL_APP.sha256',
  '26970_PROTECTED_SOURCE.sha256','26970_RAWR_LATEST_SOURCE_PROVENANCE.json',
@@ -183,7 +183,7 @@ def install():
 
 def regress():
  seal();exact(R,'26970_EXPECTED_FULL_APP.sha256','live 26970')
- for name in ('test_26970_source.py','test_26970_ae.py','test_26970_noise.py','test_26970_patches.py'):
+ for name in ('test_26970_source.py','test_26970_ae.py','test_26970_noise.py','test_26970_glsl_preflight.py','test_26970_patches.py'):
   subprocess.run([sys.executable,'-S',name,'--live'],cwd=R,check=True)
  print('PASS 26968 protected original RAW/SDR/UHDR, strictly gated B 1/14 AE and B OFF low zoom grain')
 

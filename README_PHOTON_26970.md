@@ -1,6 +1,8 @@
-# Photon 26970 — guarded three-stage vscode.dev handoff (PREPARED FOR ACTIONS)
+# Photon 26970 V2 — guarded three-stage vscode.dev corrective handoff (PREPARED FOR ACTIONS)
 
 ## STATUS
+26970 V1 was REJECTED by real Actions run `44802373107` (job `136517516845`) for declaring illegal GLSL `vec3 out` in the newly added grain shader. V2 renames only that local to `correctedRgb` and **adds a physically executed fail-fast GLSL reserved-word / CMake native-reference test** before optional compiler discovery. The original mandatory 26968/26970 real full compiler gates remain unchanged. This V2 handoff is not compile-certified.
+
 **Not BUILD-PROVEN.** Local SHA/patch, actual host JDK javac+java and Python synthetic regressions passed; real glslang 16.5 / SPIR-V optimizer+validator, full Android Java/Kotlin/NDK and :app:assembleDebug are **not installed in this isolated local workspace** and MUST PASS on GitHub Actions before claiming success or publishing an APK. On-device AE/flicker/noise image quality remains UNKNOWN. **Do not treat this as a compiled APK.** The workflow must fail closed without successful real compiler receipts.
 
 ## EXACT 26968 RUNTIME SOURCE AUTHORITY — 26969 REJECTED
@@ -23,9 +25,9 @@
 ## EXACT THREE STAGE ORDER — UPLOAD IN vscode.dev/GitHub WEB EDITOR
 This ZIP is a **handoff package**, not an APK, not a script to run on your phone. Extract it locally using the normal archive tool; follow these upload lists in order. Use ONLY `experimental-clean-photon-rebuild`. Do NOT create a backup branch, touch `dev`, or push APKs.
 
-1. **Stage 1:** upload every file listed in `26970_STAGE_1_UPLOAD_PATHS.txt` to the matching relative repository location; commit (the full staged candidate overlay goes under `handoff_payload_26970/`). All hashes must match.
+1. **Stage 1:** REPLACE V1 with all files listed (including repaired shader and new preflight test); upload every file listed in `26970_STAGE_1_UPLOAD_PATHS.txt` to the matching relative repository location; commit (the full staged candidate overlay goes under `handoff_payload_26970/`). All hashes must match.
 2. **Stage 2:** upload only `.github/workflows/build-26970-change-aware.yml` (see `26970_STAGE_2_UPLOAD_PATHS.txt`); commit. This does not yet trigger because the only push-path trigger is Stage 3's trigger file.
-3. **Stage 3:** upload only `TRIGGER_26970.txt`; commit. Monitor the first real `Photon 26970` workflow run. The run must validate the successful 26968 Actions artifact and all historical checks, byte-exact 26968 compilation, SHA allowlist/protection, new real GLSL/SPIR-V, both ABI NDK, Kotlin/Java and one real `:app:assembleDebug`, then publish exactly one 26970 APK plus its actual compiled source TAR. A failure is **not** build-proof; do not install an unverified APK.
+3. **Stage 3:** upload UPDATED `TRIGGER_26970.txt` (V2 contents must differ from failed V1); upload only `TRIGGER_26970.txt`; commit. Monitor the first real `Photon 26970` workflow run. The run must validate the successful 26968 Actions artifact and all historical checks, byte-exact 26968 compilation, SHA allowlist/protection, new real GLSL/SPIR-V, both ABI NDK, Kotlin/Java and one real `:app:assembleDebug`, then publish exactly one 26970 APK plus its actual compiled source TAR. A failure is **not** build-proof; do not install an unverified APK.
 
 Suggested commit message in `26970_COMMIT_MESSAGE.txt`. The workflow is intentionally strict and **does not weaken real compilation**, cut historical regressions or skip failures. Build duration varies by source/cache; none guaranteed.
 
@@ -34,3 +36,6 @@ Original successful 26968 workflow's entire historical sequence up to and includ
 
 ## SAFETY
 No source commit/push or GitHub Actions trigger was performed by this workspace; only this handoff is created. Validity depends on the user-authorized 3-stage upload and completed successful GitHub Actions run. Any source conflict, compiler error or protected SHA deviation must fail closed.
+
+## V2 REGRESSION EVIDENCE
+Physically re-created the 2,056-file source tree, replayed the 26968/26970 exact source manifest and 2,044-file protection tests, actual host Java AE regression, synthetic noise regression, git forward/rollback 7/12/40, YAML/parser/static native-reference tests, and GLSL reserved-name negative probes. Corrected live shader passes; deliberate reinsertion of `vec3 out` fails. Pinned glslang 16.5 and Android NDK/SDK are absent locally, so the real compiled gates remain NOT RUN LOCALLY and unchanged in Actions. V2 is a prepared candidate, not BUILD-PROVEN.
