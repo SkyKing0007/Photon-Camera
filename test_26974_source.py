@@ -24,8 +24,9 @@ assert 'iris26972CStartIndependentCamera2(false);' in ctl[start:end]
 assert 'mIris26972CShutterSession != null' in ctl[start:end]
 assert 'iris26679RejectShutter("IRIS_26974_C_INDEPENDENT_BUSY"' in ctl[start:end]
 assert 'iris26974CResumePreviewOnly(' in ctl
+assert 'getTargets()' not in ctl.replace('// CaptureRequest intentionally has no public target-enumeration method.','')
 preview=ctl[ctl.index('private boolean iris26974CResumePreviewOnly('):ctl.index('/* IRIS_26972_C_INDEPENDENT_SHUTTER_SUBMISSION')]
-for part in ('mCaptureSession != ownedSession','mIris26972CShutterSession == null','builder.removeTarget(rawSurface)','setRepeatingRequest(onlyPreview','builder.addTarget(rawSurface)','!onlyPreview.getTargets().contains(surface)'):
+for part in ('mCaptureSession != ownedSession','mIris26972CShutterSession == null','builder.removeTarget(rawSurface)','setRepeatingRequest(onlyPreview','builder.addTarget(rawSurface)','mIris26974PreviewTargetOwner != builder','mIris26974PreviewRawTargetAdded'):
  assert part in preview,part
 c=ctl[ctl.index('private void iris26972CStartIndependentCamera2('):ctl.index('private void triggerZslCapture()',ctl.index('private void iris26972CStartIndependentCamera2('))]
 for part in ('cSequenceFence.markCameraSequenceEnded();','cSequenceFence.isTerminalDelivered()','cReleaseAfterSequence.run();','cReader.setOnImageAvailableListener(', 'mIris26974CRawCallbackThread = cRawThread','mBackgroundHandler == captureHandler','cRawMoved[0]','onCaptureSequenceAborted','owner.onCaptureFailed','cWatchdog.setDaemon(true)','cWatchdog.start()','cameraEventsListener.onFrameCountSet(frames)','IRIS_26974_C_CAMERA2_SEQUENCE_COMPLETED','IRIS_26974_C_RAW_IO_SEPARATED','IRIS_26974_C_INDEPENDENT_ACQUISITION_DEADLINE','IRIS_26974_C_PREVIEW_STOP_FOR_BURST'):

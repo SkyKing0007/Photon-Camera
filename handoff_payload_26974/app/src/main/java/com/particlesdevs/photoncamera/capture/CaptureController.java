@@ -264,6 +264,12 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     public ImageReader mImageReaderRaw;
     /*{@link CaptureRequest.Builder} for the camera preview*/
     public CaptureRequest.Builder mPreviewRequestBuilder;
+    /* IRIS_26974_V3_PREVIEW_TARGET_OWNERSHIP
+     * Android CaptureRequest has no public target-enumeration API. Track RAW
+     * target presence only when creating this original preview builder. Never
+     * infer membership from a rebuilt request or mutate A/B target topology. */
+    private CaptureRequest.Builder mIris26974PreviewTargetOwner;
+    private boolean mIris26974PreviewRawTargetAdded;
     public CaptureRequest mPreviewInputRequest;
     /**
      * The current state of camera state for taking pictures.
@@ -7500,6 +7506,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
         }
 
         mPreviewRequestBuilder.addTarget(surface);
+        mIris26974PreviewTargetOwner = mPreviewRequestBuilder;
+        mIris26974PreviewRawTargetAdded = false;
         /* IRIS_26871_B_PREVIEW_HAL_ANTIBANDING
          * Set on the initial B-only preview + ZSL RAW request, not from per-frame
          * flicker feedback. HAL remains the sole shutter/ISO owner; no manual
@@ -7539,6 +7547,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
         if (isZslMode() && mImageReaderRaw != null && mIris26555RawStreamAvailable
                 && !iris26555PreviewOnlyRecoveryActive()) {
             mPreviewRequestBuilder.addTarget(mImageReaderRaw.getSurface());
+            mIris26974PreviewRawTargetAdded = true;
         } else if (isZslMode() && iris26555PreviewOnlyRecoveryActive()) {
             Log.i(TAG, "IRIS_26555_ZSL_RAW_TARGET_SKIPPED recoveryStage="
                     + mIris26555PreviewRecoveryStage + " previewOnly=true");
@@ -11385,14 +11394,21 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 mCameraDevice == null || surface == null || !surface.isValid()) return false;
         final CaptureRequest.Builder builder = mPreviewRequestBuilder;
         synchronized (builder) {
+            // Builder target membership is recorded at original creation above.
+            // CaptureRequest intentionally has no public target-enumeration method.
+            if (mIris26974PreviewTargetOwner != builder ||
+                    ownedReader != mImageReaderRaw) {
+                Log.e(TAG, "IRIS_26974_C_PREVIEW_TARGET_OWNER_MISMATCH");
+                return false;
+            }
             final Surface rawSurface = ownedReader.getSurface();
-            final boolean hadRaw = builder.build().getTargets().contains(rawSurface);
+            final boolean hadRaw = mIris26974PreviewRawTargetAdded;
             try {
                 if (hadRaw) builder.removeTarget(rawSurface);
+                // The original builder added TextureView 'surface' at creation;
+                // no other path removes it. The built request is immutable, so
+                // restoring builder RAW below does not reintroduce RAW in flight.
                 final CaptureRequest onlyPreview = builder.build();
-                if (onlyPreview.getTargets().contains(rawSurface) ||
-                        !onlyPreview.getTargets().contains(surface))
-                    throw new IllegalStateException("C preview-only RAW exclusion not proven");
                 ownedSession.setRepeatingRequest(onlyPreview, mCaptureCallback,
                         mBackgroundHandler);
                 Log.i(TAG, "IRIS_26974_C_PREVIEW_ONLY_RESUMED rawTarget=false " +

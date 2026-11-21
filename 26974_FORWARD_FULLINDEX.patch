@@ -72,10 +72,23 @@ index 50fae9041bc30808f0ccb7637d0792e28148eba0..557201a147564fe8344d4182280f505f
          try { spool?.close() } catch (cleanup: Throwable) {
              terminalReason += "; C private RAW deletion failed: ${cleanup.message}"
 diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
-index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d91220728379 100644
+index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..0ada173176bfde0074346c6fd0ccdec09c64504d 100644
 --- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
 +++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
-@@ -403,6 +403,10 @@
+@@ -264,6 +264,12 @@
+     public ImageReader mImageReaderRaw;
+     /*{@link CaptureRequest.Builder} for the camera preview*/
+     public CaptureRequest.Builder mPreviewRequestBuilder;
++    /* IRIS_26974_V3_PREVIEW_TARGET_OWNERSHIP
++     * Android CaptureRequest has no public target-enumeration API. Track RAW
++     * target presence only when creating this original preview builder. Never
++     * infer membership from a rebuilt request or mutate A/B target topology. */
++    private CaptureRequest.Builder mIris26974PreviewTargetOwner;
++    private boolean mIris26974PreviewRawTargetAdded;
+     public CaptureRequest mPreviewInputRequest;
+     /**
+      * The current state of camera state for taking pictures.
+@@ -403,6 +409,10 @@
       * C session owns every RAW Image until it finishes or fails explicitly. */
      private volatile com.hinnka.mycamera.processor.Iris26972CCamera2ShutterSession
              mIris26972CShutterSession;
@@ -86,7 +99,7 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
      private final java.util.LinkedHashSet<Long> mIris26972CRetiredSensorTimestamps =
              new java.util.LinkedHashSet<>();
  
-@@ -1686,6 +1690,19 @@
+@@ -1686,6 +1696,19 @@
                      mIris26972CShutterSession;
              mIris26972CShutterSession = null;
              if (c != null) c.close();
@@ -106,10 +119,30 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
              if (null != mCaptureSession) {
                  mCaptureSession.close();
                  mCaptureSession = null;
-@@ -7608,6 +7625,24 @@
-             return;
+@@ -7483,6 +7506,8 @@
          }
  
+         mPreviewRequestBuilder.addTarget(surface);
++        mIris26974PreviewTargetOwner = mPreviewRequestBuilder;
++        mIris26974PreviewRawTargetAdded = false;
+         /* IRIS_26871_B_PREVIEW_HAL_ANTIBANDING
+          * Set on the initial B-only preview + ZSL RAW request, not from per-frame
+          * flicker feedback. HAL remains the sole shutter/ISO owner; no manual
+@@ -7522,6 +7547,7 @@
+         if (isZslMode() && mImageReaderRaw != null && mIris26555RawStreamAvailable
+                 && !iris26555PreviewOnlyRecoveryActive()) {
+             mPreviewRequestBuilder.addTarget(mImageReaderRaw.getSurface());
++            mIris26974PreviewRawTargetAdded = true;
+         } else if (isZslMode() && iris26555PreviewOnlyRecoveryActive()) {
+             Log.i(TAG, "IRIS_26555_ZSL_RAW_TARGET_SKIPPED recoveryStage="
+                     + mIris26555PreviewRecoveryStage + " previewOnly=true");
+@@ -7605,6 +7631,24 @@
+                     + " previewAlive=true fakeYuvFallback=false");
+             iris26679RejectShutter("RAW_MODE_UNAVAILABLE",
+                     "RAW capture is not supported by this camera");
++            return;
++        }
++
 +        /* IRIS_26974_C_TRUE_INDEPENDENT_MOTION_SHUTTER_ENTRY
 +         * C captures fresh post-press RAW_SENSOR frames. It must not require
 +         * A/B's pre-shutter ZSL ring nor enter its deferred-shutter replay.
@@ -125,13 +158,10 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
 +                return;
 +            }
 +            iris26972CStartIndependentCamera2(false);
-+            return;
-+        }
-+
-         /* IRIS_26679_SCENE_INDEPENDENT_SHUTTER_ADMISSION
-          * Lighting/content never decides whether the UI can become stranded. Motion shutter
-          * intent is held one-deep while the same camera/mode regains a configured repeating
-@@ -11337,11 +11372,48 @@
+             return;
+         }
+ 
+@@ -11337,11 +11381,55 @@
       * frozen into fresh post-shutter RAW-only NORMAL top-up tickets. Stale
       * HAL/ZSL RAWs remain ineligible and can never satisfy that capture.
       */
@@ -148,14 +178,21 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
 +                mCameraDevice == null || surface == null || !surface.isValid()) return false;
 +        final CaptureRequest.Builder builder = mPreviewRequestBuilder;
 +        synchronized (builder) {
++            // Builder target membership is recorded at original creation above.
++            // CaptureRequest intentionally has no public target-enumeration method.
++            if (mIris26974PreviewTargetOwner != builder ||
++                    ownedReader != mImageReaderRaw) {
++                Log.e(TAG, "IRIS_26974_C_PREVIEW_TARGET_OWNER_MISMATCH");
++                return false;
++            }
 +            final Surface rawSurface = ownedReader.getSurface();
-+            final boolean hadRaw = builder.build().getTargets().contains(rawSurface);
++            final boolean hadRaw = mIris26974PreviewRawTargetAdded;
 +            try {
 +                if (hadRaw) builder.removeTarget(rawSurface);
++                // The original builder added TextureView 'surface' at creation;
++                // no other path removes it. The built request is immutable, so
++                // restoring builder RAW below does not reintroduce RAW in flight.
 +                final CaptureRequest onlyPreview = builder.build();
-+                if (onlyPreview.getTargets().contains(rawSurface) ||
-+                        !onlyPreview.getTargets().contains(surface))
-+                    throw new IllegalStateException("C preview-only RAW exclusion not proven");
 +                ownedSession.setRepeatingRequest(onlyPreview, mCaptureCallback,
 +                        mBackgroundHandler);
 +                Log.i(TAG, "IRIS_26974_C_PREVIEW_ONLY_RESUMED rawTarget=false " +
@@ -180,7 +217,7 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
          if (!com.particlesdevs.photoncamera.processing.experimentc.Iris26972CContract.CONTROLLED_DEVICE_TRIAL_ENABLED) {
              iris26679RejectShutter("C_PRODUCTION_NOT_COMPILED_AND_PROVEN",
                      "Experiment C is not yet ready for capture");
-@@ -11436,6 +11508,7 @@
+@@ -11436,6 +11524,7 @@
          final long shutterMillis = System.currentTimeMillis();
          final CameraCaptureSession captureSession = mCaptureSession;
          final Handler captureHandler = mBackgroundHandler;
@@ -188,7 +225,7 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
          final com.hinnka.mycamera.processor.Iris26972CCamera2ShutterSession[] ownerHolder =
                  new com.hinnka.mycamera.processor.Iris26972CCamera2ShutterSession[1];
          /* IRIS_26972_C_SEQUENCE_END_FENCE
-@@ -11450,8 +11523,27 @@
+@@ -11450,8 +11539,27 @@
          final Runnable cReleaseAfterSequence = () -> {
              if (!cSequenceFence.takeReleasePermit()) return;
              captureHandler.postDelayed(() -> {
@@ -217,7 +254,7 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
              }, 1500L);
          };
          final com.hinnka.mycamera.processor.Iris26972CCamera2ShutterSession owner;
-@@ -11475,8 +11567,12 @@
+@@ -11475,8 +11583,12 @@
                                              abortError);
                                  }
                              }
@@ -231,7 +268,7 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
                              try {
                                  if (uri == null) {
                                      Log.e(TAG, "IRIS_26972_C_NO_IMAGE: " + String.valueOf(error));
-@@ -11527,6 +11623,7 @@
+@@ -11527,6 +11639,7 @@
                  b.setTag(new Iris26972CFrameTag(owner, i));
                  requests.add(b.build());
              }
@@ -239,7 +276,7 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
              captureSession.stopRepeating();
              synchronized (mZslBufferLock) {
                  while (!mZslRingBuffer.isEmpty()) {
-@@ -11541,7 +11638,12 @@
+@@ -11541,7 +11654,12 @@
                  if (old == null) break;
                  old.close();
              }
@@ -252,7 +289,7 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
              final CameraCaptureSession.CaptureCallback onlyC =
                      new CameraCaptureSession.CaptureCallback() {
                  private Iris26972CFrameTag ticket(CaptureRequest request) {
-@@ -11557,7 +11659,19 @@
+@@ -11557,7 +11675,19 @@
                          owner.onCaptureFailed("foreign C callback identity"); return;
                      }
                      iris26972CRetireSensorTimestamp(timestamp);
@@ -272,7 +309,7 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
                  }
                  @Override public void onCaptureCompleted(@NonNull CameraCaptureSession session,
                          @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
-@@ -11566,6 +11680,12 @@
+@@ -11566,6 +11696,12 @@
                          owner.onCaptureFailed("foreign C completed result"); return;
                      }
                      owner.onTotal(tag.index, result);
@@ -285,7 +322,7 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
                  }
                  @Override public void onCaptureFailed(@NonNull CameraCaptureSession session,
                          @NonNull CaptureRequest request,
-@@ -11581,6 +11701,17 @@
+@@ -11581,6 +11717,17 @@
                          owner.onCaptureFailed("foreign completed Camera2 sequence"); return;
                      }
                      cSequenceFence.markCameraSequenceEnded();
@@ -303,7 +340,7 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
                      cReleaseAfterSequence.run();
                  }
                  @Override public void onCaptureSequenceAborted(
-@@ -11589,16 +11720,35 @@
+@@ -11589,16 +11736,35 @@
                          owner.onCaptureFailed("foreign aborted Camera2 sequence"); return;
                      }
                      cSequenceFence.markCameraSequenceEnded();
@@ -343,7 +380,7 @@ index 8b9f6e0639e40f346a96349ddfbf5d0ae54226aa..581e0d55f6746146e4dad6864764d912
          } catch (Exception failure) {
              Log.e(TAG, "IRIS_26972_C_SHUTTER_ABORT "+failure.getMessage());
              // Before captureBurst there is no sequence to acknowledge. Once
-@@ -11606,6 +11756,8 @@
+@@ -11606,6 +11772,8 @@
              // HAL cannot still send RAW Images; require abort/sequence-end.
              if (!cBurstCallEntered[0]) cSequenceFence.markNeverSubmitted();
              owner.onCaptureFailed("Camera2 submit: " + failure.getMessage());

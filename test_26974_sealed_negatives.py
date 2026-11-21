@@ -13,6 +13,7 @@ checks=(
  '26974_EXACT_EXPANDED_C_SHADERS/sabre_merge.frag',
  '.github/workflows/build-26974-change-aware.yml',
  '26973_SUCCESSFUL_EXECUTED_BUILDER_REFERENCE.py',
+ 'test_26974_android_api.py',
 )
 for path in checks:
  f=R/path;raw=f.read_bytes()
