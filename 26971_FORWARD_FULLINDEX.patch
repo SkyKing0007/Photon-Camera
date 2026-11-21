@@ -1,0 +1,259 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker26850.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker26850.kt
+index 95998a8dc377d1ffd625fa889f2a2e79774bfb09..38c687ce1f42e9c129f472442c0047cef55279ce 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker26850.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker26850.kt
+@@ -14484,7 +14484,11 @@
+         try {
+             bindRenderTargets(intArrayOf(texture), "IRIS26718 high-zoom detail framebuffer")
+             GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
++            GLES30.glReadBuffer(GLES30.GL_COLOR_ATTACHMENT0)
+             GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
++            GLES30.glPixelStorei(GLES30.GL_PACK_ROW_LENGTH, 0)
++            GLES30.glPixelStorei(GLES30.GL_PACK_SKIP_PIXELS, 0)
++            GLES30.glPixelStorei(GLES30.GL_PACK_SKIP_ROWS, 0)
+             rg.clear()
+             GLES30.glReadPixels(0, 0, tileWidth, tileHeight, GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, rg)
+             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+@@ -14492,9 +14496,17 @@
+             val rgShort = rg.duplicate().order(ByteOrder.nativeOrder()).asShortBuffer()
+             val detailShort = detail.duplicate().order(ByteOrder.nativeOrder()).asShortBuffer()
+             for (index in 0 until tileWidth * tileHeight) {
++                val detailValue = Half.toFloat(rgShort.get(index * 4))
++                require(detailValue.isFinite() && kotlin.math.abs(detailValue) <= 0.561f) {
++                    "26971 invalid high-zoom scalar detail; fail closed to native Sabre/VGN"
++                }
+                 detailShort.put(index, rgShort.get(index * 4))
+-                val diagnostic = Half.toFloat(rgShort.get(index * 4 + 1)).toInt()
+-                require(diagnostic in 0..39) { "26718 invalid high-zoom diagnostic=$diagnostic" }
++                val diagnosticValue = Half.toFloat(rgShort.get(index * 4 + 1))
++                require(diagnosticValue.isFinite() && diagnosticValue in 0f..39f &&
++                    diagnosticValue == diagnosticValue.toInt().toFloat()) {
++                    "26971 invalid high-zoom diagnostic; fail closed to native Sabre/VGN"
++                }
++                val diagnostic = diagnosticValue.toInt()
+                 phaseHistogram[(diagnostic / 8).coerceIn(0, 4)]++
+                 reasonHistogram[diagnostic % 8]++
+             }
+@@ -14507,6 +14519,37 @@
+             LargeDirectBuffer.free(detail)
+             LargeDirectBuffer.free(rg)
+         }
++    }
++
++    /* IRIS_26971_HIGH_ZOOM_INDEPENDENT_TILE_RECONSTRUCTION_CONTRACT
++     * Read the two independent GPU reconstructions, verify their detail values and
++     * zero-DC block intent, and write only the verified optional scalar correction.
++     * The original native Sabre/VGN RGB carrier is never modified.
++     */
++    private fun reconcileHighZoomDetail26971(
++        primaryFile: File, shiftedFile: File, detailWidth: Int, detailHeight: Int,
++    ): Iris26971HighZoomDetailIntegrity.Result {
++        val pixels = Math.multiplyExact(detailWidth, detailHeight)
++        val bytes = Math.multiplyExact(pixels, Short.SIZE_BYTES)
++        require(primaryFile.length() == bytes.toLong() && shiftedFile.length() == bytes.toLong())
++        fun readValues(file: File): FloatArray {
++            val data = file.readBytes()
++            require(data.size == bytes)
++            val halves = ByteBuffer.wrap(data).order(ByteOrder.nativeOrder()).asShortBuffer()
++            return FloatArray(pixels) { i -> Half.toFloat(halves.get(i)) }
++        }
++        val original = readValues(primaryFile)
++        val result = Iris26971HighZoomDetailIntegrity.reconcile(
++            original, readValues(shiftedFile), detailWidth, detailHeight,
++        )
++        if (result.affectedPixels > 0) {
++            val data = ByteBuffer.allocate(bytes).order(ByteOrder.nativeOrder())
++            val halves = data.asShortBuffer()
++            for (i in 0 until pixels) halves.put(i, Half.toHalf(result.detail[i]))
++            FileOutputStream(primaryFile, false).use { out -> out.write(data.array()) }
++            require(primaryFile.length() == bytes.toLong())
++        }
++        return result
+     }
+ 
+     /* IRIS_26720_HIGH_ZOOM_DIRECT_CFA_RGB_GPU
+@@ -14772,16 +14815,27 @@
+         require(tileWidthLimit >= 2 && tileHeightLimit >= 2)
+         val phaseHistogram = LongArray(5)
+         val reasonHistogram = LongArray(8)
+-        RandomAccessFile(detailOutputFile, "rw").use { out ->
++        val shiftedFile = File.createTempFile("iris26971_shifted_detail_", ".r16f", detailOutputFile.parentFile)
++        try {
++          for (verificationPass in 0..1) {
++            val passPhaseHistogram = if (verificationPass == 0) phaseHistogram else LongArray(5)
++            val passReasonHistogram = if (verificationPass == 0) reasonHistogram else LongArray(8)
++            val passTarget = if (verificationPass == 0) detailOutputFile else shiftedFile
++            RandomAccessFile(passTarget, "rw").use { out ->
+             out.setLength(detailWidth.toLong() * detailHeight * Short.SIZE_BYTES)
+             var localTop = 0
+             while (localTop < detailHeight) {
+-                var tileHeight = minOf(tileHeightLimit, detailHeight - localTop)
++                // Pass B starts with a half-height tile: an internal 64-row GPU band
++                // cannot occupy the same global row in both reconstructions.
++                var tileHeight = minOf(tileHeightLimit, detailHeight - localTop,
++                    if (verificationPass == 1 && localTop == 0) 64 else tileHeightLimit)
+                 if ((tileHeight and 1) != 0) tileHeight--
+                 require(tileHeight > 0)
+                 var localLeft = 0
+                 while (localLeft < detailWidth) {
+-                    var tileWidth = minOf(tileWidthLimit, detailWidth - localLeft)
++                    // Also shift the horizontal tile grid, with even CFA origins.
++                    var tileWidth = minOf(tileWidthLimit, detailWidth - localLeft,
++                        if (verificationPass == 1 && localLeft == 0) 256 else tileWidthLimit)
+                     if ((tileWidth and 1) != 0) tileWidth--
+                     require(tileWidth > 0)
+                     val globalLeft = originX + localLeft
+@@ -14861,7 +14915,7 @@
+                         uniform2i(program,"uOutputFullSize",fullOutputWidth,fullOutputHeight)
+                         uniform2i(program,"uGuideSize",width,height)
+                         draw(program,tileWidth,tileHeight,intArrayOf(detail))
+-                        writeHighZoomDetailTile26718(out,detail,localLeft,localTop,tileWidth,tileHeight,detailWidth,phaseHistogram,reasonHistogram)
++                        writeHighZoomDetailTile26718(out,detail,localLeft,localTop,tileWidth,tileHeight,detailWidth,passPhaseHistogram,passReasonHistogram)
+                         checkGlError("IRIS26718 high-zoom scalar tile")
+                     } finally { releaseTexturesFrom(tileStart) }
+                     localLeft += tileWidth
+@@ -14869,6 +14923,16 @@
+                 localTop += tileHeight
+                 GlesGpuScheduler.yieldToUiRenderer()
+             }
++            }
++          }
++          val integrity = reconcileHighZoomDetail26971(detailOutputFile, shiftedFile, detailWidth, detailHeight)
++          val proof26971 = "disagreement=${integrity.disagreementPixels} " +
++              "invalidQuad=${integrity.invalidQuadPixels} affected=${integrity.affectedPixels} " +
++              "fullNativeFallback=${integrity.fullNativeFallback} grids=128x512_and_shifted_64x256"
++          PLog.i(SABRE_TAG, "IRIS_26971_HIGH_ZOOM_TILE_CONSENSUS $proof26971")
++          MotionTrace.processingState("IRIS_26971_HIGH_ZOOM_TILE_CONSENSUS", proof26971)
++        } finally {
++          runCatching { shiftedFile.delete() }
+         }
+         val pixels=detailWidth.toLong()*detailHeight.toLong()
+         require(phaseHistogram.sum()==pixels) { "26718 phase proof incomplete" }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/Iris26971HighZoomDetailIntegrity.kt b/app/src/main/java/com/hinnka/mycamera/processor/Iris26971HighZoomDetailIntegrity.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..a679abf3fd9ff84c7098c39c708589869260bd50
+--- /dev/null
++++ b/app/src/main/java/com/hinnka/mycamera/processor/Iris26971HighZoomDetailIntegrity.kt
+@@ -0,0 +1,111 @@
++package com.hinnka.mycamera.processor
++
++import kotlin.math.abs
++import kotlin.math.min
++
++/**
++ * IRIS_26971_HIGH_ZOOM_INDEPENDENT_TILE_CONSENSUS
++ *
++ * The scalar sidecar is an optional correction to the native Sabre/VGN RGB master. Two GPU
++ * reconstructions of exactly the same NORMAL RAW observations, with different (even) tile grids,
++ * must agree within the unavoidable half-float arithmetic tolerance. Where they don't, the
++ * existing Sabre/VGN value is the safe identity fallback (zero log-luma detail), never blur.
++ *
++ * A 2x2 single-sign high-amplitude detail block also violates the zero-DC intra-Bayer-quad
++ * intent of the scalar shader. This catches a stripe that is identically corrupt in both tilings.
++ * No RGB, RAW, color transform or global sharpness owner changes.
++ */
++internal object Iris26971HighZoomDetailIntegrity {
++    private const val MAX_DETAIL_EV = 0.561f
++    private const val INDEPENDENT_TOL_EV = 0.055f
++    private const val SAMESIGN_FLOOR_EV = 0.090f
++    private const val FADE_RADIUS = 6
++
++    data class Result(
++        val detail: FloatArray,
++        val disagreementPixels: Int,
++        val invalidQuadPixels: Int,
++        val affectedPixels: Int,
++        val fullNativeFallback: Boolean,
++    )
++
++    fun reconcile(primary: FloatArray, shifted: FloatArray, width: Int, height: Int): Result {
++        require(width > 0 && height > 0 && width % 2 == 0 && height % 2 == 0)
++        val size = Math.multiplyExact(width, height)
++        require(primary.size == size && shifted.size == size)
++        val failed = BooleanArray(size)
++        var disagree = 0
++        for (i in 0 until size) {
++            val a = primary[i]
++            val b = shifted[i]
++            val invalid = !a.isFinite() || !b.isFinite() ||
++                abs(a) > MAX_DETAIL_EV || abs(b) > MAX_DETAIL_EV ||
++                abs(a - b) > INDEPENDENT_TOL_EV
++            if (invalid) {
++                failed[i] = true
++                disagree++
++            }
++        }
++        var quadCount = 0
++        for (y in 0 until height step 2) {
++            for (x in 0 until width step 2) {
++                val at = y * width + x
++                val ids = intArrayOf(at, at + 1, at + width, at + width + 1)
++                // The shader's 2x2 direct CFA residual is centered about zero. Four strong
++                // same-sign log gains cannot represent supported zero-DC microstructure.
++                val aPos = ids.all { primary[it] >= SAMESIGN_FLOOR_EV }
++                val aNeg = ids.all { primary[it] <= -SAMESIGN_FLOOR_EV }
++                val bPos = ids.all { shifted[it] >= SAMESIGN_FLOOR_EV }
++                val bNeg = ids.all { shifted[it] <= -SAMESIGN_FLOOR_EV }
++                if (aPos || aNeg || bPos || bNeg) {
++                    for (id in ids) {
++                        if (!failed[id]) {
++                            failed[id] = true
++                            quadCount++
++                        }
++                    }
++                }
++            }
++        }
++        val failedCount = failed.count { it }
++        if (failedCount == 0) return Result(primary, 0, 0, 0, false)
++        // Extensive disagreement means the optional sidecar is not dependable. Keep the
++        // original Sabre/VGN RGB image, rather than risking dense fallback boundaries.
++        if (failedCount >= size / 20) {
++            primary.fill(0f)
++            return Result(primary, disagree, quadCount, size, true)
++        }
++        val distance = ByteArray(size) { i -> if (failed[i]) 0 else (FADE_RADIUS + 1).toByte() }
++        // Two distance-transform passes produce a smooth 6-pixel guard around failed detail.
++        for (y in 0 until height) {
++            for (x in 0 until width) {
++                val i = y * width + x
++                var d = distance[i].toInt()
++                if (x > 0) d = min(d, distance[i - 1].toInt() + 1)
++                if (y > 0) d = min(d, distance[i - width].toInt() + 1)
++                distance[i] = min(d, FADE_RADIUS + 1).toByte()
++            }
++        }
++        for (y in height - 1 downTo 0) {
++            for (x in width - 1 downTo 0) {
++                val i = y * width + x
++                var d = distance[i].toInt()
++                if (x + 1 < width) d = min(d, distance[i + 1].toInt() + 1)
++                if (y + 1 < height) d = min(d, distance[i + width].toInt() + 1)
++                distance[i] = min(d, FADE_RADIUS + 1).toByte()
++            }
++        }
++        var affected = 0
++        for (i in 0 until size) {
++            val d = distance[i].toInt()
++            if (d > FADE_RADIUS) continue
++            // At the failed pixel and its immediate neighbors: native identity. The
++            // remaining 2..6 pixel transition is a gain on the optional detail only.
++            val t = ((d - 1).toFloat() / (FADE_RADIUS - 1)).coerceIn(0f, 1f)
++            val gain = t * t * (3f - 2f * t)
++            primary[i] = if (primary[i].isFinite()) primary[i] * gain else 0f
++            affected++
++        }
++        return Result(primary, disagree, quadCount, affected, false)
++    }
++}
+diff --git a/app/version.properties b/app/version.properties
+index f2791f640c76ce89ba5e9388b940bafa64df7cc8..29e3dcbac9f14f4fda6a8dde06b95930efde399a 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726970
+-VERSION_BUILD=26970
++VERSION_NAME=0.9726971
++VERSION_BUILD=26971
