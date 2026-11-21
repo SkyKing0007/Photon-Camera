@@ -20,4 +20,13 @@ for x in ('python3 -S build_26974_incremental.py seal','python3 -S test_26974_se
 assert 'TRIGGER_26974.txt' in after[:200] and 'TRIGGER_26973.txt' not in after[:200]
 assert 'photon_26974_outputs/' in after and 'IrisCamera-0.9726974-26974-iris-rawr-debug.apk' in after
 assert before[:before.index(p)].count('      - name:')==after[:after.index(q)].count('      - name:')
+# Enforce current candidate verification only after install; stage order is mandatory.
+pre=after.split('      - name: Reconstruct and verify actual compiled 26973 2132-file source and 26974 candidate',1)[1].split('      - name: Preserve mandatory historical 26904 optimizer',1)[0]
+assert pre.count('python3 -S build_26974_incremental.py prepare-base')==1
+assert pre.count('python3 -S test_26974_patches.py --frozen')==1
+assert 'test_26974_patches.py --live' not in pre, 'live candidate checked before install'
+post=after.split('      - name: Install exact 26974 controlled C trial and prove identical protected source',1)[1].split('      - name: Record actual Ubuntu Actions runner identity',1)[0]
+assert post.count('python3 -S build_26974_incremental.py install')==1
+assert post.count('python3 -S test_26974_patches.py --live')==1
+assert after.index('test_26974_patches.py --frozen') < after.index('build_26974_incremental.py install') < after.index('test_26974_patches.py --live')
 print('PASS 26974 EXACT successful 26973 historical workflow prefix unchanged, additive C-only gates, actual shader SPIR-V Kotlin Java dual-ABI NDK assemble and published artifact preserved')

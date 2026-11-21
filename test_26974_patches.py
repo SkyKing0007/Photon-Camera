@@ -28,6 +28,9 @@ for abbr in ('7','12','40'):
   apply('26974_FORWARD_FULLINDEX.patch');check(c)
   apply('26974_ROLLBACK_FULLINDEX.patch');check(a)
   apply('26974_FORWARD_FULLINDEX.patch');check(c)
+if '--frozen' in sys.argv:
+ b.exact(b.BASE,'26974_BASE_26973_FULL_APP.sha256','26974 real frozen successful 26973 source SHA')
+ b.exact(b.CAND,'26974_EXPECTED_FULL_APP.sha256','26974 frozen transformed candidate SHA')
 if '--live' in sys.argv:
  b.exact(R,'26974_EXPECTED_FULL_APP.sha256','26974 live full 2132 app source SHA')
 print('PASS 26974 full-index git forward/rollback at core.abbrev 7/12/40, zero fuzz, 4 exact original edits')
