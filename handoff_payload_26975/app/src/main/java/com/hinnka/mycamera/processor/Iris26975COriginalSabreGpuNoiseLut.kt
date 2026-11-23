@@ -1,5 +1,5 @@
 package com.hinnka.mycamera.processor
-import com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreNoiseEstimatesLut
+import com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreNoiseEstimatesLut
 
 import android.opengl.EGL14
 import android.opengl.EGLContext

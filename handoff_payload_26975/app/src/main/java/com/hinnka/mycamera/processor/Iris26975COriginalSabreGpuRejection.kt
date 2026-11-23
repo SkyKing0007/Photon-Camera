@@ -1,6 +1,6 @@
 package com.hinnka.mycamera.processor
 
-import com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreRejectionTuning
+import com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreRejectionTuning
 import android.opengl.EGL14
 import android.opengl.EGLContext
 import android.opengl.GLES30

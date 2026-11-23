@@ -1,8 +1,8 @@
 package com.hinnka.mycamera.processor
 
-import com.hinnka.mycamera.processor.experimentc.bjzhou.processor.PhotonSharpenTuning
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.MgcSharpenCurveBuilder
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.RawSharpeningDefaults
+import com.hinnka.mycamera.processor.experimentc.original129.processor.PhotonSharpenTuning
+import com.hinnka.mycamera.processor.experimentc.original129.raw.MgcSharpenCurveBuilder
+import com.hinnka.mycamera.processor.experimentc.original129.raw.RawSharpeningDefaults
 
 /**
  * Experiment C selection adapter. No independently transcribed tuning nodes or

@@ -1,5 +1,5 @@
 package com.hinnka.mycamera.processor
-import com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreKernelTuning
+import com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreKernelTuning
 
 import com.particlesdevs.photoncamera.processing.experimentc.Iris26972CContract
 import android.opengl.EGL14

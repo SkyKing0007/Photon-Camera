@@ -14,7 +14,9 @@ import com.hinnka.mycamera.processor.experimentc.original129.hdr.GainmapSourceSe
 import com.hinnka.mycamera.processor.experimentc.original129.hdr.HdrBuffer
 import com.hinnka.mycamera.processor.experimentc.original129.hdr.HdrBufferEncoding
 import com.hinnka.mycamera.processor.experimentc.original129.hdr.SourceKind
-import com.hinnka.mycamera.processor.experimentc.original129.hdr.UnifiedGainmapProducer
+import com.hinnka.mycamera.processor.experimentc.original129.hdr.GpuReferenceGainmapProducer
+import com.hinnka.mycamera.processor.experimentc.original129.hdr.HdrGainmapStrength
+import com.hinnka.mycamera.processor.experimentc.original129.hdr.NoLookLutRawGainmapSidecar
 import com.hinnka.mycamera.processor.experimentc.original129.processor.GpuLinearRgbStorage
 import com.hinnka.mycamera.processor.experimentc.original129.processor.MultiFrameStacker
 import com.hinnka.mycamera.processor.experimentc.original129.processor.RawNoiseProfileSelection
@@ -44,6 +46,8 @@ import java.io.File
  * gate must remain FALSE until the original JNI/Java ABI and Actions assembly pass.
  */
 internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.Engine {
+    // Reuse the donor GPU context/worker across C captures; do not spawn one per JPEG.
+    private val rawGpuGainmapProducer = GpuReferenceGainmapProducer()
     override fun process(
         context: Context,
         transaction: Iris26972CCaptureToGallery.OriginalTransaction,
@@ -96,6 +100,7 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
         var denoisedSource: com.hinnka.mycamera.processor.experimentc.original129.processor.GpuLinearRgbSource? = null
         var sdr: android.graphics.Bitmap? = null
         var hdr: android.graphics.Bitmap? = null
+        var neutralLookLuma: com.hinnka.mycamera.processor.experimentc.original129.hdr.LuminanceGainMap? = null
         val temporary = File(output.scratchDirectory, "original129_sabre_${transaction.shutterTimeMillis}.jpg")
         require(!temporary.exists()) { "C scratch name collision" }
         try {
@@ -228,6 +233,10 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
                 profileGainTableMap = renderMetadata.profileGainTableMap,
                 profileToneCurve = null,
             ) ?: error("Original Adobe DNG embedded color profile unavailable")
+            check(embeddedPlan.lookTable == null && embeddedPlan.hueSatMap == null &&
+                embeddedPlan.toneCurveLut == null) {
+                "Experiment C original Pro Sabre must never apply a film/look/profile LUT"
+            }
             val rendered = renderer.processDngBufferForHdrSources(
                 context = context, rawData = null,
                 width = merged.width, height = merged.height,
@@ -262,13 +271,18 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
             val hdrBitmap = checkNotNull(hdr) {
                 "Original HDR reference missing; no estimated SDR fallback allowed"
             }
-            val gainmap = UnifiedGainmapProducer().build(
+            // The original GPU RAW gainmap needs an explicit LUT-ratio input.
+            // No film/look LUT is applied: an exact identity sidecar leaves the
+            // HDR-to-SDR gain computed solely by donor RAW HDR/SDR pixels.
+            neutralLookLuma = NoLookLutRawGainmapSidecar.create(checkNotNull(sdr))
+            val gainmap = rawGpuGainmapProducer.build(
                 GainmapSourceSet(
                     sdrBase = checkNotNull(sdr),
+                    lutLuminanceGainMap = neutralLookLuma,
                     hdrReference = HdrBuffer(hdrBitmap, HdrBufferEncoding.LINEAR_SRGB),
                     sourceKind = SourceKind.RAW,
                 ),
-                output.gainmapStrength,
+                HdrGainmapStrength.DEFAULT,
             ) ?: error("Original JPEG/R gainmap unavailable")
             check(stillLive()) { "C session closed before original JPEG/R encoding" }
             val info = CaptureInfo(
@@ -297,6 +311,7 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
             temporary.delete()
             sdr?.recycle()
             hdr?.recycle()
+            neutralLookLuma?.bitmap?.recycle()
             // All original GL texture owners, even failed jobs, return to their renderer.
             val fused = stackResult
             val final = denoisedSource

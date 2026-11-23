@@ -13,9 +13,9 @@ internal object Iris26975CDonorSabreMergedNoiseModel {
 
     /** Backwards-compatible C-only API; the original pinned donor owns the algorithm. */
     fun merge(frames: List<Frame>, referenceSnr: Float, noiseSpectrumSeed: Float = 1f): Output {
-        val donor = com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreMergedNoiseModel.merge(
+        val donor = com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreMergedNoiseModel.merge(
             frames.map { frame ->
-                com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreMergedNoiseModel.Frame(
+                com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreMergedNoiseModel.Frame(
                     frame.read, frame.shot)
             },
             referenceSnr, noiseSpectrumSeed)
@@ -41,6 +41,6 @@ internal object Iris26975CDonorSabreMergedNoiseModel {
 
     /** Delegate the V25 SNR variance correction to the original pinned donor. */
     internal fun snrCorrection(referenceSnr: Float): Float =
-        com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreMergedNoiseModel
+        com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreMergedNoiseModel
             .snrCorrection(referenceSnr)
 }

@@ -1,6 +1,6 @@
 package com.hinnka.mycamera.processor.experimentc
 
-import com.hinnka.mycamera.processor.experimentc.bjzhou.processor.RawNoiseModel
+import com.hinnka.mycamera.processor.experimentc.original129.processor.RawNoiseModel
 
 /** Camera2 physical Bayer ordering adapter; the donor owns all noise sanitization and mapping. */
 internal object Iris26975CDonorCamera2Noise {

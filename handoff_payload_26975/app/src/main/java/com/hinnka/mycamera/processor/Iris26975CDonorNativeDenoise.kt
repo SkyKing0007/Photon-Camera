@@ -34,7 +34,7 @@ internal object Iris26975CDonorNativeDenoise {
         fused: Iris26972CDonorSabreGpuResolve.Result,
         referenceSignal: Float,
         shading: Iris26972CPhysicalLensShading.Frozen,
-        mergedNoise: com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreMergedNoiseModel.Output,
+        mergedNoise: com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreMergedNoiseModel.Output,
     ) {
         fused.requireOwner()
         gpu.requireCurrentContext()

@@ -1,7 +1,7 @@
 package com.hinnka.mycamera.processor
 
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.DcpDefaultBlackRender
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.RawProfileExposureGl
+import com.hinnka.mycamera.processor.experimentc.original129.raw.DcpDefaultBlackRender
+import com.hinnka.mycamera.processor.experimentc.original129.raw.RawProfileExposureGl
 
 /**
  * Experiment C's immutable parameterization of the ORIGINAL bjzhou/PhotonCamera

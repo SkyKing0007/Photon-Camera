@@ -1,5 +1,5 @@
 package com.hinnka.mycamera.processor
-import com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreAlignmentOffset
+import com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreAlignmentOffset
 
 import android.opengl.EGL14
 import android.opengl.EGLContext
