@@ -1924,11 +1924,11 @@ internal object GlesMgcRawSpatialShaders {
             return exp2(-0.5 * kernelDistance) + 0.00005;
         }
 
-        vec3 unpackCovariance(vec3 packed) {
+        vec3 unpackCovariance(vec3 packedValue) {
             return vec3(
-                packed.x * uCovRangeRg.y + uCovRangeRg.x,
-                packed.y * uCovRangeRg.w + uCovRangeRg.z,
-                packed.z * uCovRangeB.y + uCovRangeB.x
+                packedValue.x * uCovRangeRg.y + uCovRangeRg.x,
+                packedValue.y * uCovRangeRg.w + uCovRangeRg.z,
+                packedValue.z * uCovRangeB.y + uCovRangeB.x
             );
         }
 
@@ -2024,13 +2024,13 @@ internal object GlesMgcRawSpatialShaders {
         uniform ivec2 uQuadSize;
         layout(location = 0) out highp int oBayerFixed16;
         void main() {
-            ivec2 packed = clamp(
+            ivec2 packedValue = clamp(
                 ivec2(gl_FragCoord.xy),
                 ivec2(0),
                 ivec2(uQuadSize.x - 1, uQuadSize.y * 4 - 1)
             );
-            int phase = packed.y / uQuadSize.y;
-            ivec2 quad = ivec2(packed.x, packed.y - phase * uQuadSize.y);
+            int phase = packedValue.y / uQuadSize.y;
+            ivec2 quad = ivec2(packedValue.x, packedValue.y - phase * uQuadSize.y);
             ivec2 phaseOffset = ivec2(phase & 1, phase >> 1);
             ivec2 source = min(quad * 2 + phaseOffset, uSourceSize - ivec2(1));
             vec2 valueAndWeight = texelFetch(uBayerAndWeight, source, 0).rg;

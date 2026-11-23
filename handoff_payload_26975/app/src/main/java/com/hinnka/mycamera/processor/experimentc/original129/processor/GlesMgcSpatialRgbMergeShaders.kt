@@ -210,14 +210,14 @@ internal object GlesMgcSpatialRgbMergeShaders {
         layout(location = 0) out highp int oFixed16;
 
         void main() {
-            ivec2 packed = ivec2(gl_FragCoord.xy);
-            ivec2 cell = packed / uPlaneSize;
+            ivec2 packedValue = ivec2(gl_FragCoord.xy);
+            ivec2 cell = packedValue / uPlaneSize;
             int channel = cell.y * uAtlasColumns + cell.x;
             if (channel > 2) {
                 oFixed16 = 0;
                 return;
             }
-            ivec2 p = min(packed - cell * uPlaneSize, uSourceSize - ivec2(1));
+            ivec2 p = min(packedValue - cell * uPlaneSize, uSourceSize - ivec2(1));
             float sum = channel == 0 ? texelFetch(uSumRed, p, 0).r :
                 (channel == 1 ? texelFetch(uSumGreen, p, 0).r : texelFetch(uSumBlue, p, 0).r);
             float merged = sum / max(texelFetch(uWeightSum, p, 0).r, 1.0e-8) * uSignalScale;

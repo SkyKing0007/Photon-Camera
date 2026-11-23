@@ -65,7 +65,7 @@ internal object MgcStrengthReadbackShaders {
             int byteCount = uPlaneSize.x * uPlaneSize.y * uPlaneCount;
             int first = wordIndex * 4;
             if (first >= byteCount) return;
-            uint packed = 0u;
+            uint packedValue = 0u;
             for (int lane = 0; lane < 4; ++lane) {
                 int index = first + lane;
                 if (index >= byteCount) break;
@@ -74,9 +74,9 @@ internal object MgcStrengthReadbackShaders {
                     0.0,
                     1.0
                 ) * 255.0));
-                packed |= value << uint(lane * 8);
+                packedValue |= value << uint(lane * 8);
             }
-            words[wordIndex] = packed;
+            words[wordIndex] = packedValue;
         }
     """.trimIndent()
 
@@ -110,14 +110,14 @@ internal object MgcStrengthReadbackShaders {
             int valueCount = uPlaneSize.x * uPlaneSize.y * uPlaneCount;
             int first = wordIndex * 2;
             if (first >= valueCount) return;
-            uint packed = 0u;
+            uint packedValue = 0u;
             for (int lane = 0; lane < 2; ++lane) {
                 int index = first + lane;
                 if (index >= valueCount) break;
                 uint bits = uint(texelFetch(uSource, atlasPosition(index), 0).r) & 0xffffu;
-                packed |= bits << uint(lane * 16);
+                packedValue |= bits << uint(lane * 16);
             }
-            words[wordIndex] = packed;
+            words[wordIndex] = packedValue;
         }
     """.trimIndent()
 }

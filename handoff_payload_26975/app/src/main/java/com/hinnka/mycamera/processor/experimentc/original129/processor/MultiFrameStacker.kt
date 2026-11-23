@@ -1,18 +1,12 @@
 package com.hinnka.mycamera.processor.experimentc.original129.processor
 
-import android.graphics.Bitmap
-import android.graphics.ColorSpace
 import android.graphics.Rect
 import com.hinnka.mycamera.processor.experimentc.original129.utils.PLog
 import java.nio.ByteBuffer
-import com.hinnka.mycamera.processor.experimentc.original129.camera.AspectRatio
-import com.hinnka.mycamera.processor.experimentc.original129.camera.MultiFrameConfig
-import com.hinnka.mycamera.processor.experimentc.original129.model.SafeImage
 import com.hinnka.mycamera.processor.experimentc.original129.raw.DngProfileGainTableMap
 import com.hinnka.mycamera.processor.experimentc.original129.raw.MgcSpatialStrengthMap
 import com.hinnka.mycamera.processor.experimentc.original129.raw.RawProfileToneMapMode
 import com.hinnka.mycamera.processor.experimentc.original129.raw.RawSceneAERawStats
-import com.hinnka.mycamera.processor.experimentc.original129.utils.BitmapUtils
 
 enum class RawStackBufferLayout {
     CFA,
@@ -142,18 +136,6 @@ data class RawStackResult(
     val mgcSpatialReferenceOnlyDiagnostic: Boolean = false,
 )
 
-enum class YuvHdrStackFrameRole {
-    ZERO_EV,
-    HIGH_EV,
-    LOW_EV,
-}
-
-data class YuvHdrStackFrame(
-    val image: SafeImage,
-    val exposureProduct: Float,
-    val role: YuvHdrStackFrameRole,
-)
-
 /**
  * Multi-Frame Stacker
  * 
@@ -163,118 +145,9 @@ data class YuvHdrStackFrame(
 object MultiFrameStacker {
     private const val TAG = "MultiFrameStacker"
 
-    /**
-     * Process a burst of images and return a stacked Bitmap.
-     * 
-     * @param images List of captured Images (YUV_420_888).
-     * @return Stacked Bitmap (ARGB_8888), or null if failed.
+    /** RAW-only Experiment C interface: original Pro-mode Sabre source below.
+     * YUV/photo-mode merger removed: not reachable from Iris Experiment C.
      */
-    @Synchronized
-    fun processBurst(
-        images: List<SafeImage>,
-        rotation: Int,
-        aspectRatio: AspectRatio?,
-        outputScale: Float = MultiFrameConfig.DEFAULT_SUPER_RESOLUTION_SCALE,
-        colorSpace: ColorSpace,
-    ): Bitmap? {
-        if (images.isEmpty()) return null
-
-        val width = images[0].width
-        val height = images[0].height
-
-        val scale = MultiFrameConfig.normalizeOutputScale(outputScale)
-        val dimensions = BitmapUtils.calculateProcessedRect(width, height, aspectRatio, null, rotation)
-        // Match preparePhoto: scale the input bounds, then apply the aspect crop and rotation.
-        // Keep the native crop separately so rounding never changes the sampled field of view.
-        val outputDimensions = BitmapUtils.calculateProcessedRect(
-            MultiFrameConfig.scaledRawOutputDimension(width, scale),
-            MultiFrameConfig.scaledRawOutputDimension(height, scale),
-            aspectRatio,
-            null,
-            rotation,
-        )
-
-        val inputFormat = images[0].format
-        if (!GlesYuvStacker.supportsImageFormat(inputFormat)) {
-            PLog.w(TAG, "GLES streaming stacker does not support image format=$inputFormat")
-            images.forEach { it.close() }
-            return null
-        }
-        RawStackRuntimeDebug.i(TAG) {
-            "Starting GLES streaming stacking process for ${images.size} frames ($width x $height). outputScale=$scale"
-        }
-        return try {
-            GlesYuvStacker(
-                width = width,
-                height = height,
-                outputWidth = outputDimensions.width(),
-                outputHeight = outputDimensions.height(),
-                rotation = rotation,
-                colorSpace = colorSpace,
-                inputFormat = inputFormat,
-                outputScale = scale,
-                referenceOutputWidth = dimensions.width(),
-                referenceOutputHeight = dimensions.height(),
-            ).process(images).also { result ->
-                if (result == null) {
-                    PLog.w(TAG, "GLES streaming stacker failed")
-                }
-            }
-        } finally {
-            images.forEach { it.close() }
-        }
-    }
-
-    @Synchronized
-    fun processHdrBurstYuv(
-        frames: List<YuvHdrStackFrame>,
-        fusionExposureProducts: FloatArray?,
-        rotation: Int,
-        aspectRatio: AspectRatio?,
-        colorSpace: ColorSpace,
-    ): Bitmap? {
-        if (frames.size < 3) return null
-        val images = frames.map { it.image }
-        val width = images[0].width
-        val height = images[0].height
-        val dimensions = BitmapUtils.calculateProcessedRect(width, height, aspectRatio, null, rotation)
-        val inputFormat = images[0].format
-
-        if (!GlesYuvStacker.supportsImageFormat(inputFormat)) {
-            PLog.w(TAG, "GLES HDR YUV stacker does not support image format=$inputFormat")
-            images.forEach { it.close() }
-            return null
-        }
-
-        val result = try {
-            GlesYuvStacker(
-                width = width,
-                height = height,
-                outputWidth = dimensions.width(),
-                outputHeight = dimensions.height(),
-                rotation = rotation,
-                colorSpace = colorSpace,
-                inputFormat = inputFormat,
-            ).processHdr(
-                frames = frames.map {
-                    GlesYuvStacker.HdrInputFrame(
-                        image = it.image,
-                        exposureProduct = it.exposureProduct,
-                        role = when (it.role) {
-                            YuvHdrStackFrameRole.ZERO_EV -> GlesYuvStacker.HdrFrameRole.ZERO_EV
-                            YuvHdrStackFrameRole.HIGH_EV -> GlesYuvStacker.HdrFrameRole.HIGH_EV
-                            YuvHdrStackFrameRole.LOW_EV -> GlesYuvStacker.HdrFrameRole.LOW_EV
-                        },
-                    )
-                },
-                exposureProducts = fusionExposureProducts,
-            )
-        } finally {
-            images.forEach { it.close() }
-        }
-        return result
-    }
-
     @Synchronized
     fun processBurstRaw(
         frames: List<RawStackFrame>,

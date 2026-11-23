@@ -481,11 +481,11 @@ internal object GlesMgcRawSabreShaders {
             return exp2(-0.5 * kernelDistance) + 0.00005;
         }
 
-        vec3 unpackCovariance(vec3 packed) {
+        vec3 unpackCovariance(vec3 packedValue) {
             return vec3(
-                packed.x * uCovRangeRg.y + uCovRangeRg.x,
-                packed.y * uCovRangeRg.w + uCovRangeRg.z,
-                packed.z * uCovRangeB.y + uCovRangeB.x
+                packedValue.x * uCovRangeRg.y + uCovRangeRg.x,
+                packedValue.y * uCovRangeRg.w + uCovRangeRg.z,
+                packedValue.z * uCovRangeB.y + uCovRangeB.x
             );
         }
 
