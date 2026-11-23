@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 26975 V6: mandatory exact successful 26974 V3 24 physical shaders PLUS
-# all 178 independently extracted, SHA-pinned static Kotlin donor/Iris C GLSL.
+# all 145 independently extracted, SHA-pinned current V8 RAW-only Kotlin C GLSL.
 # Never rely only on 26974's stale expanded shader snapshot. Dynamic Kotlin
 # assembled shaders are explicitly audited but cannot be compile-proven offline.
 set -eEuo pipefail
@@ -46,7 +46,7 @@ mapfile -t SOURCES < <(find "$INPUT" -maxdepth 1 -type f \( -name '*.vert' -o -n
 COUNT="$(python3 -S - <<'PY'
 import json
 v=json.load(open('26975_V6_CURRENT_SHADER_INVENTORY.json'))
-assert v['static_count'] == 178 and v['source_count'] == v['static_count'] + v['dynamic_count']
+assert v['static_count'] == 145 and v['dynamic_count'] == 148 and v['source_count'] == v['static_count'] + v['dynamic_count']
 print(v['static_count'])
 PY
 )"
@@ -54,7 +54,7 @@ PY
 WORK="$PWD/.photon_26975_work/26975_v6_shader_spirv"
 mkdir -p "$WORK"
 # Always report actual failure, never substitute an old receipt.
-trap 'rc=$?; echo "26975 V6 physical current GLSL compile FAILED $rc" >&2; [ -f "$LOG" ] && tail -n 75 "$LOG" >&2 || :; exit "$rc"' ERR
+trap 'rc=$?; rm -f -- "$TMP"; if [ "$rc" -ne 0 ]; then echo "26975 V8 current-source GLSL compiler FAILED with exit $rc" >&2; if [ -f "$LOG" ]; then tail -n 120 "$LOG" >&2; fi; fi' EXIT
 {
  "$COMPILER" --version
  spirv-val --version
@@ -81,9 +81,9 @@ trap 'rc=$?; echo "26975 V6 physical current GLSL compile FAILED $rc" >&2; [ -f 
    spirv-val --target-env opengl4.5 "$WORK/$BASE.opt.spv"
    sha256sum "$WORK/$BASE.spv" "$WORK/$BASE.opt.spv"
  done
- echo "PASS 26975 V6 physical current $COUNT/$COUNT static donor/Iris C ESSL GLSL + SPIR-V opt/val; independently pinned source inventory"
+ echo "PASS 26975 V8 physical current $COUNT/$COUNT static donor/Iris C ESSL GLSL + SPIR-V opt/val; independently pinned source inventory"
  echo 'NOT RUN/NOT PROVEN: dynamic Kotlin-assembled donor shader compile on physical Android GPU (cannot honestly substitute static template validation)'
 } > "$LOG" 2>&1
-trap - ERR
+trap 'rm -f -- "$TMP"' EXIT
 cp "$LOG" "$OUT/26975_V6_STATIC_GLSL_SPIRV_RECEIPT.txt"
-printf '%s\n' "PASS inherited historical 24/24 and actual current $COUNT/$COUNT V6 donor/Iris C shader compilation with pinned glslang/SPIR-V toolchain; dynamic runtime GLSL still needs device" >> "$OUT/26975_REAL_GLSL_SPIRV_COMPILER.txt"
+printf '%s\n' "PASS inherited historical 24/24 and actual current $COUNT/$COUNT V8 donor/Iris C shader compilation with pinned glslang/SPIR-V toolchain; dynamic runtime GLSL still needs device" >> "$OUT/26975_REAL_GLSL_SPIRV_COMPILER.txt"

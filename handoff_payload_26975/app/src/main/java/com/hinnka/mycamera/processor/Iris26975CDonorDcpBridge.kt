@@ -1,11 +1,11 @@
 package com.hinnka.mycamera.processor
 
 import android.opengl.GLES30
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.ColorSpace
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.DcpDefaultBlackRender
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.DcpHueSatMap
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.DcpRenderPlan
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.DcpTextureResources
+import com.hinnka.mycamera.processor.experimentc.original129.raw.ColorSpace
+import com.hinnka.mycamera.processor.experimentc.original129.raw.DcpDefaultBlackRender
+import com.hinnka.mycamera.processor.experimentc.original129.raw.DcpHueSatMap
+import com.hinnka.mycamera.processor.experimentc.original129.raw.DcpRenderPlan
+import com.hinnka.mycamera.processor.experimentc.original129.raw.DcpTextureResources
 
 /**
  * A C-only type/GL boundary for *real supplied* DCP HueSat/Look profile tables.

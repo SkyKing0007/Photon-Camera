@@ -167,7 +167,7 @@ internal object Iris26972CDonorSabreGpuResolve {
             val (redX, redY) = when (plan.cfaPattern) {
                 0 -> 0 to 0; 1 -> 1 to 0; 2 -> 0 to 1; else -> 1 to 1
             }
-            val parameters = com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreResolveTuning.build(
+            val parameters = com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreResolveTuning.build(
                 plan.referenceSnr, plan.desiredExposureProduct, plan.actualExposureProduct)
             val demosaicScale = plan.sensorWhiteLevelScaledToMgc14 * parameters.demosaicSharpness
             check(demosaicScale.isFinite() && demosaicScale > 0f) {

@@ -3,16 +3,16 @@ package com.hinnka.mycamera.processor
 import android.opengl.EGL14
 import android.opengl.EGLContext
 import android.opengl.GLES30
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.DcpTextureResources
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.MgcGuidedUpsample
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.RawCurveTextureResources
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.RawEngineTonePass
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.RawFullscreenQuad
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.RawLinearRcdPass
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.RawProfileExposureGl
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.RawRenderingEngine
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.RawSrgbPass
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.RawToneMappingParameters
+import com.hinnka.mycamera.processor.experimentc.original129.raw.DcpTextureResources
+import com.hinnka.mycamera.processor.experimentc.original129.raw.MgcGuidedUpsample
+import com.hinnka.mycamera.processor.experimentc.original129.raw.RawCurveTextureResources
+import com.hinnka.mycamera.processor.experimentc.original129.raw.RawEngineTonePass
+import com.hinnka.mycamera.processor.experimentc.original129.raw.RawFullscreenQuad
+import com.hinnka.mycamera.processor.experimentc.original129.raw.RawLinearRcdPass
+import com.hinnka.mycamera.processor.experimentc.original129.raw.RawProfileExposureGl
+import com.hinnka.mycamera.processor.experimentc.original129.raw.RawRenderingEngine
+import com.hinnka.mycamera.processor.experimentc.original129.raw.RawSrgbPass
+import com.hinnka.mycamera.processor.experimentc.original129.raw.RawToneMappingParameters
 
 /**
  * C-private EGL and donor Adobe adapter; all MGC guided kernels, FBO layouts,

@@ -7,6 +7,7 @@ No commit, push, partial compilation, platform verification bypass or A/B fallba
 """
 import argparse,gzip,hashlib,io,json,os,pathlib,re,shutil,subprocess,sys,tarfile,urllib.request,zipfile
 R=pathlib.Path(__file__).resolve().parent
+SHADER_COUNT=145 # exact current V8 physical shader inventory; not skip
 TMP=R/'.photon_26975_work';OUT=R/'photon_26975_outputs'
 ART=TMP/'26974-success.zip';BASE=TMP/'authority_26974';CAND=TMP/'candidate_26975'
 REPO='SkyKing0007/Photon-Camera';BRANCH='experimental-clean-photon-rebuild'
@@ -18,7 +19,7 @@ WORKFLOW_SHA='3aba27e38220f8c8995b807ec91b58a82fe68d3e385226b3b3849f3f6f81ef5b'
 PRIOR_APK_SHA='25ad6df699e9a232b2f76fbc50777acf376bd13f8a6f07f63909ea3d5c9247e9'
 PRIOR_APK_NAME='IrisCamera-0.9726974-26974-iris-rawr-debug.apk'
 APKNAME='IrisCamera-0.9726975-26975-iris-rawr-debug.apk'
-NBASE=2132;NFILES=2502;NCHANGE=392;NADDED=370;NMODIFIED=22;NDELETED=0;NPROTECTED=2110
+NBASE=2132;NFILES=2447;NCHANGE=337;NADDED=315;NMODIFIED=22;NDELETED=0;NPROTECTED=2110
 NATIVE_SHA={
  'lib/arm64-v8a/liblkrpipeline.so':'037a5f62649dcac7034c789c8e7ea2f250ca818d1c1c364e09a59f6897530105',
  'lib/arm64-v8a/libsrpipeline.so':'f87cc70ad12a69345392a4eb73b6ec33739577ce8c39b7a4916180c344f67069',
@@ -228,9 +229,9 @@ def verify_compiled():
  regress();success=OUT/'26974_SUCCESSFUL_REAL_GLSL_SPIRV_COMPILER.txt'
  current=OUT/'26975_REAL_GLSL_SPIRV_COMPILER.txt'
  if not success.is_file() or 'PASS actual 26974 24/24 C GLES' not in success.read_text():fail('26974 actual successful shader proof missing')
- if not current.is_file() or 'PASS actual 26974 24/24 C GLES' not in current.read_text() or 'PASS inherited historical 24/24 and actual current 178/178 V6 donor/Iris C shader compilation' not in current.read_text():fail('current Actions 24/24 + V6 178/178 shader recompilation proof missing')
+ if not current.is_file() or 'PASS actual 26974 24/24 C GLES' not in current.read_text() or 'PASS inherited historical 24/24 and actual current {SHADER_COUNT}/{SHADER_COUNT} V8 donor/Iris C shader compilation'.format(SHADER_COUNT=SHADER_COUNT) not in current.read_text():fail('current Actions 24/24 + V8 145/145 shader recompilation proof missing')
  v6=OUT/'26975_V6_CURRENT_STATIC_GLSL_SPIRV_COMPILER.txt'
- if not v6.is_file() or 'PASS 26975 V6 physical current 178/178 static donor/Iris C ESSL GLSL + SPIR-V opt/val' not in v6.read_text():fail('current C shader parser and SPIR-V optimizer must actually pass')
+ if not v6.is_file() or f'PASS 26975 V8 physical current {SHADER_COUNT}/{SHADER_COUNT} static donor/Iris C ESSL GLSL + SPIR-V opt/val' not in v6.read_text():fail('current C shader parser and SPIR-V optimizer must actually pass')
  for p,want in NATIVE_SHA.items():
   if sha(R/'app/build/verified_rawlens26931/jniLibs'/p.removeprefix('lib/'))!=want:fail('staged dual ABI LKR mismatch')
  for p,want in DONOR_SHA.items():
@@ -258,7 +259,7 @@ def finalize():
   if not any(x.startswith('lib/arm64-v8a/libiris26972c.so') for x in apk.namelist()):fail('original C native library not linked')
  exact(R,'26975_EXPECTED_FULL_APP.sha256','actual assembled 26975 source unchanged')
  OUT.mkdir(exist_ok=True)
- (OUT/'26975_COMPILER_STATUS.txt').write_text('REAL PINNED GLSL COMPILE: PASS\nREAL SPIR-V VALIDATION/OPTIMIZATION: PASS\nREAL KOTLIN COMPILE: PASS\nREAL JAVA COMPILE: PASS\nREAL TWO-ABI NDK/CMake COMPILE: PASS\nREAL ANDROID Gradle :app:assembleDebug: PASS\nRUNTIME SOURCE INVARIANCE: PASS (2110 protected, 22 modified, 375 added)\nEXPERIMENT C CONTROLLED DEVICE TRIAL: ENABLED\nEXPERIMENT C PRODUCTION READY: NO\nDEVICE IQ VALIDATION: NOT RUN\n')
+ (OUT/'26975_COMPILER_STATUS.txt').write_text('REAL PINNED GLSL COMPILE: PASS\nREAL SPIR-V VALIDATION/OPTIMIZATION: PASS\nREAL KOTLIN COMPILE: PASS\nREAL JAVA COMPILE: PASS\nREAL TWO-ABI NDK/CMake COMPILE: PASS\nREAL ANDROID Gradle :app:assembleDebug: PASS\nRUNTIME SOURCE INVARIANCE: PASS (2110 protected, 22 modified, 315 added)\nEXPERIMENT C CONTROLLED DEVICE TRIAL: ENABLED\nEXPERIMENT C PRODUCTION READY: NO\nDEVICE IQ VALIDATION: NOT RUN\n')
  (OUT/'26975_REAL_GRADLE_TASKS.txt').write_text(''.join('PASS '+p+'\n' for p in tasks))
  (OUT/'26975_APK.sha256').write_text(sha(R/APKNAME)+'  '+APKNAME+'\n')
  wf=R/'.github/workflows/build-26975-change-aware.yml'

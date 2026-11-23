@@ -58,7 +58,7 @@ internal object Iris26972CDngColorMath {
         require(gains.all { it.isFinite() && it > 0f }) {
             "$COMPONENT non-finite as-shot Camera2 gain normalization"
         }
-        val donor = com.hinnka.mycamera.processor.experimentc.bjzhou.raw.DngSdkColorSpec
+        val donor = com.hinnka.mycamera.processor.experimentc.original129.raw.DngSdkColorSpec
         val dng = donor.computeCameraToPcsD50(
             input.colorMatrix1, input.colorMatrix2,
             input.forwardMatrix1, input.forwardMatrix2,
@@ -80,10 +80,10 @@ internal object Iris26972CDngColorMath {
             cameraCalibration1 = input.calibrationMatrix1,
             cameraCalibration2 = input.calibrationMatrix2,
         ) ?: throw IllegalArgumentException("$COMPONENT original donor scene white unavailable")
-        val xyzToProfile = requireNotNull(donor.computeXyzD50ToGamut(com.hinnka.mycamera.processor.experimentc.bjzhou.raw.ColorSpace.ProPhoto)) {
+        val xyzToProfile = requireNotNull(donor.computeXyzD50ToGamut(com.hinnka.mycamera.processor.experimentc.original129.raw.ColorSpace.ProPhoto)) {
             "$COMPONENT original ProPhoto PCS transform unavailable"
         }
-        val xyzToSrgb = requireNotNull(donor.computeXyzD50ToGamut(com.hinnka.mycamera.processor.experimentc.bjzhou.raw.ColorSpace.SRGB)) {
+        val xyzToSrgb = requireNotNull(donor.computeXyzD50ToGamut(com.hinnka.mycamera.processor.experimentc.original129.raw.ColorSpace.SRGB)) {
             "$COMPONENT original linear sRGB transform unavailable"
         }
         val profileToXyz = requireNotNull(donor.invertMatrix3x3(xyzToProfile)) {

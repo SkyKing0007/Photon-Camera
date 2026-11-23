@@ -1,7 +1,7 @@
 package com.hinnka.mycamera.processor
 
 import com.particlesdevs.photoncamera.processing.experimentc.Iris26972CContract
-import com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcAlignmentInputScale
+import com.hinnka.mycamera.processor.experimentc.original129.processor.MgcAlignmentInputScale
 import com.hinnka.mycamera.processor.experimentc.Iris26975CDonorCamera2Noise
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager

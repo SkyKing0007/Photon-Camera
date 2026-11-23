@@ -3,7 +3,7 @@ package com.hinnka.mycamera.processor
 import android.opengl.EGL14
 import android.opengl.EGLContext
 import android.opengl.GLES30
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.RawHdrReferenceMath
+import com.hinnka.mycamera.processor.experimentc.original129.raw.RawHdrReferenceMath
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 

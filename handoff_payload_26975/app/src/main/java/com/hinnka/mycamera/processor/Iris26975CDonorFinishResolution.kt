@@ -1,6 +1,6 @@
 package com.hinnka.mycamera.processor
 
-import com.hinnka.mycamera.processor.experimentc.bjzhou.raw.MgcFinishResolution
+import com.hinnka.mycamera.processor.experimentc.original129.raw.MgcFinishResolution
 
 /**
  * Experiment C-only ABI adapter. All MGC V25 FinishShot resolution policy is

@@ -1,5 +1,5 @@
 package com.hinnka.mycamera.processor
-import com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreAlignmentOffset
+import com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreAlignmentOffset
 
 import com.particlesdevs.photoncamera.processing.experimentc.Iris26972CContract
 import android.opengl.EGL14
@@ -175,15 +175,15 @@ internal object Iris26972CDonorSabreGpuBurst {
             // original Adobe HDR reference. Final guided SDR sharpening follows.
             // HDR must use the same denoised camera-RGB source as the SDR prepass,
             // never the earlier provisional C custom color developer.
-            val params = com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreResolveTuning.build(
+            val params = com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreResolveTuning.build(
                 burst.resolve.referenceSnr,burst.resolve.desiredExposureProduct,
                 burst.resolve.actualExposureProduct)
             // The donor constructs merged read/shot/correlation from the actual
             // admitted Camera2 RAW frames; do not infer it from output residuals.
             val mergedNoise =
-                com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreMergedNoiseModel.merge(
+                com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreMergedNoiseModel.merge(
                     burst.frozenFrames.map { frame ->
-                        com.hinnka.mycamera.processor.experimentc.bjzhou.processor.MgcSabreMergedNoiseModel.Frame(
+                        com.hinnka.mycamera.processor.experimentc.original129.processor.MgcSabreMergedNoiseModel.Frame(
                             frame.cameraRgbReadNoise, frame.cameraRgbShotNoise)
                     },
                     burst.frozenFrames.first().raw.referenceSnr,
