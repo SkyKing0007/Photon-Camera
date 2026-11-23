@@ -11,7 +11,7 @@ import com.hinnka.mycamera.processor.experimentc.original129.processor.PhotonCor
 import com.hinnka.mycamera.processor.experimentc.original129.utils.PLog
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
-import com.google.ai.edge.litert.support.common.FileUtil
+import org.tensorflow.lite.support.common.FileUtil
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.abs
