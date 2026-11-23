@@ -46,8 +46,9 @@ assert 'CONTROLLED_DEVICE_TRIAL_ENABLED' in contract
 native=file('app/src/main/cpp/iris26975c/Iris26975Original129JniTrampolines.cpp')
 assert 'Java_com_hinnka_mycamera_processor_experimentc_original129' in native
 build=file('app/build.gradle')
-for component in ('litert:2.3.2','litert-gpu:2.3.2','litert-support:2.3.2'):
+for component in ('litert:2.2.0','litert-support:1.4.2'):
  assert component in build,component
+assert not re.search(r"^\s*implementation\s+['\"]com\.google\.ai\.edge\.litert:litert-(?:gpu|support):2\.2\.0['\"]", build, re.M)
 print(f'PASS {"LIVE" if a.live else "PAYLOAD"} 26975 original Pro Sabre 1x Lanczos3 2..30, original HDR/JPEG-R, Iris DCIM/Camera, strict trial/production gate; {len(changed)} allowlisted changes, {len(base)-22} protected')
 
 # V5: verified donor optional style assets pruned, never the actual RAW processing assets.

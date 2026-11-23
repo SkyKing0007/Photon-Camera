@@ -147,7 +147,7 @@ def main():
     assets=asset_audit()
     manifest=[{k:x[k] for k in ('location','hash','kind','stage','bytes','version')} for x in entries]
     manifest.sort(key=lambda v:(v['location'],v['hash']))
-    actual={'version':'26975-v8-current-actual-RAW-only-donor-and-Iris-C-shaders',
+    actual={'version':'26975-v9-current-actual-RAW-only-donor-and-Iris-C-shaders',
             'sources':manifest,
             'source_count':len(manifest),
             'static_count':sum(s['kind']=='static' for s in manifest),
