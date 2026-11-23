@@ -53,37 +53,92 @@ PY
 [ "${#SOURCES[@]}" -eq "$COUNT" ] || { echo "26975 V6 BLOCKED: only ${#SOURCES[@]} of $COUNT current static shaders extracted" >&2; exit 7; }
 WORK="$PWD/.photon_26975_work/26975_v6_shader_spirv"
 mkdir -p "$WORK"
-# Always report actual failure, never substitute an old receipt.
-trap 'rc=$?; rm -f -- "$TMP"; if [ "$rc" -ne 0 ]; then echo "26975 V9 current-source GLSL compiler FAILED with exit $rc" >&2; if [ -f "$LOG" ]; then tail -n 120 "$LOG" >&2; fi; fi' EXIT
-{
- "$COMPILER" --version
- spirv-val --version
- spirv-opt --version
- sha256sum "$INPUT"/*.{frag,comp,vert} 2>/dev/null || :
- for SRC in "${SOURCES[@]}"; do
-   BASE="$(basename "$SRC")"
-   TYPE="${BASE##*.}"
-   case "$TYPE" in frag|vert|comp) ;; *) echo 'invalid source stage' >&2; exit 8;; esac
-   echo "VERIFY CURRENT C GLSL $BASE stage=$TYPE"
-   # Actual ESSL 300/310 parser and semantic checks, not just regex.
-   "$COMPILER" -S "$TYPE" "$SRC"
-   # Historical 26974 SPIR-V mechanics require ESSL >= 310 for -G.
-   CONVERTED="$WORK/$BASE"
-   if grep -q '^#version 300 es$' "$SRC"; then
-     sed '1s/#version 300 es/#version 310 es/' "$SRC" > "$CONVERTED"
-   else
-     cp "$SRC" "$CONVERTED"
-   fi
-   "$COMPILER" -S "$TYPE" "$CONVERTED"
-   "$COMPILER" -G --auto-map-locations --auto-map-bindings -S "$TYPE" -o "$WORK/$BASE.spv" "$CONVERTED"
-   spirv-val --target-env opengl4.5 "$WORK/$BASE.spv"
-   spirv-opt --target-env=opengl4.5 -O "$WORK/$BASE.spv" -o "$WORK/$BASE.opt.spv"
-   spirv-val --target-env opengl4.5 "$WORK/$BASE.opt.spv"
-   sha256sum "$WORK/$BASE.spv" "$WORK/$BASE.opt.spv"
- done
- echo "PASS 26975 V9 physical current $COUNT/$COUNT static donor/Iris C ESSL GLSL + SPIR-V opt/val; independently pinned source inventory"
- echo 'NOT RUN/NOT PROVEN: dynamic Kotlin-assembled donor shader compile on physical Android GPU (cannot honestly substitute static template validation)'
-} > "$LOG" 2>&1
-trap 'rm -f -- "$TMP"' EXIT
+# V9 Step 60 correction: preserve every real compiler/optimizer/validator gate.
+# Emit the EXACT failing phase, shader name, and originating Kotlin file to
+# GitHub Actions immediately. Report ALL failures in this one run and fail
+# closed after the full inventory. Do not hide diagnostics in a redirected brace.
+printf '%s\n' \
+  '26975 V9 ACTUAL STATIC GLSL/SPIR-V COMPILATION BEGIN' \
+  "static_shader_count=$COUNT" > "$LOG"
+"$COMPILER" --version >> "$LOG" 2>&1
+spirv-val --version >> "$LOG" 2>&1
+spirv-opt --version >> "$LOG" 2>&1
+sha256sum "${SOURCES[@]}" >> "$LOG"
+
+shader_origin() {
+ python3 -S - "$INPUT/COMPILATION_METADATA.json" "$1" <<'PYMETA'
+import json,sys
+records=json.load(open(sys.argv[1],encoding='utf8'))
+matching=[x for x in records if x['file']==sys.argv[2]]
+if len(matching)!=1:
+ raise SystemExit('26975 V9 BLOCKED: shader metadata missing or ambiguous '+sys.argv[2])
+print(matching[0]['location'])
+PYMETA
+}
+run_checked_phase() {
+ # Does NOT treat a failing compiler as success; only captures its evidence.
+ local source_name="$1" origin="$2" phase="$3"
+ shift 3
+ local command_log="$WORK/26975_v9_last_phase.log" code=0
+ printf 'RUN shader=%s origin=%s phase=%s command=' "$source_name" "$origin" "$phase" >> "$LOG"
+ printf '%q ' "$@" >> "$LOG"
+ printf '\n' >> "$LOG"
+ if "$@" > "$command_log" 2>&1; then
+   cat "$command_log" >> "$LOG"
+   return 0
+ else
+   code=$?
+   printf 'FAIL 26975 V9 shader=%s origin=%s phase=%s exit=%d\n' \
+     "$source_name" "$origin" "$phase" "$code" | tee -a "$LOG" >&2
+   printf 'FAILING COMMAND: ' | tee -a "$LOG" >&2
+   printf '%q ' "$@" | tee -a "$LOG" >&2
+   printf '\n' | tee -a "$LOG" >&2
+   cat "$command_log" | tee -a "$LOG" >&2
+   return 1
+ fi
+}
+FAILED=0
+PASSED=0
+for SRC in "${SOURCES[@]}"; do
+  BASE="$(basename "$SRC")"
+  TYPE="${BASE##*.}"
+  case "$TYPE" in frag|vert|comp) ;; *) echo "BLOCKED invalid source stage: $BASE" >&2; exit 8;; esac
+  ORIGIN="$(shader_origin "$BASE")"
+  CONVERTED="$WORK/$BASE"
+  if grep -q '^#version 300 es$' "$SRC"; then
+    sed '1s/#version 300 es/#version 310 es/' "$SRC" > "$CONVERTED"
+  else
+    cp "$SRC" "$CONVERTED"
+  fi
+  printf 'VERIFY CURRENT C GLSL %s stage=%s origin=%s\n' "$BASE" "$TYPE" "$ORIGIN" >> "$LOG"
+  if ! run_checked_phase "$BASE" "$ORIGIN" 'original-ESSL-parse' "$COMPILER" -S "$TYPE" "$SRC"; then
+    FAILED=$((FAILED+1)); continue
+  fi
+  if ! run_checked_phase "$BASE" "$ORIGIN" 'ESSL310-conversion-parse' "$COMPILER" -S "$TYPE" "$CONVERTED"; then
+    FAILED=$((FAILED+1)); continue
+  fi
+  if ! run_checked_phase "$BASE" "$ORIGIN" 'OpenGL-SPIRV-generate' "$COMPILER" -G --auto-map-locations --auto-map-bindings -S "$TYPE" -o "$WORK/$BASE.spv" "$CONVERTED"; then
+    FAILED=$((FAILED+1)); continue
+  fi
+  if ! run_checked_phase "$BASE" "$ORIGIN" 'SPIRV-original-validate' spirv-val --target-env opengl4.5 "$WORK/$BASE.spv"; then
+    FAILED=$((FAILED+1)); continue
+  fi
+  if ! run_checked_phase "$BASE" "$ORIGIN" 'SPIRV-optimize-O' spirv-opt --target-env=opengl4.5 -O "$WORK/$BASE.spv" -o "$WORK/$BASE.opt.spv"; then
+    FAILED=$((FAILED+1)); continue
+  fi
+  if ! run_checked_phase "$BASE" "$ORIGIN" 'SPIRV-optimized-validate' spirv-val --target-env opengl4.5 "$WORK/$BASE.opt.spv"; then
+    FAILED=$((FAILED+1)); continue
+  fi
+  sha256sum "$WORK/$BASE.spv" "$WORK/$BASE.opt.spv" >> "$LOG"
+  PASSED=$((PASSED+1))
+done
+printf '26975 V9 CURRENT SHADER RESULT: pass=%d fail=%d total=%d\n' \
+  "$PASSED" "$FAILED" "$COUNT" | tee -a "$LOG"
+if [ "$FAILED" -ne 0 ] || [ "$PASSED" -ne "$COUNT" ]; then
+  printf 'BLOCKED: %d actual shader toolchain failures; see complete phase diagnostics in this Actions log\n' "$FAILED" | tee -a "$LOG" >&2
+  exit 2
+fi
+printf 'PASS 26975 V9 physical current %d/%d static donor/Iris C ESSL GLSL + SPIR-V opt/val; independently pinned source inventory\n' "$COUNT" "$COUNT" >> "$LOG"
+printf '%s\n' 'NOT RUN/NOT PROVEN: dynamic Kotlin-assembled donor shader compile on physical Android GPU (cannot honestly substitute static template validation)' >> "$LOG"
 cp "$LOG" "$OUT/26975_V6_STATIC_GLSL_SPIRV_RECEIPT.txt"
 printf '%s\n' "PASS inherited historical 24/24 and actual current $COUNT/$COUNT V9 donor/Iris C shader compilation with pinned glslang/SPIR-V toolchain; dynamic runtime GLSL still needs device" >> "$OUT/26975_REAL_GLSL_SPIRV_COMPILER.txt"
