@@ -21,6 +21,7 @@ PINNED=R/'26975_V6_CURRENT_SHADER_INVENTORY.json'
 # broke earlier GLSL versions: flat / coherent. Only declaration sites are
 # examined: a legal qualifier like `flat in int id;` is not a variable named flat.
 RESERVED=set('attribute varying precision highp mediump lowp in out inout uniform buffer shared coherent volatile restrict readonly writeonly const invariant layout flat smooth noperspective patch sample centroid subroutine common partition active asm class union enum typedef template this resource goto inline noinline public static extern external interface long short half fixed unsigned superp input output filter sizeof cast namespace using row_major switch default case struct while do for if else continue break return discard true false void int uint float double bool atomic_uint'.split())
+RESERVED.add('packed')
 RESERVED |= {'gl_FragColor','gl_FragData','gl_FragCoord','gl_VertexID','gl_Position','gl_GlobalInvocationID'}
 TYPE=r'(?:float|int|uint|bool|double|vec[234]|ivec[234]|uvec[234]|bvec[234]|mat[234](?:x[234])?|sampler\w*|isampler\w*|usampler\w*|image\w*|iimage\w*|uimage\w*)'
 VAR=re.compile(r'\b'+TYPE+r'\s+([a-zA-Z_]\w*)\b\s*(?=[;=,\[\(\)])')
@@ -98,7 +99,7 @@ def asset_audit():
     for t in ('rawRenderingEngine = RawRenderingEngine.AdobeCurve','rawOutputUpscaleMode = proSabre1x.outputUpscaleMode',
               'embeddedDngRenderPlan = embeddedPlan','sharpeningValue = Iris26975COriginalDonorEngine.DEFAULT_SHARPENING',
               'MultiFrameStacker.processBurstRaw','renderer.processMgcSpatialGpuLinearRgb',
-              'UnifiedGainmapProducer().build','Jpeg444ExportEncoder'):
+              'rawGpuGainmapProducer.build','Jpeg444ExportEncoder'):
         if t not in c_entry:fail('selected Pro Sabre -> Adobe path changed: '+t)
     for t in ('RawRenderingEngine.Spektrafilm','RawRenderingEngine.Fotufilm','RawRenderingEngine.Canon',
               'RawRenderingEngine.Leica','RawRenderingEngine.Hncs','RawRenderingEngine.Lumix',
@@ -134,7 +135,8 @@ def main():
     if a.selftest:
         for s in ('#version 300 es\nvoid main(){ float flat=1.; }',
                   '#version 310 es\nvoid main(){ vec2 coherent = vec2(1.); }',
-                  '#version 300 es\nvoid main(){ vec4 gl_FragColor = vec4(1.); }'):
+                  '#version 300 es\nvoid main(){ vec4 gl_FragColor = vec4(1.); }',
+                  '#version 310 es\nvoid main(){ uint packed = 0u; }'):
             try:lexical_check(s,'selftest')
             except RuntimeError:pass
             else:fail('reserved declaration negative test accepted')
@@ -145,7 +147,7 @@ def main():
     assets=asset_audit()
     manifest=[{k:x[k] for k in ('location','hash','kind','stage','bytes','version')} for x in entries]
     manifest.sort(key=lambda v:(v['location'],v['hash']))
-    actual={'version':'26975-v6-current-actual-donor-and-Iris-C-shaders',
+    actual={'version':'26975-v8-current-actual-RAW-only-donor-and-Iris-C-shaders',
             'sources':manifest,
             'source_count':len(manifest),
             'static_count':sum(s['kind']=='static' for s in manifest),

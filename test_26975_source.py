@@ -29,8 +29,17 @@ assert 'private val originalEngine: Engine? = Iris26975CPinnedDonorProEngine' in
 assert 'check(Iris26972CContract.CONTROLLED_DEVICE_TRIAL_ENABLED)' in engine
 assert 'Iris26975CDonorStackFrameAdapter.withOriginalDonorFrames' in engine
 real=file('app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CPinnedDonorProEngine.kt')
-for token in ('MultiFrameStacker.processBurstRaw','renderer.processMgcSpatialGpuLinearRgb','RawDemosaicProcessor.getInstance()','UnifiedGainmapProducer','Iris26975CDonorMediaStorePublisher.publish'):
+for token in ('MultiFrameStacker.processBurstRaw','renderer.processMgcSpatialGpuLinearRgb','RawDemosaicProcessor.getInstance()','GpuReferenceGainmapProducer','NoLookLutRawGainmapSidecar.create','HdrGainmapStrength.DEFAULT','Jpeg444ExportEncoder.write','rawRenderingEngine = RawRenderingEngine.AdobeCurve','Iris26975CDonorMediaStorePublisher.publish'):
  assert token in real,token
+# Pro RAW-only interface: all YUV photo/HDR mergers and obsolete bjzhou path must be physically absent.
+for obsolete in ('app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou',
+                 'app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesYuvStacker.kt'):
+ assert not (root/obsolete).exists(),obsolete
+stacker=file('app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/MultiFrameStacker.kt')
+assert 'fun processBurstRaw(' in stacker and 'GlesMgcRawFusion(' in stacker
+assert 'fun processBurst(' not in stacker and 'processHdrBurstYuv(' not in stacker
+assert 'embeddedPlan.lookTable == null' in real
+assert 'UnifiedGainmapProducer' not in real and 'EstimatedSdrGainmapProducer' not in real
 contract=file('app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26972CContract.java')
 assert re.search(r'PRODUCTION_READY\s*=\s*false',contract), 'must not claim production readiness'
 assert 'CONTROLLED_DEVICE_TRIAL_ENABLED' in contract

@@ -35,7 +35,7 @@ assert 'rawRenderingEngine = RawRenderingEngine.AdobeCurve' in s
 assert 'embeddedDngRenderPlan = embeddedPlan' in s
 assert 'MultiFrameStacker.processBurstRaw' in s
 assert 'renderer.processMgcSpatialGpuLinearRgb' in s
-assert 'UnifiedGainmapProducer' in s
+assert 'GpuReferenceGainmapProducer' in s and 'NoLookLutRawGainmapSidecar.create' in s and 'HdrGainmapStrength.DEFAULT' in s
 assert 'rawDcpId' not in s
 assert 'prewarmDepthEstimator' not in s
 assert 'RawOutputUpscaleMode.LANCZOS3' in (R/('handoff_payload_26975/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CProSabre1xSelection.kt' if scope=='--payload' else 'app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CProSabre1xSelection.kt')).read_text()

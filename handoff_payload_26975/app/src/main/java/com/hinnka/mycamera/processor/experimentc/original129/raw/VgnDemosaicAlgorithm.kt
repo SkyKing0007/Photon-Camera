@@ -2539,16 +2539,16 @@ void main() {
         }
 
         void main() {
-            ivec2 packed = ivec2(gl_GlobalInvocationID.xy);
-            if (any(greaterThanEqual(packed, uPackedSize))) return;
-            int x = packed.x * 4;
+            ivec2 packedValue = ivec2(gl_GlobalInvocationID.xy);
+            if (any(greaterThanEqual(packedValue, uPackedSize))) return;
+            int x = packedValue.x * 4;
             vec4 values = vec4(
-                preparedSample(ivec2(x + 0, packed.y)),
-                preparedSample(ivec2(x + 1, packed.y)),
-                preparedSample(ivec2(x + 2, packed.y)),
-                preparedSample(ivec2(x + 3, packed.y))
+                preparedSample(ivec2(x + 0, packedValue.y)),
+                preparedSample(ivec2(x + 1, packedValue.y)),
+                preparedSample(ivec2(x + 2, packedValue.y)),
+                preparedSample(ivec2(x + 3, packedValue.y))
             );
-            imageStore(outTex, packed, values);
+            imageStore(outTex, packedValue, values);
         }
     """.trimIndent()
 

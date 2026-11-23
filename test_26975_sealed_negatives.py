@@ -6,7 +6,8 @@ spec=importlib.util.spec_from_file_location('builder26975',R/'build_26975_increm
 b.seal()
 lines=(R/'26975_HANDOFF_HASHES.sha256').read_text().splitlines()
 entries={p:h for h,p in (x.split('  ',1) for x in lines)}
-assert len(entries)==len(lines) and len(entries)>392
+changed,_,_=b.scope()
+assert len(entries)==len(lines) and len(entries)==len(changed)+len(b.FILES)+2, 'sealed exactly every current V8 delta, infrastructure and trigger file'
 cases=0
 for name in ('26975_FORWARD_FULLINDEX.patch','26975_ROLLBACK_FULLINDEX.patch','26975_EXPECTED_FULL_APP.sha256','26975_PROTECTED_SOURCE.sha256','26975_AUTHORITY_AND_SCOPE.json','.github/workflows/build-26975-change-aware.yml'):
  original=(R/name).read_bytes();want=entries[name]
