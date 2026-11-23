@@ -1,4 +1,4 @@
-# Photon 26975 V8 — SINGLE ORIGINAL129 RAW Pro Sabre, no creative LUT, Lanczos-3
+# Photon 26975 V8 V2 — FAILED STEP 50 PHYSICAL STAGING REPAIR — SINGLE ORIGINAL129 RAW Pro Sabre, no creative LUT, Lanczos-3
 
 **LOCALLY VALIDATED / PREPARED FOR ACTIONS — NOT BUILD-PROVEN.** ONE inherited V7-style, guarded three-stage vscode.dev handoff to `experimental-clean-photon-rebuild`, not user-run scripts. No source commit/push, no changes to dev, no APK upload.
 
@@ -23,3 +23,8 @@ Gradle/NDK infrastructure remains the V6/V7 exact 3 pinned LiteRT dependencies a
 3. **LAST**, extract/upload `TRIGGER_26975.txt` from `STAGE_3_TRIGGER.zip` to start the guarded Actions run.
 
 If any pinned shader/Kotlin/Java/native/assembly or source identity gate fails, no build success may be claimed; use complete GitHub Actions logs for diagnosis. Do not modify dev or push APKs.
+
+## V8 V2 correction after actual failed GitHub run 45219180981
+The first V8 Actions job failed at historical Step 50 `26975 BLOCKED: payload missing/extra`, before source reconstruction or Android compilation. The 49 former `bjzhou/` and seven old YUV Kotlin files were retained as **unreferenced, V7-only files inside the GitHub `handoff_payload_26975/` staging folder** despite V8's 337-file allowlist. The V8 upload procedure overwrites/adds files but cannot delete earlier GitHub paths. The new V8 V2 executable builder first validates the exact names **and source SHA-256 of all 56 obsolete files**, refuses any modified/unexpected/missing file, removes ONLY those staging paths from the Actions runner checkout, and then performs the **unmodified strict V8 payload seal**. No one needs to manually delete files or change the three-stage procedure. Exact V8 source remains 2447 files, 337 allowlisted changes and 2110 protected originals. Stale V7 staging paths cannot be copied into APK sources; source install always begins from the verified 26974 successful compiled TAR. The exact successful 26974 49 historical stages, pinned 24+145 GLSL/SPIR-V, Kotlin, Java, dual-ABI NDK and Android assemble/publish requirements are unchanged. The GitHub branch retains old *staging-only* paths until physically deleted by an approved GitHub cleanup; the Actions runner cleans them every build.
+
+This V8 V2 has NO new successful Actions build or APK proof. Full Android compilation and device IQ remain NOT RUN.

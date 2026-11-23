@@ -45,6 +45,112 @@ FILES=[
  '26975_EXPECTED_ACTION_EXECUTABLES.txt'
 ]
 
+# Exact 56 source files physically left by V7 in the *staging directory*, not
+# in the separately reconstructed 26974 baseline or the V8 compiled candidate.
+# These bytes are hash-pinned to the actual V7 three-stage seal and GitHub's
+# failed Actions head 9dff8881b85d98ea186c99800a217135856ed1bf.
+# Never delete anything outside this manifest, and never import stale source.
+V7_STALE_STAGE_SHA256 = """\
+405dab2f1a59e5a0194dddd71e2bab280e512faf0a41d3a6ac84b21b8c5b67d5  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/processor/GlesLanczosResampling.kt
+655d997149f21fcaa9bbb42d2bee828eff44c361ef8f4a8a3d41b313fc4be589  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/processor/MgcAlignmentInputScale.kt
+a4bcb43ac16f94678f64e6435aa0f3298937f0b6d5abd2934f3b74518f7b9cbb  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/processor/MgcSabreAlignmentOffset.kt
+5258353b17802a1e0a5951003f12ef0edad1a001995ecfae17c70ce003a8d220  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/processor/MgcSabreKernelTuning.kt
+28f2835847dd6acd0efbc5d045bc7ae8c525e18577e4e1e27bdeca6a13871e92  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/processor/MgcSabreMergedNoiseModel.kt
+970d0aaacd54c8f908ec31b43ec2ac558ef703c92011d6748166abfd0c1f7617  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/processor/MgcSabreNoiseEstimatesLut.kt
+12e338bb5a247f6b0392c7ef571f922e1cc09c1ed896e85faa19a2aa4b4702e2  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/processor/MgcSabreRejectionTuning.kt
+7a7d35c6121eabadc5409fb0d7567729942b46da20b0186ba45540c5c6502bb4  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/processor/MgcSabreResolveTuning.kt
+82117c7c206887272bcd3d5c1c8557412dfa95b0a24966fafdb5b98fdb550256  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/processor/PhotonSharpenTuning.kt
+89d6f74779f480b4b2c608451977731ed3b5c298534dbb249b3a7ced352cea82  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/processor/RawNoiseModel.kt
+cc80f77bf5e22893e73827b05d9bc97ff49f0df1481c309112d7d81e697ec706  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/AdobeCurveToneAlgorithm.kt
+31ce91ba2c3f4112b619c48217272acab681c8935738dc5e4acf2ecbd1308dd2  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/ColorSpace.kt
+569a433e742c78be7d7965441139a999a5a3d64acb9320330c246432512615a4  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/DcpDefaultBlackRender.kt
+71c1082600c299113efad4c1ae1fc2aa59e549f7d6f23bbcee964f00d7af5ab4  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/DcpHueSatMap.kt
+02ed466de95efd492088e269c7cdb06056eb53f29293f36a521f83f86445ed91  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/DcpHueSatMapGl.kt
+d79202b0b6516b14a3399ff7c9769deaeb62bbf9738df5fd3a3302c3a8d12de2  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/DcpProfile.kt
+15576a6e76f1aaba188e0bcac130d14c6927047bef86e92793b15fa3a0a023fa  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/DcpRenderPlan.kt
+6d372b8479aa8e4e2b1a8dd13e8092640c66d1285cc458e45e0ec99d210326b7  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/DcpTextureResources.kt
+dec750aa88c2c6e87fdb1150f35b6ff678fb87f341317be2cf64007afc32fb9f  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/DcpToneCurve.kt
+e4bf812d8480b1fe5526bc775cb1d8649bb404026658ef0a641402c5cd420567  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/DngBaselineExposure.kt
+2f45fa722847685d11b3fa5a32881492d6de459b185a8ed2c8d882d811c92bd7  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/DngProfileGainTableRenderShader.kt
+2fbe106b48f183bdfe4d13efd298e0ca8a466ae693fd3f34842b98fd9a6524ba  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/DngSdkColorSpec.kt
+1dc0527580c5b61722add444428d14d2fffb117194fabcccef93243e6bf803b5  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/GlesMgcGuidedUpsampleShaders.kt
+c4d559b2a07e3c90fb0ec0e3c7acadf8aeab8e7d3ef053735e7c91632da8d976  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/GlesMgcSharpen.kt
+a3e4f02541822ef5461b5b685b0d19a1d0dd232710aa1967d61c309faaca8385  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/GlesMgcSharpenShaders.kt
+bbd6feb9e16857b75441fd7516b3faaff86bdab51c991e0bccaeeaed56dfdb60  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/MgcFinishResolution.kt
+41c7717ddbf8d9df2b77b06d64e53061a771330b3e1f13e2b7dc11739ba788a4  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/MgcGlesSurfaces.kt
+2082fd5e7b18cc971698fb6fd819b18756a9b16bc5aa218aaec7f4c939cebaad  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/MgcGuidedUpsample.kt
+29568567fff7e7afd369fc3ef2e4346b504f102c25b3c5a97bbaa78c34e4e9ec  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/MgcSharpenCurveBuilder.kt
+aeec65a1ef0e45d119b78617771416c90a540f32b1b1cc7e372a824b1a6ef4d5  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawAdobeOnlyCompatibility.kt
+3ca9b655e37c4dab36f799d487b33d2eddb3039ac26161f30014d0690b43197f  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawCameraCalibration.kt
+5c3094c1573b9174012d3cc54cdccbfb37cb4ca6469522e95d07212dd7a898b0  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawCurveTextureResources.kt
+a94e41d6385ddb759002c08628da7b00abae4a37c266f65bbda1ad8fdd688730  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawEngineColorResources.kt
+2421ec0c7b4188836864c92af073e21952043a9875a18cb363a912deffc5035b  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawEngineTonePass.kt
+bedbfc8c15de8a50a938d2d7245c579b439a1296f6b307e03969fd43ccaf9b36  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawFullscreenQuad.kt
+e8af21cf1a29455df7b3a620e9e656e4346c79630eb6d122c34a45b60741e67e  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawGlesProgram.kt
+78384340455e78133bb68d9a49f9821150a07f650b293ece0784236dbf463a35  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawHdrReferenceMath.kt
+dfc665ed737f89b5cd70f64b0240e8304b2781fbdcc671d04c403d7dc2a3297b  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawHdrReferencePass.kt
+e1c31bd47272a1a94dcf1fcf15c5b2d001fa9346fa9a8657c3211beeded32b3f  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawLinearRcdPass.kt
+89b15fe777a0a69f83045d68661ce0d7f85b380fd7b5a2ba542f84bead213f0e  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawMetadata.kt
+5bede6dc1ebef377b0be6aa2c6f22c72fbb2fb34d45973d7a1e86c66f54cdf55  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawOutputGeometry.kt
+28858cf3c6fd7f4322e4d3d021126eb632e21224790eb7c7c7f4e5148f169077  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawOutputPass.kt
+0e1cb4c99ae9626b8761702162067564cd87af7d79c17893e40142ea8e88015f  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawOutputUpscaleMode.kt
+df4a57da8736a720a90dbe399a8b239eac05c4da526f78e3f6ccbb91d02b726e  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawProfileExposureGl.kt
+cfcd45734b8da7bf53d10f42e952c614ef21bbb68c8b8f06a3d47e27fadd4c73  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawRenderingEngine.kt
+3fd4ee5278263176c5dadafaea69f4af1a75dfb395376e327e1c1d9f9a8e36ad  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawRenderingEngineToneAlgorithm.kt
+dc3b29f2a29f606b773de570c63437821428737622d083975e8df52c3b1f6454  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawSharpeningDefaults.kt
+d4dc25a8b1a4f8e5133bd1a4bf19028cca2b4e129ebf9eddc2c755f1942f5290  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawSrgbPass.kt
+5ad4337e1f53828914eb4e9e2e19aebbe4f393b19160ab1149d60f812ac1282d  app/src/main/java/com/hinnka/mycamera/processor/experimentc/bjzhou/raw/RawTileRect.kt
+36d50a44591d542b0c41d645ddeb026ff78bdfc200c3fed4e5786d5c1880c0bf  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesYuvAlignmentShaders.kt
+e932e9156f6665c421b3446943f03a3445b11c0ed0083f646802d18b3a3bdceb  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesYuvHardwareBufferInput.kt
+b9960f26e2a624f61b14f74118b81de8e0d0e3d58f496113e14691c409913e4e  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesYuvLkPyramidPlan.kt
+ad893cafc4058bbbf227b5171c86b7e4eec498ccf087f10e30e7f2814a1bd9e6  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesYuvSabreShaders.kt
+8e9ddec98899cde5be0f79b08a1ee7f3090da04753bdeffd64b0faeebfcab2de  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesYuvSpatialShaders.kt
+9f2a946934c361b1576a5e1d0c61abe44277acf214196fde0905586d54b6fac0  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesYuvStacker.kt
+3bdc66f7ed4625b4cdf670e4999bbd64befae51d79ae1eb3e656dc44f833623c  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesYuvTiming.kt
+"""
+
+def stale_stage_manifest():
+    out={}
+    for line in V7_STALE_STAGE_SHA256.splitlines():
+        h,path=line.split('  ',1)
+        if not re.fullmatch('[0-9a-f]{64}',h) or path in out or not path.startswith('app/src/main/java/com/hinnka/mycamera/processor/experimentc/'):
+            fail('bad V7 stale stage SHA-256 manifest')
+        out[path]=h
+    if len(out)!=56 or sum('/bjzhou/' in p for p in out)!=49 or sum('GlesYuv' in p for p in out)!=7:
+        fail('V7 stale stage list changed')
+    return out
+
+def prune_only_pinned_stale_stage(payload,changed,known_stale):
+    # Pure, isolated staging cleanup: fail closed for missing V8 inputs,
+    # unexpected extras, tampered old inputs, or symlinks; only remove
+    # the EXACT historic V7 paths. The compiled candidate never includes these.
+    for path in payload.rglob('*'):
+        if path.is_symlink():
+            fail('symlink in 26975 staging payload '+str(path))
+    got={p.relative_to(payload).as_posix() for p in payload.rglob('*') if p.is_file()}
+    missing=changed-got
+    extra=got-changed
+    if missing or extra-set(known_stale) or (set(known_stale)&changed):
+        fail('payload missing/extra (stale guard): missing='+str(sorted(missing)[:8])+' extra='+str(sorted(extra-set(known_stale))[:8]))
+    for rel in sorted(extra):
+        p=payload/rel
+        if sha(p)!=known_stale[rel]:
+            fail('tampered historical V7 staging file '+rel)
+    for rel in sorted(extra):
+        path=payload/rel
+        path.unlink()
+        # Git tracks files, not directories. Remove now-empty historical
+        # directories too, because source tests forbid a residual bjzhou tree.
+        parent=path.parent
+        while parent!=payload:
+            try:parent.rmdir()
+            except OSError:break
+            parent=parent.parent
+    if extra:
+        print(f'PASS exact original V7 stale staging cleanup: {len(extra)} SHA-256 pinned files excluded from V8 C candidate')
+    return len(extra)
+
+
 def fail(msg):raise RuntimeError('26975 BLOCKED: '+str(msg))
 def sha(path):
  h=hashlib.sha256()
@@ -114,6 +220,7 @@ def seal():
  stages=[(R/f'26975_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
  if stages[0]!=sorted((expect|{'26975_HANDOFF_HASHES.sha256'})-{wf,trigger}) or stages[1]!=[wf] or stages[2]!=[trigger]:fail('three upload stages not strict')
  payload=R/'handoff_payload_26975'
+ prune_only_pinned_stale_stage(payload, changed, stale_stage_manifest())
  if {p.relative_to(payload).as_posix() for p in payload.rglob('*') if p.is_file()}!=changed:fail('payload missing/extra')
  for p in changed:
   if sha(payload/p)!=b[p]:fail('source input tampering '+p)
