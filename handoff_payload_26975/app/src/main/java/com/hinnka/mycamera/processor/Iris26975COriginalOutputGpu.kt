@@ -59,8 +59,7 @@ internal class Iris26975COriginalOutputGpu(
             upscaleMode = RawOutputUpscaleMode.LANCZOS3,
         )
         check(donorGeometry.width == geometry.outputWidth &&
-            donorGeometry.height == geometry.outputHeight &&
-            !donorGeometry.raisrUpsample) {
+            donorGeometry.height == geometry.outputHeight) {
             "$component donor geometry changed the shutter-frozen physical output"
         }
     }

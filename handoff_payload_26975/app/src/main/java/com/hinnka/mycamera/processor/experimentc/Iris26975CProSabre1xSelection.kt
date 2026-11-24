@@ -33,7 +33,6 @@ internal data class Iris26975CProSabre1xSelection private constructor(
             rawMaxMode.mergeMethod == mergeMethod &&
             rawMaxMode.outputMode == stackOutputMode &&
             outputUpscaleMode == RawOutputUpscaleMode.LANCZOS3 &&
-            !outputUpscaleMode.usesRaisr(outputScale) &&
             outputUpscaleMode.resolveOutputScale(outputScale) == 1f &&
             outputScale == 1f && normalFrameCount in 2..30) {
             "Experiment C permits ONLY the original Pro Sabre native-1x/Lanczos-3 route"

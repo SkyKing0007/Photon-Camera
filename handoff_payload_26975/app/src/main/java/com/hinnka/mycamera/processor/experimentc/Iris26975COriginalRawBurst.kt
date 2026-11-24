@@ -1,5 +1,6 @@
 package com.hinnka.mycamera.processor.experimentc
 
+import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import com.hinnka.mycamera.processor.Iris26972CPhysicalRawMetadata
 import com.particlesdevs.photoncamera.processing.experimentc.Iris26972CContract
@@ -24,6 +25,7 @@ internal class Iris26975COriginalRawBurst private constructor(
     internal class Frame internal constructor(
         val metadata: Iris26972CPhysicalRawMetadata.Frozen,
         val totalCaptureResult: TotalCaptureResult,
+        val physicalCaptureResult: CaptureResult,
         val sensorWidth: Int,
         val sensorHeight: Int,
         val cropLeft: Int,
@@ -78,6 +80,11 @@ internal class Iris26975COriginalRawBurst private constructor(
                 frame.rawWidth == ref.rawWidth && frame.rawHeight == ref.rawHeight &&
                 frame.sensorWidth == ref.sensorWidth && frame.sensorHeight == ref.sensorHeight &&
                 frame.cropLeft == ref.cropLeft && frame.cropTop == ref.cropTop &&
+                frame.physicalCaptureResult.get(CaptureResult.SENSOR_TIMESTAMP) == meta.sensorTimestampNs &&
+                frame.physicalCaptureResult.get(CaptureResult.SENSOR_EXPOSURE_TIME) == meta.exposureTimeNs &&
+                frame.physicalCaptureResult.get(CaptureResult.SENSOR_SENSITIVITY) == meta.sensitivityIso &&
+                meta.exposureTimeNs == ref.metadata.exposureTimeNs &&
+                meta.sensitivityIso == ref.metadata.sensitivityIso &&
                 meta.exposureProduct.isFinite() &&
                 abs(meta.exposureProduct / refExposure - 1.0) <= 0.01) {
                 "C donor rejects cross-lens/geometry/frame/exposure bracket"

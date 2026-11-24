@@ -63,8 +63,7 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
         val output = transaction.output
         val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val characteristics = cameraManager.getCameraCharacteristics(burst.physicalCameraId)
-        val cameraResult: CaptureResult = reference.totalCaptureResult
-            .physicalCameraResults[burst.physicalCameraId] ?: reference.totalCaptureResult
+        val cameraResult: CaptureResult = reference.physicalCaptureResult
         val metadata = RawMetadata.create(
             width = reference.rawWidth, height = reference.rawHeight,
             characteristics = characteristics, captureResult = cameraResult,
@@ -257,6 +256,7 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
                 // 90/270 rotation. Passing the already-rotated dimensions here
                 // transposes portrait JPEGs and breaks their output size.
                 rawPhysicalOutputSize = Size(shutterGrid.rawWidth, shutterGrid.rawHeight),
+                // C has exactly one output mode: original SDR base + original HDR reference.
                 includeHdrReference = true,
                 photonHdrRatio = preparation.hdrRatio,
                 photonSourceToShortGain = preparation.finalShortGain,
@@ -271,6 +271,8 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
             val hdrBitmap = checkNotNull(hdr) {
                 "Original HDR reference missing; no estimated SDR fallback allowed"
             }
+            check(stillLive()) { "C session closed before rendered pixel validation" }
+            validateNonBlackBase(checkNotNull(sdr), reference, shutterGrid)
             // The original GPU RAW gainmap needs an explicit LUT-ratio input.
             // No film/look LUT is applied: an exact identity sidecar leaves the
             // HDR-to-SDR gain computed solely by donor RAW HDR/SDR pixels.
@@ -327,5 +329,38 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
                 fused.fusedBayerBuffer = null
             }
         }
+    }
+
+    /** Reject an exactly black SDR base only when the actual same-crop RAW has
+     * meaningful signal. No exposure rescue, color change or substitution.
+     * A sparse positive probe avoids a full scan for normal photos; a suspected
+     * black image is confirmed across every row before rejection. */
+    private fun validateNonBlackBase(bitmap: android.graphics.Bitmap,
+            reference: Iris26975COriginalRawBurst.Frame,
+            geometry: com.particlesdevs.photoncamera.processing.experimentc.Iris26975COutputGeometry) {
+        if (bitmap.isRecycled) error("C donor returned a recycled SDR bitmap")
+        for (iy in 0 until 8) for (ix in 0 until 8) {
+            val x = (ix * 2 + 1) * bitmap.width / 16
+            val y = (iy * 2 + 1) * bitmap.height / 16
+            if (bitmap.getPixel(x,y) and 0x00ffffff != 0) return
+        }
+        val phase = when(reference.metadata.cfaPattern) {
+            0 -> intArrayOf(0,1,2,3); 1 -> intArrayOf(1,0,3,2)
+            2 -> intArrayOf(2,3,0,1); 3 -> intArrayOf(3,2,1,0)
+            else -> error("C unknown CFA in rendered-pixel guard")
+        }
+        val canonical = reference.metadata.copyCanonicalBlackForAudit()
+        val raw = com.particlesdevs.photoncamera.processing.experimentc.Iris26975CRawHighlightMeter.measure(
+            reference.raw16(), reference.rawWidth * 2, 2,
+            geometry.cropLeft,geometry.cropTop,geometry.cropRight,geometry.cropBottom,
+            reference.metadata.sensorWhiteLevel,FloatArray(4) { canonical[phase[it]] })
+        // Preserve genuinely dark photographs. This is deliberately not a general IQ metric.
+        if (raw.mean < 0.08f) return
+        val row = IntArray(bitmap.width)
+        for (y in 0 until bitmap.height) {
+            bitmap.getPixels(row,0,bitmap.width,0,y,bitmap.width,1)
+            if (row.any { (it and 0x00ffffff) != 0 }) return
+        }
+        error("C original donor SDR was exactly black despite substantial physical RAW signal")
     }
 }
