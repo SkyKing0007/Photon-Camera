@@ -1,0 +1,303 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 55a489a1c74c5967d8204f49b9b8c5c0f28a4786..ff343e54e6542ce63d4be03a0bcb2eaf20397226 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -339,6 +339,15 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+         }
+     }
+ 
++    /** Capture-resume is not a new user tap. Keep its current absolute protection target. */
++    public void iris26981CResumeTouchRegion(MeteringRectangle[] region) {
++        if (!iris26975CSelectedForMotion()) return;
++        synchronized (mZslBufferLock) {
++            if (!java.util.Objects.equals(mIris26980CTouchLens,physicalID) ||
++                    !java.util.Arrays.equals(mIris26980CTouchRegion,region)) iris26980CSetTouchRegion(region);
++        }
++    }
++
+     /** Shared touch UI calls this only to fence C's background exposure tracker while
+      * it updates the builder and submits the AF/AE region request. A/B are untouched. */
+     public boolean iris26979CBeginTouchMetering() {
+@@ -351,8 +360,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+     }
+     private com.particlesdevs.photoncamera.processing.experimentc.Iris26977CPreviewTicket mIris26977CPendingPreview; // guarded by mZslBufferLock
+     private long mIris26976CAdmissionGeneration; // guarded by mZslBufferLock
+-    private final com.particlesdevs.photoncamera.processing.experimentc.Iris26979CExposureTracking
+-            mIris26979CTracking = new com.particlesdevs.photoncamera.processing.experimentc.Iris26979CExposureTracking();
++    private final com.particlesdevs.photoncamera.processing.experimentc.Iris26981CExposureTracking
++            mIris26979CTracking = new com.particlesdevs.photoncamera.processing.experimentc.Iris26981CExposureTracking();
+ 
+     private void iris26975CRecordPreviewRequest(CameraCaptureSession session,
+             CaptureRequest.Builder builder, CaptureRequest request) {
+@@ -469,7 +478,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+         return newest;
+     }
+ 
+-    /** C-owned AE->same-exposure RAW epoch. Only the donor HAL pair is frozen;
++    /** C-owned AE->same-exposure RAW epoch. An adaptive legal pair is frozen;
+      * original template antibanding is retained, no B exposure/flicker state.
+      * Called from the existing preview callback Handler after exact pairing. */
+     private void iris26976CAdvanceEpoch(TotalCaptureResult paired) {
+@@ -502,6 +511,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+                 final Integer observedComp=paired.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION);
+                 final float step=compStep==null?0f:compStep.floatValue();
+                 final int baseComp=compRange==null?userComp:Math.max(compRange.getLower(),Math.min(compRange.getUpper(),userComp));
++                mIris26979CTracking.selectUserComp(baseComp);
+                 final float appliedEv=requestedComp==null?0f:Math.max(0f,(baseComp-requestedComp)*step);
+                 if(compRange!=null && requestedComp!=null && requestedComp!=mIris26979CTracking.compensation(userComp,compRange.getLower(),compRange.getUpper(),step)) {
+                     // A previous submission may have failed or the user EV changed. Retry the pending target,
+@@ -525,17 +535,23 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+                         iris26975CMeterOwnRawAtShutter(chars,physical,ss,iso);
+                 // Require proved RAW evidence before locking or adjusting. A missing sample is not a scene change.
+                 if(meter==null) {
+-                    if(locked) mIris26979CTracking.observeLocked(ts,Float.NaN,Float.NaN);
++                    if(locked) mIris26979CTracking.observeLocked(ts,Float.NaN,Float.NaN,Float.NaN);
+                     return;
+                 }
+-                final boolean sceneChanged=locked && mIris26979CTracking.observeLocked(ts,meter.mean,meter.clippedFraction);
+-                final boolean biasChanged=compRange!=null && mIris26979CTracking.observeProtection(
+-                        meter.protectionEv,meter.highlightSignal,meter.clippedFraction,appliedEv,step,userComp,compRange.getLower(),compRange.getUpper());
++                final boolean sceneChanged=locked && mIris26979CTracking.observeLocked(ts,meter.mean,meter.clippedFraction,meter.highlightSignal);
++                // Only a meaningful change opens a new unprotected HAL metering epoch.
++                // Never reinterpret residual clipping in a protected frame as another EV step.
++                if(sceneChanged) {
++                    mIris26979CTracking.clearProtection();
++                    iris26980CClearReferenceLocked();
++                }
++                final boolean biasChanged=!locked && compRange!=null && mIris26979CTracking.observeProtection(
++                        meter.protectionEv,meter.highlightSignal,meter.clippedFraction,appliedEv,step,baseComp,compRange.getLower(),compRange.getUpper());
+                 if(sceneChanged||biasChanged) {
+-                    // Keep protection while HAL remeters, including under mains flicker and touch regions.
+-                    // No unprotected intermediate request; no manual shortening of the HAL's anti-banding shutter.
++                    // Apply one absolute compensation target; a new scene must first establish its own base.
++                    // HAL retains its antibanding authority and the existing touch region.
+                     final int nextComp=compRange==null?baseComp:mIris26979CTracking.compensation(userComp,compRange.getLower(),compRange.getUpper(),step);
+-                    Log.i(TAG,"IRIS_26979_C_TRACK_REMETER scene="+sceneChanged+" protection="+mIris26979CTracking.protectionEv()+" comp="+nextComp);
++                    Log.i(TAG,"IRIS_26981_C_ABSOLUTE_TARGET scene="+sceneChanged+" touch="+(mIris26980CTouchRegion!=null)+" baseComp="+baseComp+" protection="+mIris26979CTracking.protectionEv()+" comp="+nextComp);
+                     rebuildPreviewBuilder(true);
+                     return;
+                 }
+@@ -578,13 +594,22 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+                 final android.util.Range<Integer> gain=chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+                 final Long frameLimit=chars.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION);
+                 if(range==null || gain==null) return;
+-                final boolean steady=PhotonCamera.getGyro()!=null && PhotonCamera.getGyro().getFilteredShakiness()<=35;
+-                final com.particlesdevs.photoncamera.processing.experimentc.Iris26980CManualExposure.Pair chosen=
+-                        com.particlesdevs.photoncamera.processing.experimentc.Iris26980CManualExposure.plan(
++                final int gyro=PhotonCamera.getGyro()==null?-1:PhotonCamera.getGyro().getFilteredShakiness();
++                final Float focal=physical.get(CaptureResult.LENS_FOCAL_LENGTH);
++                final android.util.SizeF sensorSize=chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
++                final android.graphics.Rect active=chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
++                final android.graphics.Rect physicalCrop=physical.get(CaptureResult.SCALER_CROP_REGION);
++                float equivalentMm=focal!=null && sensorSize!=null && sensorSize.getWidth()>0f
++                        ? 36f*focal/sensorSize.getWidth():Float.NaN;
++                if(active!=null && physicalCrop!=null && physicalCrop.width()>0 && active.contains(physicalCrop))
++                    equivalentMm*=Math.max(1f,(float)active.width()/physicalCrop.width());
++                final com.particlesdevs.photoncamera.processing.experimentc.Iris26981CManualExposure.Pair chosen=
++                        com.particlesdevs.photoncamera.processing.experimentc.Iris26981CManualExposure.plan(
+                             ss,iso,range.getLower(),range.getUpper(),gain.getLower(),gain.getUpper(),
+-                            frameLimit==null?0L:frameLimit,steady,
++                            frameLimit==null?0L:frameLimit,gyro,equivalentMm,
+                             physical.get(CaptureResult.STATISTICS_SCENE_FLICKER),meter.mean,meter.highlightSignal,
+                             meter.clippedFraction,appliedEv);
++                Log.i(TAG,"IRIS_26981_C_ADAPTIVE_PAIR base="+ss+"/"+iso+" chosen="+chosen.shutterNs+"/"+chosen.iso+" gyro="+gyro+" equivalentMm="+equivalentMm+" protection="+appliedEv);
+                 builder.set(CaptureRequest.CONTROL_AE_MODE,CaptureRequest.CONTROL_AE_MODE_OFF);
+                 builder.set(CaptureRequest.CONTROL_AE_LOCK,false);
+                 builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME,chosen.shutterNs);
+@@ -6722,6 +6747,17 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     final int target;
+                     synchronized(mZslBufferLock) {
+                         mIris26979CTracking.selectLens(physicalID);
++                        final CaptureRequest previous=mIris26975CProvenRawPreviewRequest;
++                        if(cMotion && previous!=null &&
++                                (!java.util.Objects.equals(previous.get(CaptureRequest.SCALER_CROP_REGION),
++                                        builder.get(CaptureRequest.SCALER_CROP_REGION)) ||
++                                 (android.os.Build.VERSION.SDK_INT>=30 &&
++                                  !java.util.Objects.equals(previous.get(CaptureRequest.CONTROL_ZOOM_RATIO),
++                                        builder.get(CaptureRequest.CONTROL_ZOOM_RATIO))))) {
++                            mIris26979CTracking.clearProtection();
++                            iris26980CClearReferenceLocked();
++                        }
++                        mIris26979CTracking.selectUserComp(Math.max(comp.getLower(),Math.min(comp.getUpper(),userComp)));
+                         target=cMotion?mIris26979CTracking.compensation(userComp,comp.getLower(),comp.getUpper(),step==null?0f:step.floatValue()):Math.max(comp.getLower(),Math.min(comp.getUpper(),userComp));
+                     }
+                     builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,target);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/control/TouchFocus.java b/app/src/main/java/com/particlesdevs/photoncamera/control/TouchFocus.java
+index 5416c640a192380ab42966fa5cb67e194355d00e..ed9a44c753338c61aa2e221c0973c2946e5874a0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/control/TouchFocus.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/control/TouchFocus.java
+@@ -82,7 +82,7 @@ public class TouchFocus {
+         if (builder == null || activeTouchRegion == null) return;
+         final boolean cMetering = captureController.iris26979CBeginTouchMetering();
+         try {
+-            if(cMetering) captureController.iris26980CSetTouchRegion(activeTouchRegion);
++            if(cMetering) captureController.iris26981CResumeTouchRegion(activeTouchRegion);
+             builder.set(CaptureRequest.CONTROL_AF_REGIONS, activeTouchRegion);
+             if (captureController.iris26975CSelectedForCapture())
+                 builder.set(CaptureRequest.CONTROL_AE_REGIONS, activeTouchRegion);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26981CExposureTracking.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26981CExposureTracking.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..61d22c1507475bdd0a528ba5e6146a891a71edac
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26981CExposureTracking.java
+@@ -0,0 +1,84 @@
++package com.particlesdevs.photoncamera.processing.experimentc;
++
++/** C-only exposure tracking. RAW observations are always from a proved current request.
++ * Bias is applied by Camera2 AE, leaving the HAL's original flicker strategy in charge.
++ * One absolute target per settled unprotected metering epoch. Request transitions preserve the target;
++ * genuine scene, touch, lens or user-EV transitions establish a new epoch.
++ * All methods are serialized by the controller's C RAW ring lock. */
++public final class Iris26981CExposureTracking {
++    private String lens;
++    private float protectionEv;
++    private boolean decided;
++    private Integer userBaseComp;
++    private static final float RETARGET_DEADBAND_EV = .30f;
++    private long autoTs, firstAutoTs, probeTs, lastShutter;
++    private int lastIso, stableVotes, sceneVotes;
++    private float baselineMean = Float.NaN, baselineClipped = Float.NaN, baselineHigh = Float.NaN;
++    public void reset() { lens=null; userBaseComp=null; clearProtection(); }
++    public void selectLens(String id) {
++        if (!java.util.Objects.equals(lens,id)) { reset(); lens=id; }
++    }
++    public void resetRequest() {
++        autoTs=firstAutoTs=probeTs=lastShutter=0L;
++        lastIso=stableVotes=sceneVotes=0;
++        baselineMean=baselineClipped=baselineHigh=Float.NaN;
++    }
++    public void clearProtection() { protectionEv=0f; decided=false; resetRequest(); }
++    public void selectUserComp(int user) {
++        if (userBaseComp==null || userBaseComp!=user) { clearProtection(); userBaseComp=user; }
++    }
++    public float protectionEv() { return protectionEv; }
++    public int compensation(int user, int lo, int hi, float step) {
++        int base=Math.max(lo,Math.min(hi,user));
++        if (!Float.isFinite(step)||step<=0f) return base;
++        int offset=Math.min((int)Math.floor(1.50f/step+0.0001f),Math.max(0,Math.round(protectionEv/step)));
++        return (int)Math.max(lo,(long)base-offset);
++    }
++    /** Wait for a new request's actual metering to settle, especially after touch AE.
++     * Searching/precapture never qualifies. The fallback is only for absent/vendor AE states. */
++    public boolean observeAuto(long ts,long ss,int iso,Integer ae,boolean touch) {
++        if(ts<=autoTs||ss<=0L||iso<=0) return false;
++        if(firstAutoTs==0L) firstAutoTs=ts;
++        autoTs=ts;
++        double ratio=lastShutter>0L && lastIso>0 ? ((double)ss*iso)/((double)lastShutter*lastIso) : 0;
++        stableVotes=ratio>=.92 && ratio<=1.087 ? stableVotes+1 : 1;
++        lastShutter=ss;lastIso=iso;
++        long minimum=touch?350_000_000L:100_000_000L;
++        boolean converged=ae!=null&&(ae==2||ae==4);
++        boolean unknown=ae==null||ae==0;
++        return ts-firstAutoTs>=minimum && ((converged&&stableVotes>=2)||(unknown&&stableVotes>=4&&ts-firstAutoTs>=350_000_000L));
++    }
++    public boolean shouldProbe(long ts) { return ts>probeTs && (probeTs==0L||ts-probeTs>=120_000_000L); }
++    /** The RAW sampler's B-derived meaningful-region/94% headroom decision is
++     * valid at the unprotected user/HAL base only. Residual clipping after that
++     * one target has been applied is not another exposure demand. A changed
++     * scene reopens the base metering epoch instead of summing demands. */
++    public boolean observeProtection(float demand,float high,float clipped,float appliedEv,float step,int user,int lo,int hi) {
++        if(!Float.isFinite(demand)||!Float.isFinite(high)||!Float.isFinite(clipped)||
++                !Float.isFinite(appliedEv)||!Float.isFinite(step)||step<=0f) return false;
++        selectUserComp(user);
++        if(decided || appliedEv>.03f) return false;
++        decided=true;
++        int before=compensation(user,lo,hi,step);
++        protectionEv=Math.max(0f,Math.min(1.50f,demand));
++        int after=compensation(user,lo,hi,step);
++        if(Math.abs(after-before)*step<RETARGET_DEADBAND_EV) { protectionEv=0f; return false; }
++        return before!=after;
++    }
++    /** A large scene change remeters immediately; modest changes need two observations.
++     * Missing RAW evidence does not cause a periodic flash back to unprotected AE. */
++    public boolean observeLocked(long ts,float mean,float clipped,float high) {
++        if(!shouldProbe(ts)) return false;
++        probeTs=ts;
++        if(!Float.isFinite(mean)||mean<0f||!Float.isFinite(clipped)||clipped<0f||clipped>1f||!Float.isFinite(high)||high<0f||high>1f) return false;
++        if(!Float.isFinite(baselineMean)) {baselineMean=mean;baselineClipped=clipped;baselineHigh=high;return false;}
++        double ratio=(mean+.002)/(baselineMean+.002);
++        float clipDelta=Math.abs(clipped-baselineClipped);
++        if(ratio>=2.0||ratio<=.5||clipDelta>=.03f) return true;
++        boolean changed=ratio>1.45||ratio<1.0/1.45||clipDelta>.01f
++                || (clipDelta>.004f && (clipped>baselineClipped*2f || baselineClipped>clipped*2f))
++                || Math.abs(high-baselineHigh)>.25f;
++        sceneVotes=changed?sceneVotes+1:0;
++        return sceneVotes>=2;
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26981CManualExposure.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26981CManualExposure.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9539f38039325a90307fb842c6c46ae156538b2
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26981CManualExposure.java
+@@ -0,0 +1,59 @@
++package com.particlesdevs.photoncamera.processing.experimentc;
++
++/** C-private automatic pair selection. Explicit user manual requests and donor
++ * manual control remain untouched. 1/15s is the donor preview bound, not a target.
++ * Preserve the protected AE exposure product; favor more photons only when
++ * darkness, gain, measured steadiness, focal length and highlight headroom permit.
++ * Gyro is camera motion evidence, not proof of a motionless subject. */
++public final class Iris26981CManualExposure {
++    private Iris26981CManualExposure() {}
++    public static final class Pair {
++        public final long shutterNs; public final int iso;
++        Pair(long shutterNs,int iso) { this.shutterNs=shutterNs; this.iso=iso; }
++    }
++    private static double clamp(double v,double lo,double hi) { return Math.max(lo,Math.min(hi,v)); }
++    public static Pair plan(long ss,int iso,long minSs,long maxSs,int minIso,int maxIso,
++            long maxFrame,int gyro,float equivalentMm,Integer flicker,float mean,float high,float clipped,float protection) {
++        if(ss<=0||iso<=0||minSs<=0||maxSs<minSs||minIso<=0||maxIso<minIso)
++            throw new IllegalArgumentException("C invalid physical exposure bounds");
++        long limit=maxFrame>0?Math.min(maxSs,maxFrame):maxSs;
++        if(limit<minSs) throw new IllegalArgumentException("C invalid frame duration");
++        long base=Math.max(minSs,Math.min(limit,ss));
++        int gain=Math.max(minIso,Math.min(maxIso,iso));
++        Pair unchanged=new Pair(base,gain);
++        if(gyro<0||gyro>35||!Float.isFinite(equivalentMm)||equivalentMm<=0||flicker==null||
++           !Float.isFinite(mean)||mean<0||mean>.12f||!Float.isFinite(high)||high<0||high>=.85f||
++           !Float.isFinite(clipped)||clipped<0||clipped>.0005f||!Float.isFinite(protection)||protection<0||gain<400)
++            return unchanged;
++        double energy=(double)ss*iso;
++        // The preferred extension is scene dependent, not a jump to the limit.
++        // As gain and darkness rise the noise benefit grows, while camera motion
++        // and longer effective focal length reduce the permissible extension.
++        double darkness=clamp((.12-mean)/.11,0,1);
++        double gainNeed=clamp(Math.log(gain/400.0)/Math.log(8.0),0,1);
++        double steady=clamp(1.0-gyro/36.0,0,1);
++        double focalPenalty=clamp(28.0/equivalentMm,.20,1);
++        double preferredEv=(.15+.95*darkness*gainNeed)*(.35+.65*steady)*Math.sqrt(focalPenalty);
++        long cap=Math.min(limit,1_000_000_000L/15L);
++        // A conservative relative motion budget; never shorten the proven HAL pair.
++        long motionCap=Math.round((1_000_000_000.0/15.0)*(.45+.55*steady)*focalPenalty);
++        cap=Math.min(cap,motionCap);
++        cap=Math.min(cap,(long)Math.floor(energy/minIso));
++        // A conservative headroom check before lowering gain. No invented full-well calibration.
++        if(high>0) cap=Math.min(cap,(long)Math.floor(ss*.85/high));
++        long preferred=Math.min(cap,(long)Math.floor(base*Math.pow(2.0,preferredEv)));
++        if(preferred<base*Math.pow(2.0,.12)) return unchanged;
++        long chosen=preferred;
++        if(flicker!=0) {
++            double period=flicker==1?10_000_000.0:flicker==2?1_000_000_000.0/120.0:0;
++            if(period==0||Math.abs(base-Math.rint(base/period)*period)>period*.015) return unchanged;
++            // A legal complete mains period must fit inside the adaptive preference.
++            chosen=Math.round(Math.floor(preferred/period)*period);
++            if(chosen>cap) return unchanged;
++        }
++        if(chosen<base*Math.pow(2.0,.12)) return unchanged;
++        int newIso=(int)Math.max(minIso,Math.min(maxIso,Math.floor(energy/chosen)));
++        if(newIso>=gain || (double)chosen*newIso>energy) return unchanged;
++        return new Pair(chosen,newIso);
++    }
++}
+diff --git a/app/version.properties b/app/version.properties
+index 6812d910ecd6768ea12d689cd7e85e5c1d30c441..47a3577ec8c3cbeb389b0185eb8b80a6325ac590 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726980
+-VERSION_BUILD=26980
++VERSION_NAME=0.9726981
++VERSION_BUILD=26981
