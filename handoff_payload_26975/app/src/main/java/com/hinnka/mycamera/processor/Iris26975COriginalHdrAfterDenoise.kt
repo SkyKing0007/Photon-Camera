@@ -209,8 +209,6 @@ internal object Iris26975COriginalHdrAfterDenoise {
                 profileExposure = originalUniforms,
                 dcpRenderPlan = dcp.dcpRenderPlan,
                 applyDcpHueSatMap = false, // HueSat already applied by RawLinearRcdPass.
-                spectralFilmLut = null,
-                hncsRenderPlan = null,
                 bindProfileGainTable = { program -> pgtm.bind(program, textures[0]) },
             )
             // Original RawDemosaicProcessor separates the HDRNet long-scene gain
