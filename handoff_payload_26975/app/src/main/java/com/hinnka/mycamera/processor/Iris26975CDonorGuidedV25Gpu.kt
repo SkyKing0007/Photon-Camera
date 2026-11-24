@@ -240,8 +240,6 @@ internal class Iris26975CDonorGuidedV25Gpu : AutoCloseable {
                 profileExposure = donorExposure,
                 dcpRenderPlan = dcp.dcpRenderPlan,
                 applyDcpHueSatMap = false, // Original linear pass has already applied HueSat.
-                spectralFilmLut = null,
-                hncsRenderPlan = null,
                 bindProfileGainTable = { program -> pgtm.bind(program, tex[0]) },
             )) ?: error("Pinned bjzhou Adobe Curve tone rendering failed")
             check(toned.textureId == tex[1])

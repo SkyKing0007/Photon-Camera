@@ -137,7 +137,7 @@ internal object Iris26972CCamera2Calibration {
             ?: throw IllegalArgumentException("$COMPONENT missing frozen DNG neutral")
         require(neutral.size == 3) { "$COMPONENT invalid physical DNG neutral" }
         val first = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1)
-        val second = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2)
+        val second = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2)?.toInt()
         // Use the *actual original donor* fixed-calibration domain and defensive
         // deep-copy semantics before handing immutable physical matrices to the
         // pre-existing C color solver.  This does not imply that the C solver is
