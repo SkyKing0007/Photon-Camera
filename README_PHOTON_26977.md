@@ -1,0 +1,6 @@
+# Photon 26977 — independent C donor processing completion
+PREPARED FOR ACTIONS, not build-proven. Actual successful 26976 run 45326310944, artifact 14890426950; all authority hashes in 26977_AUTHORITY_AND_SCOPE.json.
+
+Preserve the successful independent same-exposure ZSL admission and post-shutter supplementation. Correct the missing owned shutter preview for original HDRNet/PGTM, crop/rotation/metering and physical RAW calibration, original merged noise/SNR continuity, HDR reference alignment, donor zoom resampling, early buffer release, capture UI terminal cleanup and donor diagnostic export. Highlight protection is automatically C-private, without a preference. C uses the donor Adobe pipeline and applicable original shader/model prewarming, with shutter cancellation and resource guards; no A/B prewarming within C. No alternate rendering engine, creative LUT or substitute for a failed donor result.
+
+10 modified, 4 added, 0 removed; 2390 protected original files. Shared capture/UI/settings edits are C-gated. The exact successful 26976 compiler/build sequence remains mandatory, retargeted to 26977 with additive checks. Local checks cannot establish full Android compilation or device processing parity. No new APK included.
