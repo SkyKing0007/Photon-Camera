@@ -1,0 +1,307 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CPinnedDonorProEngine.kt b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CPinnedDonorProEngine.kt
+index db49b7e7b635d60fa53173ccf85cb0c29e71cb8d..06730a80c8763e60e68f1e63dc5b6a8c6f3860fc 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CPinnedDonorProEngine.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CPinnedDonorProEngine.kt
+@@ -119,7 +119,6 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
+         var denoisedSource: com.hinnka.mycamera.processor.experimentc.original129.processor.GpuLinearRgbSource? = null
+         var sdr: android.graphics.Bitmap? = null
+         var hdr: android.graphics.Bitmap? = null
+-        var gainmapContents: Bitmap? = null
+         var neutralLookLuma: com.hinnka.mycamera.processor.experimentc.original129.hdr.LuminanceGainMap? = null
+         val temporary = File(output.scratchDirectory, "original129_sabre_${transaction.shutterTimeMillis}.jpg")
+         require(!temporary.exists()) { "C scratch name collision" }
+@@ -316,11 +315,6 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
+             stage("original Adobe SDR/HDR rendering and Lanczos-3")
+             sdr = rendered.sdrBitmap
+             hdr = rendered.hdrReferenceBitmap
+-            val originalSdr = checkNotNull(sdr)
+-            val finalSdr = Iris26978CFinalOutput.prepareSdr(originalSdr)
+-            sdr = finalSdr
+-            if (finalSdr !== originalSdr) originalSdr.recycle()
+-            stage("neutral encoded sRGB JPEG base preparation")
+             check(sdr?.width == output.finalWidth && sdr?.height == output.finalHeight) {
+                 "Original 1x Lanczos-3 physical output does not match frozen Iris geometry"
+             }
+@@ -328,15 +322,13 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
+             val hdrBitmap = checkNotNull(normalizeRawHdrReferenceForGainmap(rendered, checkNotNull(sdr), sourceHdr))
+             if (hdrBitmap !== sourceHdr && !sourceHdr.isRecycled) sourceHdr.recycle()
+             hdr = hdrBitmap
+-            Iris26978CFinalOutput.validateHdrPair(checkNotNull(sdr), hdrBitmap)
++            check(hdrBitmap.width == checkNotNull(sdr).width && hdrBitmap.height == checkNotNull(sdr).height)
+             check(stillLive()) { "C session closed before rendered pixel validation" }
+             validateNonBlackBase(checkNotNull(sdr), reference, shutterGrid)
+             // The original GPU RAW gainmap needs an explicit LUT-ratio input.
+             // No film/look LUT is applied: an exact identity sidecar leaves the
+             // HDR-to-SDR gain computed solely by donor RAW HDR/SDR pixels.
+             neutralLookLuma = NoLookLutRawGainmapSidecar.create(checkNotNull(sdr))
+-            Iris26978CFinalOutput.validateSidecar(checkNotNull(sdr), checkNotNull(neutralLookLuma))
+-            check(Jpeg444ExportEncoder.isSupported) { "Original native JPEG/R encoder unavailable" }
+             val gainmap = rawGpuGainmapProducer.build(
+                 GainmapSourceSet(
+                     sdrBase = checkNotNull(sdr),
+@@ -347,12 +339,6 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
+                 ),
+                 HdrGainmapStrength.DEFAULT,
+             ) ?: error("Original JPEG/R gainmap unavailable")
+-            gainmapContents = gainmap.gainmap.gainmapContents
+-            check(!checkNotNull(gainmapContents).isRecycled &&
+-                checkNotNull(gainmapContents).width == checkNotNull(neutralLookLuma).bitmap.width &&
+-                checkNotNull(gainmapContents).height == checkNotNull(neutralLookLuma).bitmap.height) {
+-                "Original gainmap result geometry invalid"
+-            }
+             stage("original GPU gainmap")
+             check(stillLive()) { "C session closed before original JPEG/R encoding" }
+             val info = CaptureInfo(
+@@ -388,7 +374,6 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
+             sdr?.recycle()
+             hdr?.recycle()
+             neutralLookLuma?.bitmap?.recycle()
+-            gainmapContents?.recycle()
+             // All original GL texture owners, even failed jobs, return to their renderer.
+             val fused = stackResult
+             val final = denoisedSource
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26978CFinalOutput.kt b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26978CFinalOutput.kt
+deleted file mode 100644
+index 2592fe5610f4d69fc87e56439205a96967cc0e52..0000000000000000000000000000000000000000
+--- a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26978CFinalOutput.kt
++++ /dev/null
+@@ -1,58 +0,0 @@
+-package com.hinnka.mycamera.processor.experimentc
+-
+-import android.graphics.Bitmap
+-import android.graphics.Canvas
+-import android.graphics.ColorSpace
+-import android.graphics.Rect
+-import com.hinnka.mycamera.processor.experimentc.original129.hdr.RawGainmapMath
+-import com.hinnka.mycamera.processor.experimentc.original129.hdr.LuminanceGainMap
+-import com.hinnka.mycamera.processor.experimentc.original129.hdr.LuminanceGainMapEncoding
+-
+-/** Neutral output boundary only. Donor no-look render clamps RGB to [0,1] in RGBA8.
+- * Extended encoded sRGB has the same in-range transfer and primaries as sRGB.
+- * Draw through Android's color-managed Canvas into an explicitly bounded sRGB
+- * destination; never relabel the source or modify the linear HDR reference.
+- */
+-internal object Iris26978CFinalOutput {
+-    fun prepareSdr(source: Bitmap): Bitmap {
+-        require(!source.isRecycled && source.width > 0 && source.height > 0)
+-        val srgb = ColorSpace.get(ColorSpace.Named.SRGB)
+-        val extended = ColorSpace.get(ColorSpace.Named.EXTENDED_SRGB)
+-        require(source.colorSpace?.id == srgb.id || source.colorSpace?.id == extended.id) {
+-            "C donor returned unexpected SDR color space: ${source.colorSpace}"
+-        }
+-        if (source.config == Bitmap.Config.ARGB_8888 && source.colorSpace?.isSrgb == true) return source
+-        val target = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888, false, srgb)
+-        try {
+-            // Explicit source/destination rectangles: no density scaling or geometry change.
+-            val bounds = Rect(0, 0, source.width, source.height)
+-            Canvas(target).drawBitmap(source, bounds, bounds, null)
+-            check(target.colorSpace?.isSrgb == true && target.config == Bitmap.Config.ARGB_8888)
+-            return target
+-        } catch (failure: Throwable) {
+-            target.recycle()
+-            throw failure
+-        }
+-    }
+-
+-    fun validateHdrPair(sdr: Bitmap, hdr: Bitmap) {
+-        require(!sdr.isRecycled && !hdr.isRecycled && sdr.width > 0 && sdr.height > 0)
+-        require(sdr.config == Bitmap.Config.ARGB_8888 && sdr.colorSpace?.isSrgb == true)
+-        require(hdr.config == Bitmap.Config.RGBA_F16 && hdr.colorSpace?.id ==
+-            ColorSpace.get(ColorSpace.Named.LINEAR_EXTENDED_SRGB).id) {
+-            "C donor HDR reference must remain linear extended sRGB RGBA_F16"
+-        }
+-        require(sdr.width == hdr.width && sdr.height == hdr.height) { "C SDR/HDR geometry mismatch" }
+-    }
+-
+-    fun validateSidecar(sdr: Bitmap, sidecar: LuminanceGainMap) {
+-        val d = RawGainmapMath.DOWNSAMPLE
+-        val b = sidecar.bitmap
+-        require(!b.isRecycled && sidecar.encoding == LuminanceGainMapEncoding.LINEAR_RATIO &&
+-            b.config == Bitmap.Config.RGBA_F16 && b.colorSpace?.id ==
+-            ColorSpace.get(ColorSpace.Named.LINEAR_EXTENDED_SRGB).id &&
+-            b.width == (sdr.width + d - 1) / d && b.height == (sdr.height + d - 1) / d) {
+-            "C donor RAW gainmap luminance sidecar contract failed"
+-        }
+-    }
+-}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index f63702e29a838e7ef26e84c4ebb04557cf34ac23..8e255ff19164a2194faa8f34f863037cfc41d7d9 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -625,20 +625,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * C session owns every RAW Image until it finishes or fails explicitly. */
+     private volatile com.hinnka.mycamera.processor.Iris26972CCamera2ShutterSession
+             mIris26972CShutterSession;
+-    private volatile com.hinnka.mycamera.processor.Iris26972CCamera2ShutterSession mIris26978CUiOwner;
+-    public boolean iris26978CIsUiBusy() { return mIris26978CUiOwner != null; }
+-    private synchronized void iris26978CArmUi(com.hinnka.mycamera.processor.Iris26972CCamera2ShutterSession owner) {
+-        if (mIris26972CShutterSession != owner || mIris26978CUiOwner != null)
+-            throw new IllegalStateException("C UI owner changed before capture start");
+-        mIris26978CUiOwner = owner;
+-        CaptureController.isProcessing = true;
+-    }
+-    private synchronized boolean iris26978CFinishUi(com.hinnka.mycamera.processor.Iris26972CCamera2ShutterSession owner) {
+-        if (owner == null || mIris26978CUiOwner != owner) return false;
+-        mIris26978CUiOwner = null;
+-        CaptureController.isProcessing = false;
+-        return true;
+-    }
+     /* IRIS_26974_C_RAW_CALLBACK_IO_ISOLATION: physically independent RAW ImageReader handler.
+      * The original Camera2 capture handler remains free to deliver callback/sequence/timeout
+      * events while each C RAW16 image is checksum-spooled and fd.synced. */
+@@ -1988,16 +1974,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mIris26975CProvenMeterRequest = null;
+             mIris26975CLatestMeterResult = null;
+             mIris26975CProvenRawPreviewRequest = null;
+-            if (c != null) {
+-                try {
+-                    if (iris26978CFinishUi(c)) {
+-                        try { cameraEventsListener.onCaptureSequenceCompleted(null); }
+-                        finally { cameraEventsListener.onProcessingFinished("Experiment C capture cancelled"); }
+-                    }
+-                } catch (RuntimeException uiError) {
+-                    Log.e(TAG, "IRIS_26978_C_CLOSE_UI", uiError);
+-                } finally { c.close(); }
+-            }
++            if (c != null) c.close();
+             final android.os.HandlerThread cRawThread = mIris26974CRawCallbackThread;
+             mIris26974CRawCallbackThread = null;
+             if (cRawThread != null) {
+@@ -12522,7 +12499,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                                     "saved=" + (uri != null) + " sequenceEnd=" +
+                                     cSequenceFence.isSequenceEnded());
+                             try {
+-                                iris26978CFinishUi(ownerHolder[0]);
+                                 cCompleteUiSequence.run();
+                                 if (uri == null) {
+                                     Log.e(TAG, "IRIS_26972_C_NO_IMAGE: " + String.valueOf(error));
+@@ -12622,16 +12598,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             cRawThread.start();
+             mIris26974CRawCallbackThread = cRawThread;
+             mIris26972CShutterSession = owner;
+-            iris26978CArmUi(owner);
+-            cameraEventsListener.onFrameCountSet(frames);
+-            cameraEventsListener.onCaptureStillPictureStarted("Experiment C RAW capture");
+-            cameraEventsListener.onBurstPrepared(null);
+-            // Match shared Motion ZSL progress callbacks for retained frames.
+-            for (int i = 0; i < cPreShutterImages.size(); i++) {
+-                cameraEventsListener.onFrameCaptureStarted(null);
+-                cameraEventsListener.onFrameCaptureCompleted(new TimerFrameCountViewModel.FrameCntTime(
+-                        i + 1, frames, ExposureIndex.time2sec(exposure)));
+-            }
+             // A fully pre-shutter burst is activated only after the reader is
+             // drained and its never-submitted sequence fence is acknowledged.
+             if (cPreShutterImages.size() < frames) owner.activate();
+@@ -12657,7 +12623,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     if (tag.index == 0 || tag.index == frames - 1 || tag.index % 5 == 4)
+                         Log.i(TAG, "IRIS_26974_C_FRAME_STARTED " +
+                                 (tag.index + 1) + "/" + frames + " ts=" + timestamp);
+-                    cameraEventsListener.onFrameCaptureStarted(null);
+                     owner.onStarted(tag.index, timestamp, number);
+                 }
+                 @Override public void onCaptureCompleted(@NonNull CameraCaptureSession session,
+@@ -12669,7 +12634,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     owner.onTotal(tag.index, result);
+                     cameraEventsListener.onFrameCaptureCompleted(
+                             new TimerFrameCountViewModel.FrameCntTime(
+-                                    tag.index + 1, frames, ExposureIndex.time2sec(exposure)));
++                                    tag.index + 1, frames, exposure));
+                     if (tag.index == 0 || tag.index == frames - 1 || tag.index % 5 == 4)
+                         Log.i(TAG, "IRIS_26974_C_TOTAL_RESULT " +
+                                 (tag.index + 1) + "/" + frames);
+@@ -12711,6 +12676,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     cReleaseAfterSequence.run();
+                 }
+             };
++            cameraEventsListener.onFrameCountSet(frames);
++            cameraEventsListener.onCaptureStillPictureStarted("Experiment C RAW capture");
+             if (requests.isEmpty()) {
+                 // Exactly N pre-shutter RAWs were physically paired and copied
+                 // into C's private spool. No post-shutter captureBurst exists.
+@@ -12718,10 +12685,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 // releases the C owner without waiting for a nonexistent HAL job.
+                 cSequenceFence.markNeverSubmitted();
+                 cCompleteUiSequence.run();
++                owner.activate();
+                 iris26974CResumePreviewOnly(captureSession, cReader);
+                 cameraEventsListener.onProcessingStarted(
+                         "Experiment C complete pre-shutter RAW burst processing");
+-                owner.activate();
+                 Log.i(TAG, "IRIS_26975_V4_C_ALL_PRE_SHUTTER frames=" + frames);
+                 return;
+             }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index 6ea7b282c5181c053e10a04738359fe31c2ff9fe..e327658bd3250a012dd98f814fc8f469d80d47d3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -1245,8 +1245,7 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+             /* B/SR ON may be rendering the original RawLens 15-RAW LKR;
+              * never reactivate its shutter merely because background work began. */
+             mCameraUIView.activateShutterButton(
+-                    !com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive() &&
+-                    (captureController == null || !captureController.iris26978CIsUiBusy()));
++                    !com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive());
+             showNotification(processName);
+         }
+ 
+@@ -1267,8 +1266,7 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+             logD("onProcessingFinished: " + obj);
+             /* Duplicate HDRX/Motion terminal notifications are not JPEG success.
+              * In B/ON only the verified publish or terminal error releases. */
+-            if (!com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive() &&
+-                    (captureController == null || !captureController.iris26978CIsUiBusy())) {
++            if (!com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive()) {
+                 mCameraUIView.setProcessingProgressBarIndeterminate(false);
+                 mCameraUIView.activateShutterButton(true);
+                 mCameraUIView.lockUIForBurst(false);
+@@ -1352,8 +1350,6 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+                  */
+                 mCameraUIView.setCaptureProgressBarOpacity(1.0f);
+                 mCameraUIView.lockUIForBurst(true);
+-                if (captureController != null && captureController.iris26978CIsUiBusy())
+-                    mCameraUIView.activateShutterButton(false);
+             }
+             //textureView.post(() -> textureView.setAlpha(0.8f));
+         }
+@@ -1467,16 +1463,6 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+ 
+         @Override
+         public void onRequestTriggerMediaScanner(Uri fileUri) {
+-            // A committed MediaStore row needs no filesystem scanner. Reuse the
+-            // universal exact-item thumbnail route, rather than querying newest.
+-            if (fileUri != null && "content".equals(fileUri.getScheme()) &&
+-                    "media".equals(fileUri.getAuthority())) {
+-                final Activity owner = activity;
+-                if (owner != null) owner.runOnUiThread(() -> {
+-                    if (isAdded()) cameraFragmentViewModel.updateGalleryThumb(fileUri);
+-                });
+-                return;
+-            }
+             triggerMediaScanner(fileUri);
+         }
+     }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+index 5bc6486cf20dd44e263d735c2aaa5355e5ee7a8d..eb961b6bbbf16a7250e1f10e875d0a3452a49406 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+@@ -800,8 +800,7 @@ public class CameraUIViewImpl implements CameraUIView {
+ 
+             applyVideoShutterStack(videoStyle);
+             final boolean iris26935Locked =
+-                    com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive() ||
+-                    (cameraFragment.captureController != null && cameraFragment.captureController.iris26978CIsUiBusy());
++                    com.particlesdevs.photoncamera.capture.Iris26935BOnSession.isActive();
+             this.mShutterButton.setActivated(status && !iris26935Locked);
+             this.mShutterButton.setClickable(status && !iris26935Locked);
+             /* Only the B/ON JPEG guard owns grey alpha and enabled=false;
+diff --git a/app/version.properties b/app/version.properties
+index 49376a14bc70f769d7be70ac258d4529edc10129..ed815061b9ac6b60b4545ae2d92afbadd5c6e607 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726978
+-VERSION_BUILD=26978
++VERSION_NAME=0.9726977
++VERSION_BUILD=26977
