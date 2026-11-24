@@ -78,6 +78,7 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
     // CaptureController installs the independent terminal/sequence fence.
     private var activated = false
     @Volatile private var cancelled = false
+    @Volatile private var processingDeadlineExpired = false
 
     private enum class State { COLLECTING, PROCESSING, FINISHED }
 
@@ -270,6 +271,18 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
             !active.hasCompletePhysicalBurst()) return
         state = State.PROCESSING
         Log.i(traceTag, "IRIS_26974_C_FULL_BURST_PROCESSING_START frames=" + frameCount)
+        val processingWatchdog = Thread({
+            try { Thread.sleep(PROCESSING_DEADLINE_MS) } catch (_: InterruptedException) { return@Thread }
+            synchronized(this) {
+                if (state == State.PROCESSING) {
+                    processingDeadlineExpired = true
+                    cancelled = true
+                    // Do not release the GPU/spool or admit another C owner until the worker exits.
+                    Log.e(traceTag,"IRIS_26975_C_PROCESSING_DEADLINE publicationCancelled=true ownerRetained=true")
+                }
+            }
+        },"Iris26975C-ProcessingDeadline").apply { isDaemon = true }
+        processingWatchdog.start()
         try {
             worker.execute {
                 var uri: Uri? = null
@@ -297,6 +310,13 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
                 } finally {
                     try { active.close() } catch (cleanup: Throwable) {
                         reason = (reason ?: "C RAW cleanup failed") + "; ${cleanup.message}"
+                        val committed = uri
+                        if (committed != null) try {
+                            com.particlesdevs.photoncamera.processing.experimentc
+                                .Iris26972CMediaStorePublisher.revokeCommitted(applicationContext, committed)
+                        } catch (revoke: Throwable) {
+                            reason += "; C row revocation failed: ${revoke.message}"
+                        }
                         uri = null
                     }
                     try { cleanSessionWorkspace() } catch (cleanup: Throwable) {
@@ -332,13 +352,17 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
                             uri = null
                             if (reason == null) reason = "$component camera closed during processing"
                         }
+                        if (processingDeadlineExpired) reason = "$component donor processing deadline exceeded; no gallery commit"
                         state = State.FINISHED
+                        processingWatchdog.interrupt()
                         deliver(uri, reason)
                     }
                     worker.shutdown()
                 }
             }
         } catch (error: Throwable) {
+            processingWatchdog.interrupt()
+            state = State.COLLECTING // no worker owns the spool if execute() rejects
             fail("C GPU dispatch rejected: ${error.message}")
         }
     }
@@ -431,6 +455,7 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
                 "26972 C private scratch deletion refused: ${file.name}"
             }
         }
+        private const val PROCESSING_DEADLINE_MS = 180_000L
         private const val MAX_PRIVATE_BYTES = 8L * 1024 * 1024 * 1024
         private const val FREE_SPACE_RESERVE = 128L * 1024 * 1024
         private const val ICC_SHA256 = "78e7ab7ab641965ccafce2b4fdd481c8b90ae15c8c4e9afef649aa9c7b1633c8"

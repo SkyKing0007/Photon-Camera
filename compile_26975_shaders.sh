@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 26975 V6: mandatory exact successful 26974 V3 24 physical shaders PLUS
-# all 162 independently extracted, SHA-pinned current V9 RAW-only Kotlin C GLSL.
+# all 151 remaining SHA-pinned current V14 Experiment C Kotlin GLSL (8 excluded preview shaders are physically gone).
 # Never rely only on 26974's stale expanded shader snapshot. Dynamic Kotlin
 # assembled shaders are explicitly audited but cannot be compile-proven offline.
 set -eEuo pipefail
@@ -46,7 +46,7 @@ mapfile -t SOURCES < <(find "$INPUT" -maxdepth 1 -type f \( -name '*.vert' -o -n
 COUNT="$(python3 -S - <<'PY'
 import json
 v=json.load(open('26975_V6_CURRENT_SHADER_INVENTORY.json'))
-assert v['static_count'] == 162 and v['dynamic_count'] == 149 and v['source_count'] == v['static_count'] + v['dynamic_count']
+assert v['static_count'] == 151 and v['dynamic_count'] == 77 and v['source_count'] == v['static_count'] + v['dynamic_count']
 print(v['static_count'])
 PY
 )"
@@ -58,7 +58,7 @@ mkdir -p "$WORK"
 # GitHub Actions immediately. Report ALL failures in this one run and fail
 # closed after the full inventory. Do not hide diagnostics in a redirected brace.
 printf '%s\n' \
-  '26975 V9 ACTUAL STATIC GLSL/SPIR-V COMPILATION BEGIN' \
+  '26975 V14 ACTUAL STATIC GLSL/SPIR-V COMPILATION BEGIN' \
   "static_shader_count=$COUNT" > "$LOG"
 "$COMPILER" --version >> "$LOG" 2>&1
 spirv-val --version >> "$LOG" 2>&1
@@ -71,7 +71,7 @@ import json,sys
 records=json.load(open(sys.argv[1],encoding='utf8'))
 matching=[x for x in records if x['file']==sys.argv[2]]
 if len(matching)!=1:
- raise SystemExit('26975 V9 BLOCKED: shader metadata missing or ambiguous '+sys.argv[2])
+ raise SystemExit('26975 V14 BLOCKED: shader metadata missing or ambiguous '+sys.argv[2])
 print(matching[0]['location'])
 PYMETA
 }
@@ -88,7 +88,7 @@ run_checked_phase() {
    return 0
  else
    code=$?
-   printf 'FAIL 26975 V9 shader=%s origin=%s phase=%s exit=%d\n' \
+   printf 'FAIL 26975 V14 shader=%s origin=%s phase=%s exit=%d\n' \
      "$source_name" "$origin" "$phase" "$code" | tee -a "$LOG" >&2
    printf 'FAILING COMMAND: ' | tee -a "$LOG" >&2
    printf '%q ' "$@" | tee -a "$LOG" >&2
@@ -132,13 +132,13 @@ for SRC in "${SOURCES[@]}"; do
   sha256sum "$WORK/$BASE.spv" "$WORK/$BASE.opt.spv" >> "$LOG"
   PASSED=$((PASSED+1))
 done
-printf '26975 V9 CURRENT SHADER RESULT: pass=%d fail=%d total=%d\n' \
+printf '26975 V14 CURRENT SHADER RESULT: pass=%d fail=%d total=%d\n' \
   "$PASSED" "$FAILED" "$COUNT" | tee -a "$LOG"
 if [ "$FAILED" -ne 0 ] || [ "$PASSED" -ne "$COUNT" ]; then
   printf 'BLOCKED: %d actual shader toolchain failures; see complete phase diagnostics in this Actions log\n' "$FAILED" | tee -a "$LOG" >&2
   exit 2
 fi
-printf 'PASS 26975 V9 physical current %d/%d static donor/Iris C ESSL GLSL + SPIR-V opt/val; independently pinned source inventory\n' "$COUNT" "$COUNT" >> "$LOG"
+printf 'PASS 26975 V14 physical current %d/%d static donor/Iris C ESSL GLSL + SPIR-V opt/val; independently pinned source inventory\n' "$COUNT" "$COUNT" >> "$LOG"
 printf '%s\n' 'NOT RUN/NOT PROVEN: dynamic Kotlin-assembled donor shader compile on physical Android GPU (cannot honestly substitute static template validation)' >> "$LOG"
 cp "$LOG" "$OUT/26975_V6_STATIC_GLSL_SPIRV_RECEIPT.txt"
-printf '%s\n' "PASS inherited historical 24/24 and actual current $COUNT/$COUNT V9 donor/Iris C shader compilation with pinned glslang/SPIR-V toolchain; dynamic runtime GLSL still needs device" >> "$OUT/26975_REAL_GLSL_SPIRV_COMPILER.txt"
+printf '%s\n' "PASS inherited historical 24/24 and actual current $COUNT/$COUNT V14 donor/Iris C shader compilation with pinned glslang/SPIR-V toolchain; dynamic runtime GLSL still needs device" >> "$OUT/26975_REAL_GLSL_SPIRV_COMPILER.txt"

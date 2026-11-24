@@ -7,7 +7,7 @@ No commit, push, partial compilation, platform verification bypass or A/B fallba
 """
 import argparse,gzip,hashlib,io,json,os,pathlib,re,shutil,subprocess,sys,tarfile,urllib.request,zipfile
 R=pathlib.Path(__file__).resolve().parent
-SHADER_COUNT=162 # exact current V9 physical shader inventory; not skip
+SHADER_COUNT=151 # exact current V14 physical required shader inventory; not skip
 TMP=R/'.photon_26975_work';OUT=R/'photon_26975_outputs'
 ART=TMP/'26974-success.zip';BASE=TMP/'authority_26974';CAND=TMP/'candidate_26975'
 REPO='SkyKing0007/Photon-Camera';BRANCH='experimental-clean-photon-rebuild'
@@ -19,7 +19,7 @@ WORKFLOW_SHA='3aba27e38220f8c8995b807ec91b58a82fe68d3e385226b3b3849f3f6f81ef5b'
 PRIOR_APK_SHA='25ad6df699e9a232b2f76fbc50777acf376bd13f8a6f07f63909ea3d5c9247e9'
 PRIOR_APK_NAME='IrisCamera-0.9726974-26974-iris-rawr-debug.apk'
 APKNAME='IrisCamera-0.9726975-26975-iris-rawr-debug.apk'
-NBASE=2132;NFILES=2455;NCHANGE=345;NADDED=323;NMODIFIED=22;NDELETED=0;NPROTECTED=2110
+NBASE=2132;NFILES=2394;NCHANGE=284;NADDED=262;NMODIFIED=22;NDELETED=0;NPROTECTED=2110
 NATIVE_SHA={
  'lib/arm64-v8a/liblkrpipeline.so':'037a5f62649dcac7034c789c8e7ea2f250ca818d1c1c364e09a59f6897530105',
  'lib/arm64-v8a/libsrpipeline.so':'f87cc70ad12a69345392a4eb73b6ec33739577ce8c39b7a4916180c344f67069',
@@ -35,7 +35,7 @@ FILES=[
  '26974_SUCCESSFUL_EXECUTED_WORKFLOW_REFERENCE.yml','26974_SUCCESSFUL_EXECUTED_BUILDER_REFERENCE.py',
  'build_26975_incremental.py','compile_26975_shaders.sh','test_26975_gallery_host.py','test_26975_source.py',
  'test_26975_patches.py','test_26975_sealed_negatives.py','test_26975_workflow_refs.py',
- 'test_26975_v4_capture_host.py','test_26975_v5_asset_host.py','26975_V5_REMOVED_OPTIONAL_ASSETS.json',
+ 'test_26975_v4_capture_host.py','test_26975_v5_asset_host.py','test_26975_v10_minimal_core.py','26975_V10_MINIMAL_LUT_REACHABILITY_PROOF.json','26975_V5_REMOVED_OPTIONAL_ASSETS.json',
  'verify_26975_v6_current_glsl.py','26975_V6_CURRENT_SHADER_INVENTORY.json','26975_V6_REMOVED_UNREFERENCED_GLASS_SHADERS.json',
  '26975_BASE_26974_FULL_APP.sha256','26975_EXPECTED_FULL_APP.sha256','26975_PROTECTED_SOURCE.sha256',
  '26975_AUTHORITY_AND_SCOPE.json','26975_CHANGED_RUNTIME_ALLOWLIST.txt',
@@ -109,6 +109,73 @@ ad893cafc4058bbbf227b5171c86b7e4eec498ccf087f10e30e7f2814a1bd9e6  app/src/main/j
 3bdc66f7ed4625b4cdf670e4999bbd64befae51d79ae1eb3e656dc44f833623c  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesYuvTiming.kt
 """
 
+V10_STALE_STAGE_SHA256 = """\
+33d13b5e4589b13bcdb1a9da698a8f5515ac679af9e27e497d87d09ba9ffe01b  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/EmbeddedGainmapProducer.kt
+8257a9f2e70bf5d9151c21174a77995edc7b9f150b01cd4b1724ac3e63e480f8  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/EstimatedSdrGainmapMath.kt
+72ae8a02d175b71b644bf3ccdb5681306190c0ee5b10747cafc03f7fb85cf178  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/EstimatedSdrGainmapProducer.kt
+4d62008f14daea727059ce5930aacf577902357397f44251cc8b6544156f6db5  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/UltraHdrWriter.kt
+63d863a46df1e2a705270e366a8dd23a1325b53fc4469154578272ae78287102  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/UnifiedGainmapProducer.kt
+c85aae98c1187ebcb79ce2da842ccef19ef479fd5a904779a508bf768a0e5b9a  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/ml/SharedDepthEstimator.kt
+2341c5033d4340c0dbd0a9cd7db2cf7b59bf80d13f93e6269f0cc59bbece0cd3  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesGpuTimerQuery.kt
+131aa6fa2460a2832c71c5e5916ad9addbd2dede7189b898150502e50d27671f  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesHardwareBufferImage.kt
+a01883604bab24089937be7400a5cc260d35ec06bc265eef1ea9a85df1794b27  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/AgXToneAlgorithm.kt
+754c4095ee70a13f8e09e916c6d05095662482cfff49b99485e17ce3be8c8334  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/CanonIccGlResources.kt
+7effd4df72fee69de0b5f3c6f19968b044baf227f5885ac9d1a09c556c779d66  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/CanonIccProfile.kt
+cd92b6e822b67ff8970c64f66dbc6af3a6c9394d96966b1c1c39170e5b8a521e  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/CanonIccShader.kt
+66bdb2705a440ce14a6c4583326a73ccbe4301de114cc60c0b2c79a8969a62e3  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/CanonPictureStyle.kt
+bf9a8fab294baf040bb6e5d5adebc3ccc3479e57a31d4513339ab96fac24ea13  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/CanonProfile.kt
+136e92f3a3e386248da121b5a9d060cc2920859b6cf7560e10ccde648be1c749  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/CanonR5ChromaMath.kt
+8edd050f31246e72971f8e3e68ac1cc7dac3d468ec49d5333ad4efee86a63b81  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/CanonRecipeColorMath.kt
+df7e94f994f1a306772b8a4ed581ff273bab02fe57b6459f59c5293bf5022bc1  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/CanonToneAlgorithm.kt
+316e372aed8e581bdd96b382bdeef142ebf5f6b102126f18a39729bda059ddc5  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/DarktableFilmicHighlightReconstructionAlgorithm.kt
+d6f5a18b7535612ec51a0d49c5aa4c4563b73f6a4cdec3f8d859c59d47f61201  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/DarktableFilmicToneAlgorithm.kt
+40331104687086fbbd36d568e64518925de5414197327de3608b2bf2fa6f6953  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/DarktableSigmoidToneAlgorithm.kt
+0525ff9f499b4ef39a383c02373635c1ce1a012854d0eba015223d8a585cfe5f  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/DirectCameraColorTransform.kt
+4e7e098c439b8976815af7e4123b8170197716081e8143c98a808a0c466711f6  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/EquivalentCameraCalibration.kt
+32b100329483ca4397b773a8fd00b663da59a069bce2981c7ce8b76c561997bd  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/FotufilmToneStage.kt
+b10da4f9db32910cb13b329f47daf5a10b5c356aab0eb8a7c4218221962698f5  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/HncsCameraDomain.kt
+e0602cb7874eb16fef32c65646014df88b6ce173eb63a3ee0b8ed58e3bb60820  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/HncsOutputLinearPass.kt
+6fff38a826fceee2a5ab07fe21678d46a3bcce7d87b986326b2a1652e11c6c12  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/HncsProfile.kt
+f84172ef5d68e389fbac72963a42cca76a2fd00256617047b9e813c1ea9c88b3  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/HncsToneAlgorithm.kt
+0d81571466315c4a346474ca663caab53a48baf29b88e79395aba0799a82cd90  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/LeicaProfile.kt
+c89b33a6ed51a77668decdb42c26e3e3821442415d4930147448af8f6ceb2413  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/LeicaToneAlgorithm.kt
+534bd8d56e622dcd64512cfb1d6f0c882e75e6b22e0502fe28e4d6418e9bcf01  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/LumixColorTemperature.kt
+2ee363174d9c854ba2eb8316773f7a14e3701ccf430efd1b7afc67ab219d16d0  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/LumixPhotoStyle.kt
+fc4b4e44f55bfe0f6e6e88847bbca29ead65f987b2c773d4c7aff41e23a90acb  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/LumixProfile.kt
+c29898527be28e8b75ab0c59284a0d89df7e735e4ca64901f5af347e4568a2f9  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/LumixToneAlgorithm.kt
+94034e562bfc453983335999c00621c0aaccfbc9bad7c518381e10df2d191114  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/MgcRaisrUpscale.kt
+2bea7033983ab962892cfbcd89d4cebc7b209e401ecf066321e8141ba6c2f288  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpectralFilmEffects.kt
+b4f7694e6cdc17ab53eb3ce16194d490dd698742584e2ffb529fe3643281a7ce  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpectralFilmGraph.kt
+934868b55ea77488b443fbd1c23174efda8506bfb31496e3359e170fa6b50fb6  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpectralFilmProfile.kt
+c1482e7041ae39a39136ffd1d8308c12ced35616555c51dfbb3c80ef97d57eb2  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpectralFilmTuning.kt
+ca71526705aa93e63cbcd297a985f095b0d852462acba2b642f7b147d91fe402  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpektrafilmDiffusionAtlas.kt
+25366c12839e9bc04f4029b98929e4e9bd10d85ab40e5351812a415a1276b4af  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpektrafilmGrainPass.kt
+4e38c3416ffdb352c0b8453f5b29a89f0726d1c803a80c003f9e8a5b6ad990fe  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpektrafilmGraphGl.kt
+4b93c9eb234db954507ddd40854cea22f509f6591729f3953cfe381026bb642c  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpektrafilmGraphShaders.kt
+b3b6437cd05c1cd232103e4445070b404ee3a3d405ccc7de00d0ff0e4cadc2af  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpektrafilmGraphToneStage.kt
+356d92ad779cb713dadbd0a83dd3418846766816c5d9de7a9dee21ed8992ad23  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpektrafilmOpticsKernels.kt
+227aea5cebdf5fe9d252efc4677af8015c9c680a739e9b4122e773e97dfebddf  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpektrafilmOpticsPass.kt
+16108c38ceaf6bc52be44fca0151af05ac732194bd43b97b272017873f912ae5  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpektrafilmOpticsShaders.kt
+25db9a81beebd645c611a06df7e0a379ccff75ee0ff95dab8a8fc191fe4ead6b  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpektrafilmRuntime.kt
+4566a88eec29089cdf3ab3290f6b57b877651514f504a2e987874316811553bd  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpektrafilmScannerPass.kt
+5cde7bf3b0b3b970ce81f08c8d77b44470d2a60a33ba93e557201331e036ac68  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/SpektrafilmToneAlgorithm.kt
+5d8321120e116b993c98eb09842a06be02e2229354f2f1b4f26aa5546f127566  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmBuildResult.kt
+7569d616d5ae40562c376f299e494387f8dd0b00fec771b81a2f404d3a0b73ab  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmCatalogue.kt
+4ab76ce607efd66f793ac69e9629c5cadb23d77ec213e96220befd33aa3ff902  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmConfigLayout.kt
+14a68aa181af60ca7c770e522339107114b36578fc470fd4ee8be5ab405cb95f  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmDocument.kt
+98465458e71e935b7cc10be6ce96bfe868bb2db98a02c53a820a4729d97ae8e3  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmFrame.kt
+fd32c1dce469af315dccfae7a1803c837684eafa8c96b5917061f1c675d3f752  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmFrameFields.kt
+5ad6820ff65580f37e5495677b1fc5cf7dfc63b81db620cc0d19dcc19cd073f4  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmFrameParams.kt
+04a78547f17b099dcdb6b837d8c05ce26ab86ebfdc5d1a2caed22a40d81e836e  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmNativeBridge.kt
+c0f77908c9f92e2bb6a5e05dd4a473704521c69511b2d21d111b55ac00a510fd  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmRenderer.kt
+3ba84fe6eba41127e009fbd6b5935f7d215a44e1ba2f3daf411c76e98a06bf78  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmRuntime.kt
+b1f1c936bba3e9d32fe5826e1be537629e15973010fd313649f916adf6a5085f  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmShaders.kt
+0bb90c6badb160859a30789fb2ee81f8330d61df7ae080e12e6f42dae035a714  app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/fotufilm/FotufilmStockInfo.kt
+"""
+
+V13_STALE_STAGE_SHA256="""b2cb975989affbca5cc6726dfcf5228714da927adf87b014981a4cf6ebb0c1c5  app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26975CFlickerModeFreeze.java
+c41ba8bca62961de811766207654ee3997e5c717c68091f8b178e379863f6aec  app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26975CNightExposureFreeze.java"""
+
 def stale_stage_manifest():
     out={}
     for line in V7_STALE_STAGE_SHA256.splitlines():
@@ -118,6 +185,18 @@ def stale_stage_manifest():
         out[path]=h
     if len(out)!=56 or sum('/bjzhou/' in p for p in out)!=49 or sum('GlesYuv' in p for p in out)!=7:
         fail('V7 stale stage list changed')
+    for line in V10_STALE_STAGE_SHA256.splitlines():
+        h,path=line.split('  ',1)
+        if not re.fullmatch('[0-9a-f]{64}',h) or path in out or not path.startswith('app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/'):
+            fail('bad V10 stale stage SHA-256 manifest')
+        out[path]=h
+    if len(out)!=117:fail('V10 stale stage list changed')
+    for line in V13_STALE_STAGE_SHA256.splitlines():
+        h,path=line.split('  ',1)
+        if not re.fullmatch('[0-9a-f]{64}',h) or path in out or not path.startswith('app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/'):
+            fail('bad V13 stale stage SHA-256 manifest')
+        out[path]=h
+    if len(out)!=119:fail('V13 stale stage list changed')
     return out
 
 def prune_only_pinned_stale_stage(payload,changed,known_stale):
@@ -135,7 +214,7 @@ def prune_only_pinned_stale_stage(payload,changed,known_stale):
     for rel in sorted(extra):
         p=payload/rel
         if sha(p)!=known_stale[rel]:
-            fail('tampered historical V7 staging file '+rel)
+            fail('tampered SHA-pinned historical staging file '+rel)
     for rel in sorted(extra):
         path=payload/rel
         path.unlink()
@@ -147,7 +226,7 @@ def prune_only_pinned_stale_stage(payload,changed,known_stale):
             except OSError:break
             parent=parent.parent
     if extra:
-        print(f'PASS exact original V7 stale staging cleanup: {len(extra)} SHA-256 pinned files excluded from V8 C candidate')
+        print(f'PASS exact V7/V10/V13 stale staging cleanup: {len(extra)} SHA-256 pinned files excluded from V14 C candidate')
     return len(extra)
 
 
@@ -317,6 +396,7 @@ def regress():
  subprocess.run([sys.executable,'-S','test_26975_v5_asset_host.py','--live'],cwd=R,check=True)
  subprocess.run([sys.executable,'-S','verify_26975_v6_current_glsl.py','--audit'],cwd=R,check=True)
  subprocess.run([sys.executable,'-S','test_26975_v5_asset_host.py','--live'],cwd=R,check=True)
+ subprocess.run([sys.executable,'-S','test_26975_v10_minimal_core.py','--live'],cwd=R,check=True)
  print('PASS live 26975 C-only tests and protected file invariance')
 
 def stage_native():
@@ -336,9 +416,9 @@ def verify_compiled():
  regress();success=OUT/'26974_SUCCESSFUL_REAL_GLSL_SPIRV_COMPILER.txt'
  current=OUT/'26975_REAL_GLSL_SPIRV_COMPILER.txt'
  if not success.is_file() or 'PASS actual 26974 24/24 C GLES' not in success.read_text():fail('26974 actual successful shader proof missing')
- if not current.is_file() or 'PASS actual 26974 24/24 C GLES' not in current.read_text() or 'PASS inherited historical 24/24 and actual current {SHADER_COUNT}/{SHADER_COUNT} V9 donor/Iris C shader compilation'.format(SHADER_COUNT=SHADER_COUNT) not in current.read_text():fail('current Actions 24/24 + V9 162/162 shader recompilation proof missing')
+ if not current.is_file() or 'PASS actual 26974 24/24 C GLES' not in current.read_text() or 'PASS inherited historical 24/24 and actual current {SHADER_COUNT}/{SHADER_COUNT} V14 donor/Iris C shader compilation'.format(SHADER_COUNT=SHADER_COUNT) not in current.read_text():fail('current Actions 24/24 + V14 151/151 shader recompilation proof missing')
  v6=OUT/'26975_V6_CURRENT_STATIC_GLSL_SPIRV_COMPILER.txt'
- if not v6.is_file() or f'PASS 26975 V9 physical current {SHADER_COUNT}/{SHADER_COUNT} static donor/Iris C ESSL GLSL + SPIR-V opt/val' not in v6.read_text():fail('current C shader parser and SPIR-V optimizer must actually pass')
+ if not v6.is_file() or f'PASS 26975 V14 physical current {SHADER_COUNT}/{SHADER_COUNT} static donor/Iris C ESSL GLSL + SPIR-V opt/val' not in v6.read_text():fail('current C shader parser and SPIR-V optimizer must actually pass')
  for p,want in NATIVE_SHA.items():
   if sha(R/'app/build/verified_rawlens26931/jniLibs'/p.removeprefix('lib/'))!=want:fail('staged dual ABI LKR mismatch')
  for p,want in DONOR_SHA.items():
@@ -366,7 +446,7 @@ def finalize():
   if not any(x.startswith('lib/arm64-v8a/libiris26972c.so') for x in apk.namelist()):fail('original C native library not linked')
  exact(R,'26975_EXPECTED_FULL_APP.sha256','actual assembled 26975 source unchanged')
  OUT.mkdir(exist_ok=True)
- (OUT/'26975_COMPILER_STATUS.txt').write_text('REAL PINNED GLSL COMPILE: PASS\nREAL SPIR-V VALIDATION/OPTIMIZATION: PASS\nREAL KOTLIN COMPILE: PASS\nREAL JAVA COMPILE: PASS\nREAL TWO-ABI NDK/CMake COMPILE: PASS\nREAL ANDROID Gradle :app:assembleDebug: PASS\nRUNTIME SOURCE INVARIANCE: PASS (2110 protected, 22 modified, 323 added)\nEXPERIMENT C CONTROLLED DEVICE TRIAL: ENABLED\nEXPERIMENT C PRODUCTION READY: NO\nDEVICE IQ VALIDATION: NOT RUN\n')
+ (OUT/'26975_COMPILER_STATUS.txt').write_text('REAL PINNED GLSL COMPILE: PASS\nREAL SPIR-V VALIDATION/OPTIMIZATION: PASS\nREAL KOTLIN COMPILE: PASS\nREAL JAVA COMPILE: PASS\nREAL TWO-ABI NDK/CMake COMPILE: PASS\nREAL ANDROID Gradle :app:assembleDebug: PASS\nRUNTIME SOURCE INVARIANCE: PASS (2110 protected, 22 modified, 263 added)\nEXPERIMENT C CONTROLLED DEVICE TRIAL: ENABLED\nEXPERIMENT C PRODUCTION READY: NO\nDEVICE IQ VALIDATION: NOT RUN\n')
  (OUT/'26975_REAL_GRADLE_TASKS.txt').write_text(''.join('PASS '+p+'\n' for p in tasks))
  (OUT/'26975_APK.sha256').write_text(sha(R/APKNAME)+'  '+APKNAME+'\n')
  wf=R/'.github/workflows/build-26975-change-aware.yml'

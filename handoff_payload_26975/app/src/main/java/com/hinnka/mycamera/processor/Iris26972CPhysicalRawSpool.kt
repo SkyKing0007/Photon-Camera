@@ -343,6 +343,10 @@ internal class Iris26972CPhysicalRawSpool private constructor(
             com.hinnka.mycamera.processor.experimentc.Iris26975COriginalRawBurst.Frame(
                 metadata = capture.metadata,
                 totalCaptureResult = capture.total,
+                physicalCaptureResult = if (logicalCameraId == physicalCameraId) capture.total else
+                    checkNotNull(capture.total.physicalCameraResults[physicalCameraId]) {
+                        "$name missing exact physical donor capture result"
+                    },
                 sensorWidth = raw.sensorWidth,
                 sensorHeight = raw.sensorHeight,
                 cropLeft = raw.sensorCropLeft,
