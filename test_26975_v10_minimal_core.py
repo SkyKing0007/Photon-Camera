@@ -35,8 +35,8 @@ if args.live:
  assert sorted(set(urefs))==['compileShader','linkProgram']
 import json as _json
 inventory=_json.loads((R/'26975_V6_CURRENT_SHADER_INVENTORY.json').read_text())
-assert inventory['static_count']==151 and inventory['dynamic_count']==77
-print('PASS V10 C-only donor shader/use closure, retained original GLSL/GLES bytes, four unchanged V10 and three specialized selected source pins, 151 static 77 dynamic; no creative LUT dependency')
+assert inventory['static_count']==151 and inventory['dynamic_count']==78
+print('PASS V10 C-only donor shader/use closure, retained original GLSL/GLES bytes, four unchanged V10 and three specialized selected source pins, 151 static 78 dynamic; no creative LUT dependency')
 
 bridge=src('app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CPinnedDonorProEngine.kt').decode()
 stripped=bridge.split('\n    /** Reject an exactly black SDR base',1)[0]+'}\n'

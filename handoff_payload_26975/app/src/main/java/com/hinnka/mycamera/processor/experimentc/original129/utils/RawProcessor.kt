@@ -637,7 +637,7 @@ object RawProcessor {
     suspend fun prepareRawDngProfile(
         rawBuffer: ByteBuffer?,
         gpuLinearRgbSource: GpuLinearRgbSource? = null,
-        fastMomentsRawStats: com.hinnka.mycamera.raw.RawSceneAERawStats? = null,
+        fastMomentsRawStats: com.hinnka.mycamera.processor.experimentc.original129.raw.RawSceneAERawStats? = null,
         width: Int,
         height: Int,
         characteristics: CameraCharacteristics,
@@ -770,7 +770,7 @@ object RawProcessor {
             )
         }
         val captureProfile = options.captureProfilePreparer?.prepare(
-            com.hinnka.mycamera.raw.RawDngCaptureProfileInput(
+            com.hinnka.mycamera.processor.experimentc.original129.raw.RawDngCaptureProfileInput(
                 rawData = rawBuffer?.duplicate()?.order(ByteOrder.nativeOrder()),
                 width = width,
                 height = height,
@@ -787,8 +787,8 @@ object RawProcessor {
         val viewfinderExposureOffsetEv = captureProfile?.exposureOffsetEv
             ?.takeIf { it.isFinite() }
             ?.coerceIn(
-                com.hinnka.mycamera.raw.MeteringSystem.RAW_EXPOSURE_MIN_EV,
-                com.hinnka.mycamera.raw.MeteringSystem.RAW_EXPOSURE_MAX_EV,
+                com.hinnka.mycamera.processor.experimentc.original129.raw.MeteringSystem.RAW_EXPOSURE_MIN_EV,
+                com.hinnka.mycamera.processor.experimentc.original129.raw.MeteringSystem.RAW_EXPOSURE_MAX_EV,
             )
         val finalBaselineExposureEv = DngBaselineExposure.resolveCaptureBaseline(
             sourceBaselineEv = sourceBaselineExposureEv,

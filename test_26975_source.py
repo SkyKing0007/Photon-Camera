@@ -66,3 +66,15 @@ if a.live:
 if a.live:
  assert not (assetroot/"shaders/frame_glass").exists()
  assert not any((assetroot/"shaders").rglob("*.*")) if (assetroot/"shaders").exists() else True
+
+# V15: exact fixes for all V14 compiler-error root causes.
+v15_expected = {'app/src/main/java/com/hinnka/mycamera/processor/Iris26972CCamera2Calibration.kt': '80c12bb03ac008ec083902a31eec1f7490c6cc9efc35e65f20ff8723153f5fee', 'app/src/main/java/com/hinnka/mycamera/processor/Iris26975CDonorGuidedV25Gpu.kt': '5b22329f91f6f001c31c9fefe140777569f9e9f0ce99af24e1a9ee5e4b10d5d9', 'app/src/main/java/com/hinnka/mycamera/processor/Iris26975COriginalHdrAfterDenoise.kt': '4c49e45bbcdfd294f41705237932722db838825a0d87fff6363b634109f46e21', 'app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesGraphicsShader.kt': '8c159138030c789b02e3f4ef15b47b59ec74af98b25099e17125d2b4bc8864f1', 'app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesMgcRawBaseFrameSelector.kt': 'afe0dc3da83982d56f7dd2be3798b297d6b0df947530001c592d704c0d55b8fb', 'app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/MgcSpatialRejectionGeometry.kt': 'e3631ce7d60cf5846760d9d1ef7ffe1190a12f1702be8b67a4f6fed3c0ef7334', 'app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/RawStackRegistration.kt': '1d50323e946715d66f6082c01b65d58665d9a543732ae32ad0e3a46124c41b3b', 'app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/NoisePolynomialFit.kt': '53b8aa099a0ebaa9672054da765cbd24c04ed92186a751b055422475ff9d653a', 'app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/utils/RawProcessor.kt': '14c774d90f852d39fc4673569dc7f77ba2ab046b89635bdd37ad4b6d7c97e901'}
+for rel, digest in v15_expected.items():
+ assert b.sha(root/rel)==digest, "V15 compiler repair drift: "+rel
+print("PASS V15 five repaired Kotlin callers and four pinned original donor dependencies")
+
+# Android Camera2 API contract: illuminant 1 is Int, illuminant 2 is Byte.
+calibration = file('app/src/main/java/com/hinnka/mycamera/processor/Iris26972CCamera2Calibration.kt')
+assert "val first = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1)\n" in calibration
+assert "val second = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2)?.toInt()\n" in calibration
+print("PASS Camera2 documented Integer/Byte illuminant boundary")
