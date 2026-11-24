@@ -1,8 +1,6 @@
 package com.hinnka.mycamera.processor.experimentc.original129.raw
 
 import android.content.Context
-import com.hinnka.mycamera.processor.experimentc.original129.raw.fotufilm.FotufilmDocument
-import com.hinnka.mycamera.processor.experimentc.original129.raw.fotufilm.FotufilmRuntime
 import android.graphics.Bitmap
 import android.graphics.BlendMode
 import android.graphics.Canvas
@@ -24,7 +22,6 @@ import com.hinnka.mycamera.processor.experimentc.original129.camera.AspectRatio
 import com.hinnka.mycamera.processor.experimentc.original129.camera.CameraState
 import com.hinnka.mycamera.processor.experimentc.original129.camera.RawBlackBorderCrop
 import com.hinnka.mycamera.processor.experimentc.original129.data.ContentRepository
-import com.hinnka.mycamera.processor.experimentc.original129.ml.SharedDepthEstimator
 import com.hinnka.mycamera.processor.experimentc.original129.processor.GlesGpuCompletion
 import com.hinnka.mycamera.processor.experimentc.original129.processor.GlesGpuScheduler
 import com.hinnka.mycamera.processor.experimentc.original129.processor.GlesComputeWorkGroup
@@ -267,7 +264,7 @@ class RawDemosaicProcessor {
         private const val TAG = "RawDemosaicProcessor"
         private const val EGL_CONTEXT_PRIORITY_LEVEL_IMG = 0x3100
         private const val EGL_CONTEXT_PRIORITY_LOW_IMG = 0x3103
-        // Engine tone programs already reserve 0..6 for input/profile/HNCS/SpectralFilm LUTs.
+        // Preserve original engine tone program texture slots 0..6.
         private const val PROFILE_GAIN_TABLE_TEXTURE_UNIT = 7
         private const val LINEAR_DCP_HUE_SAT_TEXTURE_UNIT = 3
         private const val RCD_RAW_TEXTURE_UNIT = 0
@@ -284,14 +281,7 @@ class RawDemosaicProcessor {
         // Phocus GetStripMargin(50) returns 60 pixels for gradient/color-noise interpolation.
         // The remaining 52 pixels cover chroma denoise, NLM, shadows/highlights and sharpening.
         private const val RAW_TILE_SUPPORT_PX = 112
-        private const val RAW_TILE_MIN_FOTUFILM_CORE_EDGE_PX = 1024
-        private const val FILMIC_GREY_SOURCE = 0.1845f
-        private const val FILMIC_OUTPUT_POWER = 3.614815775f
-        private const val FILMIC_DISPLAY_BLACK = 0.0001517634f
-        private const val FILMIC_DEFAULT_DYNAMIC_RANGE = 12.21f
-        private const val FILMIC_DEFAULT_CONTRAST = 1.433801098f
-        private const val FILMIC_LATITUDE = 0.0001f
-        private const val FILMIC_SAFETY_MARGIN = 0.01f
+        private const val RAW_TILE_MIN_CORE_EDGE_PX = 1024
         private val BRADFORD_D65_TO_D50 = floatArrayOf(
             1.0478112f, 0.0228866f, -0.0501270f,
             0.0295424f, 0.9904844f, -0.0170491f,
@@ -510,19 +500,10 @@ class RawDemosaicProcessor {
             warmupColorEngine.workingColorSpace,
             ColorSpace.SRGB,
         )
-        // Lens calibration is unavailable during synthetic startup warmup. Compile calibrated engines
-        // here; only actual photos with calibrated render plans execute its tone shader.
-        val engineToneReady = if (warmupColorEngine.usesCameraInputDomain || warmupColorEngine.isFotufilm) {
-            engineTonePass.prewarm(warmupColorEngine)
-        } else renderEngineTonePass(
+        val engineToneReady = renderEngineTonePass(
             inputTextureId = inputTextureId,
             dcpRenderPlan = null,
             applyDcpHueSatMap = false,
-            spectralFilmLut = null,
-            hncsRenderPlan = null,
-            lumixRenderPlan = null,
-            canonRenderPlan = null,
-            leicaRenderPlan = if (warmupColorEngine.isLeica) LeicaProfile.createRenderPlan(context) else null,
             colorEngine = warmupColorEngine,
             profileToEngineTransform = identityMatrix3x3(),
             profileExposureUniforms = ProfileExposureUniforms.NEUTRAL,
@@ -538,22 +519,7 @@ class RawDemosaicProcessor {
             viewportWidth = programSize.width,
             viewportHeight = programSize.height,
         )
-        val srgbInputTextureId = if (warmupColorEngine.isLumix || warmupColorEngine.isCanon) {
-            inputTextureId
-        } else if (engineToneReady && warmupColorEngine.isHncs) {
-            setupAdjustmentFramebuffer(programSize.width, programSize.height)
-            val outputReady = renderHncsOutputLinearPass(
-                inputTextureId = engineToneTextureId,
-                outputTransform = outputTransform,
-                targetFramebufferId = adjustmentFramebufferId,
-                viewportWidth = programSize.width,
-                viewportHeight = programSize.height,
-            )
-            if (!outputReady) return false
-            adjustmentTextureId
-        } else {
-            engineToneTextureId
-        }
+        val srgbInputTextureId = engineToneTextureId
         setupCombinedFramebuffer(programSize.width, programSize.height)
         val srgbReady = engineToneReady && renderSrgbPass(
             inputTextureId = srgbInputTextureId,
@@ -1396,8 +1362,6 @@ class RawDemosaicProcessor {
     // Fullscreen passes own their shader programs and lifecycle.
     private val fullscreenQuad = RawFullscreenQuad()
     private val profileGainTableAlgorithm = DngPhotonProfileGainTableAlgorithm()
-    private val filmicHighlightReconstructionAlgorithm =
-        DarktableFilmicHighlightReconstructionAlgorithm(fullscreenQuad)
     private val dcpTextureResources = DcpTextureResources()
     private val curveTextureResources = RawCurveTextureResources()
     private val engineTonePass = RawEngineTonePass(
@@ -1405,7 +1369,6 @@ class RawDemosaicProcessor {
         dcpTextureResources,
         curveTextureResources,
     )
-    private val hncsOutputLinearPass = HncsOutputLinearPass(fullscreenQuad)
     private val adjustmentPass = RawAdjustmentPass(fullscreenQuad)
     private val srgbPass = RawSrgbPass(fullscreenQuad)
     private val sharpenPass = RawSharpenPass(fullscreenQuad)
@@ -1415,9 +1378,7 @@ class RawDemosaicProcessor {
     private val outputTransfer = RawFloatTextureTransfer(RawFloatTextureTransfer.Layout.HALF)
     private var outputTransferAvailable = false
     /** RAISR reads the finalized tile as float RGBA, so it needs its own transfer layout. */
-    private val raisrTransfer = RawFloatTextureTransfer(RawFloatTextureTransfer.Layout.FLOAT)
     /** Lifted MGC RAISR finish-stage magnification; only used at the 2x output scale. */
-    private val mgcRaisrUpscale = MgcRaisrUpscale()
     private val outputPass = RawOutputPass(fullscreenQuad)
     private val linearUintToFloatPass = RawLinearUintToFloatPass()
     private val linearRgbExpandPass = RawLinearRgbExpandPass()
@@ -1512,12 +1473,6 @@ class RawDemosaicProcessor {
     private var gfHeight = 0
 
 
-    suspend fun prewarmDepthEstimator(context: Context) = withContext(Dispatchers.Default) {
-        val start = System.currentTimeMillis()
-        SharedDepthEstimator.prewarm(context.applicationContext)
-        PLog.d(TAG, "RAW DepthEstimator prewarmed, took=${System.currentTimeMillis() - start}ms")
-    }
-
     private var lensShadingTextureId = 0
     private var dummyShadingTextureId = 0
 
@@ -1526,35 +1481,9 @@ class RawDemosaicProcessor {
         val curveLut: FloatArray? = null
     )
 
-    private data class FilmicToneCurveUniforms(
-        val blackRelativeExposure: Float,
-        val whiteRelativeExposure: Float,
-        val dynamicRange: Float,
-        val inputMin: Float,
-        val inputMax: Float,
-        val latitudeMin: Float,
-        val latitudeMax: Float,
-        val m1: FloatArray,
-        val m2: FloatArray,
-        val m3: FloatArray,
-        val m4: FloatArray,
-        val m5: FloatArray
-    )
-
-    /**
-     * MGC GuidedUpsample develops the tone stage on its box-downsampled grid and regresses the
-     * result back onto the full-resolution camera guide. Fotufilm's grain is film-plane texture
-     * that no function of the guide carries, so the regression would average it away (and the
-     * smaller virtual frame would lay it at that grid's pitch). Spektrafilm's spatial graph and
-     * scanner optics also operate at native pixel pitch, independently of the camera guide.
-     */
-    private fun usesGuidedToneUpsample(
-        geometry: RawOutputGeometry,
-        colorEngine: RawRenderingEngine,
-        spectralFilmLut: SpectralFilmLut?,
-    ) = geometry.mgcFinishResolution.needsGuidedUpsample && !colorEngine.isFotufilm &&
-        (spectralFilmLut == null ||
-            (spectralFilmLut.graph == null && SpektrafilmScannerPass.support(spectralFilmLut.tuning) == 0))
+    /** The selected AdobeCurve tone pass uses the original guided-resolution decision. */
+    private fun usesGuidedToneUpsample(geometry: RawOutputGeometry) =
+        geometry.mgcFinishResolution.needsGuidedUpsample
 
     private data class RawTileRenderConfig(
         val context: Context,
@@ -1582,16 +1511,9 @@ class RawDemosaicProcessor {
         val clampProfileRgb: Boolean,
         val supportProfileOverrange: Boolean,
         val hueSatMapSupportsOverrange: Boolean,
-        val hncsCameraDomainGains: FloatArray?,
         val colorEngine: RawRenderingEngine,
         val activeDcpRenderPlan: DcpRenderPlan?,
         val profileExposureUniforms: ProfileExposureUniforms,
-        val spectralFilmLut: SpectralFilmLut?,
-        val fotufilm: FotufilmRenderRequest?,
-        val hncsRenderPlan: HncsRenderPlan?,
-        val lumixRenderPlan: LumixRenderPlan?,
-        val canonRenderPlan: CanonRenderPlan?,
-        val leicaRenderPlan: LeicaRenderPlan?,
         val engineWorkingColorSpace: ColorSpace,
         val profileToEngineTransform: FloatArray,
         val shadowsHighlightsParams: ShadowsHighlightsParams,
@@ -1754,14 +1676,7 @@ class RawDemosaicProcessor {
         rawDcpId: String? = null,
         rawEmbeddedDngProfileId: String? = null,
         rawNoiseProfileId: String = RawNoiseProfileManager.DEFAULT_PROFILE_ID,
-        rawHncsProfileId: String? = null,
-        rawHncsRenderIntent: HncsRenderIntent = HncsRenderIntent.Standard,
-        rawHncsFilmCurveMode: HncsFilmCurveMode = HncsFilmCurveMode.Standard,
         dcpRenderPlan: DcpRenderPlan? = null,
-        spectralFilmStock: String? = null,
-        spectralFilmPrint: String? = null,
-        spectralFilmTuning: SpectralFilmTuning = SpectralFilmTuning.DEFAULT,
-        fotufilmDocument: FotufilmDocument? = null,
         rawRenderingEngine: RawRenderingEngine = RawRenderingEngine.AdobeCurve,
         rawToneMappingParameters: RawToneMappingParameters = RawToneMappingParameters.DEFAULT,
         forceRegeneratePhotonPgtm: Boolean = false,
@@ -1807,14 +1722,7 @@ class RawDemosaicProcessor {
                 rawDcpId = rawDcpId,
                 rawEmbeddedDngProfileId = rawEmbeddedDngProfileId,
                 rawNoiseProfileId = rawNoiseProfileId,
-                rawHncsProfileId = rawHncsProfileId,
-                rawHncsRenderIntent = rawHncsRenderIntent,
-                rawHncsFilmCurveMode = rawHncsFilmCurveMode,
                 dcpRenderPlan = dcpRenderPlan,
-                spectralFilmStock = spectralFilmStock,
-                spectralFilmPrint = spectralFilmPrint,
-                spectralFilmTuning = spectralFilmTuning,
-                fotufilmDocument = fotufilmDocument,
                 rawRenderingEngine = rawRenderingEngine,
                 rawToneMappingParameters = rawToneMappingParameters,
                 forceRegeneratePhotonPgtm = forceRegeneratePhotonPgtm,
@@ -1862,14 +1770,7 @@ class RawDemosaicProcessor {
         rawDcpId: String? = null,
         rawEmbeddedDngProfileId: String? = null,
         rawNoiseProfileId: String = RawNoiseProfileManager.DEFAULT_PROFILE_ID,
-        rawHncsProfileId: String? = null,
-        rawHncsRenderIntent: HncsRenderIntent = HncsRenderIntent.Standard,
-        rawHncsFilmCurveMode: HncsFilmCurveMode = HncsFilmCurveMode.Standard,
         dcpRenderPlan: DcpRenderPlan? = null,
-        spectralFilmStock: String? = null,
-        spectralFilmPrint: String? = null,
-        spectralFilmTuning: SpectralFilmTuning = SpectralFilmTuning.DEFAULT,
-        fotufilmDocument: FotufilmDocument? = null,
         rawRenderingEngine: RawRenderingEngine = RawRenderingEngine.AdobeCurve,
         rawToneMappingParameters: RawToneMappingParameters = RawToneMappingParameters.DEFAULT,
         rawBlackBorderCrop: RawBlackBorderCrop = RawBlackBorderCrop(),
@@ -1907,14 +1808,7 @@ class RawDemosaicProcessor {
                 rawDcpId = rawDcpId,
                 rawEmbeddedDngProfileId = rawEmbeddedDngProfileId,
                 rawNoiseProfileId = rawNoiseProfileId,
-                rawHncsProfileId = rawHncsProfileId,
-                rawHncsRenderIntent = rawHncsRenderIntent,
-                rawHncsFilmCurveMode = rawHncsFilmCurveMode,
                 dcpRenderPlan = dcpRenderPlan,
-                spectralFilmStock = spectralFilmStock,
-                spectralFilmPrint = spectralFilmPrint,
-                spectralFilmTuning = spectralFilmTuning,
-                fotufilmDocument = fotufilmDocument,
                 rawRenderingEngine = rawRenderingEngine,
                 rawToneMappingParameters = rawToneMappingParameters,
                 rawBlackBorderCrop = rawBlackBorderCrop,
@@ -1969,8 +1863,6 @@ class RawDemosaicProcessor {
                 rawDcpId = null,
                 rawNoiseProfileId = rawNoiseProfileId,
                 dcpRenderPlan = input.meteringRenderPlan,
-                spectralFilmStock = null,
-                spectralFilmPrint = null,
                 rawRenderingEngine = RawRenderingEngine.AdobeCurve,
                 rawToneMappingParameters = RawToneMappingParameters.DEFAULT.withProfileToneMapMode(
                     RawProfileToneMapMode.Default
@@ -2014,14 +1906,7 @@ class RawDemosaicProcessor {
         rawDcpId: String? = null,
         rawEmbeddedDngProfileId: String? = null,
         rawNoiseProfileId: String = RawNoiseProfileManager.DEFAULT_PROFILE_ID,
-        rawHncsProfileId: String? = null,
-        rawHncsRenderIntent: HncsRenderIntent = HncsRenderIntent.Standard,
-        rawHncsFilmCurveMode: HncsFilmCurveMode = HncsFilmCurveMode.Standard,
         dcpRenderPlan: DcpRenderPlan? = null,
-        spectralFilmStock: String? = null,
-        spectralFilmPrint: String? = null,
-        spectralFilmTuning: SpectralFilmTuning = SpectralFilmTuning.DEFAULT,
-        fotufilmDocument: FotufilmDocument? = null,
         rawRenderingEngine: RawRenderingEngine = RawRenderingEngine.AdobeCurve,
         rawToneMappingParameters: RawToneMappingParameters = RawToneMappingParameters.DEFAULT,
         rawCfaCorrectionMode: String? = null,
@@ -2069,14 +1954,7 @@ class RawDemosaicProcessor {
                 rawDcpId = rawDcpId,
                 rawEmbeddedDngProfileId = rawEmbeddedDngProfileId,
                 rawNoiseProfileId = rawNoiseProfileId,
-                rawHncsProfileId = rawHncsProfileId,
-                rawHncsRenderIntent = rawHncsRenderIntent,
-                rawHncsFilmCurveMode = rawHncsFilmCurveMode,
                 dcpRenderPlan = dcpRenderPlan,
-                spectralFilmStock = spectralFilmStock,
-                spectralFilmPrint = spectralFilmPrint,
-                spectralFilmTuning = spectralFilmTuning,
-                fotufilmDocument = fotufilmDocument,
                 rawRenderingEngine = rawRenderingEngine,
                 rawToneMappingParameters = rawToneMappingParameters,
                 rawCfaCorrectionMode = rawCfaCorrectionMode,
@@ -2134,15 +2012,8 @@ class RawDemosaicProcessor {
         rawDcpId: String? = null,
         rawEmbeddedDngProfileId: String? = null,
         rawNoiseProfileId: String = RawNoiseProfileManager.DEFAULT_PROFILE_ID,
-        rawHncsProfileId: String? = null,
-        rawHncsRenderIntent: HncsRenderIntent = HncsRenderIntent.Standard,
-        rawHncsFilmCurveMode: HncsFilmCurveMode = HncsFilmCurveMode.Standard,
         dcpRenderPlan: DcpRenderPlan? = null,
         embeddedDngRenderPlan: DcpRenderPlan,
-        spectralFilmStock: String? = null,
-        spectralFilmPrint: String? = null,
-        spectralFilmTuning: SpectralFilmTuning = SpectralFilmTuning.DEFAULT,
-        fotufilmDocument: FotufilmDocument? = null,
         rawRenderingEngine: RawRenderingEngine = RawRenderingEngine.AdobeCurve,
         rawToneMappingParameters: RawToneMappingParameters = RawToneMappingParameters.DEFAULT,
         rawCfaCorrectionMode: String? = null,
@@ -2236,14 +2107,7 @@ class RawDemosaicProcessor {
                 chromaDenoiseValue = chromaDenoiseValue,
                 rawDcpId = rawDcpId,
                 rawNoiseProfileId = rawNoiseProfileId,
-                rawHncsProfileId = rawHncsProfileId,
-                rawHncsRenderIntent = rawHncsRenderIntent,
-                rawHncsFilmCurveMode = rawHncsFilmCurveMode,
                 dcpRenderPlan = dcpRenderPlan,
-                spectralFilmStock = spectralFilmStock,
-                spectralFilmPrint = spectralFilmPrint,
-                spectralFilmTuning = spectralFilmTuning,
-                fotufilmDocument = fotufilmDocument,
                 rawRenderingEngine = rawRenderingEngine,
                 rawToneMappingParameters = rawToneMappingParameters,
                 rawCfaCorrectionMode = rawCfaCorrectionMode,
@@ -2302,14 +2166,7 @@ class RawDemosaicProcessor {
         rawDcpId: String? = null,
         rawEmbeddedDngProfileId: String? = null,
         rawNoiseProfileId: String = RawNoiseProfileManager.DEFAULT_PROFILE_ID,
-        rawHncsProfileId: String? = null,
-        rawHncsRenderIntent: HncsRenderIntent = HncsRenderIntent.Standard,
-        rawHncsFilmCurveMode: HncsFilmCurveMode = HncsFilmCurveMode.Standard,
         dcpRenderPlan: DcpRenderPlan? = null,
-        spectralFilmStock: String? = null,
-        spectralFilmPrint: String? = null,
-        spectralFilmTuning: SpectralFilmTuning = SpectralFilmTuning.DEFAULT,
-        fotufilmDocument: FotufilmDocument? = null,
         rawRenderingEngine: RawRenderingEngine = RawRenderingEngine.AdobeCurve,
         rawToneMappingParameters: RawToneMappingParameters = RawToneMappingParameters.DEFAULT,
         forceRegeneratePhotonPgtm: Boolean = false,
@@ -2381,27 +2238,15 @@ class RawDemosaicProcessor {
         var embeddedDngJpegPreview: Bitmap? = null
         var dngWarpRectilinear: FloatArray? = null
         var dngWarpRectilinearFlags: IntArray? = null
-        var lumixColorCorrectionCoordinate: Int? = null
         val requestedColorEngine = rawRenderingEngine
         val hasDcpSelection = dcpRenderPlan != null || rawDcpId != null
         val profileWorkingColorSpace = ColorSpace.ProPhoto
-        val cameraColorMatchingEnabled = rawToneMappingParameters.colorMatchingEnabled(requestedColorEngine)
-        val targetCamera = when {
-            requestedColorEngine.isLumix -> EquivalentCameraTarget.LumixS9
-            requestedColorEngine.isHncs -> EquivalentCameraTarget.HasselbladX2DII100C
-            requestedColorEngine.isCanon -> EquivalentCameraTarget.CanonEOSR5
-            requestedColorEngine.isLeica -> EquivalentCameraTarget.LeicaM9
-            else -> null
-        }
         var embeddedDngRenderPlan: DcpRenderPlan? = sourceDngRenderPlan
         var embeddedDngProfiles: List<DngEmbeddedProfileEntry> = emptyList()
         var selectedEmbeddedDngProfile: DngEmbeddedProfileEntry? = null
         val sourceProfileGainTableMap = metadata?.profileGainTableMap?.takeIf { it.isValid }
 
         if (dngFile != null) {
-            if (requestedColorEngine.isLumix) {
-                lumixColorCorrectionCoordinate = LumixColorTemperature.readAsShotCoordinate(dngFile)
-            }
             val hasClassicTiffHeader = DngProfileGainTableMap.hasClassicTiffHeader(dngFile)
             embeddedDngProfiles = if (hasClassicTiffHeader) {
                 DngEmbeddedProfile.readAllFrom(dngFile)
@@ -2419,14 +2264,10 @@ class RawDemosaicProcessor {
                 profileWorkingColorSpace.xg, profileWorkingColorSpace.yg,
                 profileWorkingColorSpace.xb, profileWorkingColorSpace.yb,
                 profileWorkingColorSpace.xw, profileWorkingColorSpace.yw,
-                embeddedCalibrationOnly = requestedColorEngine.usesCameraInputDomain,
+                embeddedCalibrationOnly = false,
                 colorCalibrationMode = RawColorCalibrationPolicy.mode.nativeCode,
             )
             if (dngRawData == null) {
-                if (requestedColorEngine.usesCameraInputDomain) {
-                    PLog.e(TAG, "Camera RGB engine RAW decode failed; color-converted fallback is disabled")
-                    return@withContext null
-                }
                 return@withContext RawProcessor.processAndToBitmap(
                     dngFile,
                     aspectRatio,
@@ -2531,35 +2372,6 @@ class RawDemosaicProcessor {
             }
         }
 
-        // An explicit source-matrix selection must not silently use the target matrix
-        // when an imported RAW has no source calibration.
-        if ((requestedColorEngine.isLeica || requestedColorEngine.isCanon) &&
-            cameraColorMatchingEnabled && actualMetadata != null
-        ) {
-            check(actualMetadata.cameraCalibration != null) {
-                "$requestedColorEngine device color matrix requires source camera calibration"
-            }
-        }
-        val engineWhitePointXy = if (targetCamera != null && actualMetadata != null &&
-            (!cameraColorMatchingEnabled || actualMetadata.cameraCalibration == null)
-        ) {
-            // Original processing interprets the sensor as the target camera. The target
-            // calibration supplies its white/CCT and a reversible shared-space bridge.
-            val whiteXy = targetCamera.calibration.directCameraWhiteXy(context, actualMetadata)
-            // Keep calibrated source metadata intact so toggling back to matching never
-            // reuses the original-processing target white as the source illuminant.
-            if (actualMetadata.cameraCalibration == null) {
-                actualMetadata = actualMetadata.copy(
-                    whitePointXy = whiteXy,
-                    colorTemperature = DngSdkColorSpec.colorTemperatureForXy(whiteXy),
-                )
-            }
-            PLog.i(TAG, "RAW_CAMERA_CALIBRATION engine=$requestedColorEngine " +
-                "colorMatching=$cameraColorMatchingEnabled sourceCalibration=${actualMetadata.cameraCalibration != null} " +
-                "input=wb-camera-rgb cctSource=target-color-matrix librawMatrixFallback=disabled")
-            whiteXy
-        } else actualMetadata?.whitePointXy
-        val engineColorTemperature = engineWhitePointXy?.let(DngSdkColorSpec::colorTemperatureForXy)
         if (dngFile != null) onMetadata?.invoke(requireNotNull(actualMetadata))
 
         // A merged capture (it carries the merge's tuning SNRs) stores the merge output noise
@@ -2620,70 +2432,8 @@ class RawDemosaicProcessor {
             !hasDcpSelection && embeddedDngRenderPlan != null -> "embedded-dng"
             else -> null
         }
-        val spektrafilmLut =
-            if (requestedColorEngine == RawRenderingEngine.Spektrafilm &&
-                spectralFilmStock != null && spectralFilmPrint != null
-            ) {
-                SpectralFilmProfile.loadCombinedLut(
-                    context,
-                    spectralFilmStock,
-                    spectralFilmPrint,
-                    spectralFilmTuning,
-                    buildSpatialGraph = true,
-                )
-            } else {
-                null
-        }
-        val fotufilmRequest = if (
-            requestedColorEngine == RawRenderingEngine.Fotufilm && fotufilmDocument != null
-        ) {
-            FotufilmRenderRequest(context.applicationContext, fotufilmDocument)
-        } else {
-            null
-        }
-        val hncsRenderIntent = rawHncsRenderIntent
-        val activeHncsCameraGains = if (requestedColorEngine.isHncs) {
-            HncsCameraDomain.fromWhiteBalanceGains(actualMetadata.whiteBalanceGains)
-        } else {
-            null
-        }
-        val hncsRenderPlan = if (requestedColorEngine.isHncs) {
-            val sourceCalibration = actualMetadata.cameraCalibration
-            check(dngFile != null || sourceCalibration != null || !cameraColorMatchingEnabled) {
-                "HNCS requires fixed source ColorMatrix calibration for camera capture"
-            }
-            HncsProfileManager(context.applicationContext).resolveLutRenderPlan(
-                colorTemperature = engineColorTemperature,
-                filmCurveMode = rawHncsFilmCurveMode,
-            )
-        } else null
-        if (requestedColorEngine.isHncs && hncsRenderPlan == null) {
-            PLog.e(
-                TAG,
-                "HNCS rendering rejected: branch=$requestedColorEngine " +
-                    "profile=$rawHncsProfileId intent=${hncsRenderIntent.assetValue} " +
-                    "cct=${actualMetadata.colorTemperature}"
-            )
-            return@withContext null
-        }
-        val colorEngine = when {
-            requestedColorEngine == RawRenderingEngine.Spektrafilm && spektrafilmLut == null -> {
-                PLog.w(TAG, "SpectralFilm LUT unavailable, falling back to AdobeCurve")
-                RawRenderingEngine.AdobeCurve
-            }
-
-            requestedColorEngine == RawRenderingEngine.Fotufilm && fotufilmRequest == null -> {
-                PLog.w(TAG, "Fotufilm document unavailable, falling back to AdobeCurve")
-                RawRenderingEngine.AdobeCurve
-            }
-
-            else -> requestedColorEngine
-        }
-        // Fotufilm prints onto SDR media (upstream: paper output is SDR); it has no HDR reference.
-        // A direct negative scan darkens as scene exposure increases. The synthesized HDR
-        // reference fits an increasing highlight response and cannot extend a negative scan.
-        val scansNegative = spektrafilmLut?.let { it.type == "negative" && it.tuning.scanFilm } == true
-        val renderHdrReference = includeHdrReference && !colorEngine.isFotufilm && !scansNegative
+        val colorEngine = requestedColorEngine
+        val renderHdrReference = includeHdrReference
         val normalizedToneMappingParameters = rawToneMappingParameters.normalized()
         val photonHdrRequested = normalizedToneMappingParameters.usePhotonHdr
         val hasReusablePhotonPgtm = if (dngFile != null) {
@@ -2775,7 +2525,7 @@ class RawDemosaicProcessor {
                 "physicalSize=$rawPhysicalOutputSize scale=$rawOutputScale " +
                 "output=${outputGeometry.width}x${outputGeometry.height} " +
                 "lanczos=${outputGeometry.resample} " +
-                "upscale=${rawOutputUpscaleMode.name} raisr=${outputGeometry.raisrUpsample}",
+                "upscale=${rawOutputUpscaleMode.name}",
         )
         val rawOutputBounds = outputSourceBounds.toOutputBounds(actualRotation)
         val applicableDngWarpRectilinear = filterApplicableWarpRectilinear(
@@ -2820,8 +2570,6 @@ class RawDemosaicProcessor {
                 "HDRNet PGTM regeneration requires continuous linear RGB"
             hasActiveWarp && !(captureProfilePreparationRequested && !captureExposureRequested) ->
                 "DNG WarpRectilinear requires a displacement-aware render source region"
-            colorEngine == RawRenderingEngine.DarktableFilmic ->
-                "Darktable Filmic wavelet reconstruction requires scale-by-scale tiling"
             captureExposureRequested -> "capture adaptive exposure"
             else -> null
         }
@@ -2838,27 +2586,8 @@ class RawDemosaicProcessor {
             } else {
                 1f
             }
-            // Fotufilm's spatial stages (halation above all) reach `spatialSupport` frame pixels;
-            // every tile core needs that apron. The core shrinks by the extra apron so a tile's
-            // working area, and with it the tile's GPU footprint, stays within the usual bound.
-            val fotufilmSupport = fotufilmRequest?.takeIf { colorEngine.isFotufilm }?.let { request ->
-                FotufilmRuntime.buildFrame(
-                    request.context, request.document, actualWidth, actualHeight,
-                    measureFlareOnDevice = false,
-                ).frame.spatialSupport
-            } ?: 0
-            val spektrafilmSupport = spektrafilmLut?.let { lut ->
-                if (lut.graph != null) {
-                    SpektrafilmGraphToneStage.support(lut, actualWidth, actualHeight)
-                } else {
-                    SpektrafilmScannerPass.support(lut.tuning)
-                }
-            } ?: 0
-            val tileSupport = maxOf(RAW_TILE_SUPPORT_PX + spektrafilmSupport, fotufilmSupport)
-            val tileCoreEdge = maxOf(
-                RAW_TILE_MAX_CORE_EDGE_PX - 2 * (tileSupport - RAW_TILE_SUPPORT_PX),
-                RAW_TILE_MIN_FOTUFILM_CORE_EDGE_PX,
-            )
+            val tileSupport = RAW_TILE_SUPPORT_PX
+            val tileCoreEdge = maxOf(RAW_TILE_MAX_CORE_EDGE_PX, RAW_TILE_MIN_CORE_EDGE_PX)
             RawTilePlanner.plan(
                 sourceWidth = actualWidth,
                 sourceHeight = actualHeight,
@@ -2872,7 +2601,7 @@ class RawDemosaicProcessor {
                 coreEdgePx = (tileCoreEdge / restoredOutputScale).toInt(),
                 supportPx = tileSupport + if (outputGeometry.resample) 3 else 0,
                 cfaPeriod = RawCfaCorrection.repeatPatternDim(actualMetadata.cfaPattern)[0],
-                processingPeriod = if (usesGuidedToneUpsample(outputGeometry, colorEngine, spektrafilmLut)) {
+                processingPeriod = if (usesGuidedToneUpsample(outputGeometry)) {
                     outputGeometry.mgcFinishResolution.processingPeriod
                 } else 1,
             )
@@ -3091,115 +2820,17 @@ class RawDemosaicProcessor {
             profileWorkingColorSpace,
             ColorSpace.SRGB,
         )
-        val directCameraInput = targetCamera != null &&
-            (!cameraColorMatchingEnabled || actualMetadata.cameraCalibration == null)
-        val sourceColorCorrectionMatrix = if (directCameraInput) {
-            EquivalentCameraCalibration.whiteBalanceTransform(actualMetadata)
-        } else if ((colorEngine.usesCameraInputDomain) &&
-            actualMetadata.cameraCalibration != null
-        ) {
-            EquivalentCameraCalibration.sourceToProPhoto(actualMetadata)
-        } else {
-            resolveLinearColorCorrectionMatrix(
-                metadata = actualMetadata,
-                dcpRenderPlan = activeDcpRenderPlan,
-            )
-        }
-        val targetCameraColorTransform = targetCamera?.calibration?.colorTransform(
-            context, requireNotNull(engineWhitePointXy) {
-                "Equivalent camera rendering requires the source white point"
-            },
+        val linearColorCorrectionMatrix = resolveLinearColorCorrectionMatrix(
+            metadata = actualMetadata,
+            dcpRenderPlan = activeDcpRenderPlan,
         )
-        // Every shared consumer (ML AE, HDRNet, PGTM, tiled and continuous rendering)
-        // requires actual linear ProPhoto. Native's WB-only matrix is not that space.
-        val linearColorCorrectionMatrix = if (directCameraInput) {
-            requireNotNull(targetCameraColorTransform).sensorToProPhoto(
-                sourceColorCorrectionMatrix,
-            )
-        } else sourceColorCorrectionMatrix
-        // The shared prepass has already applied source calibration and white balance.
-        // Map ProPhoto straight to target WB RGB using its ColorMatrix at the scene white.
-        // This replaces source-matrix recovery and both inverse-DCP LUT lookups.
-        val cameraInputTransform = targetCameraColorTransform?.proPhotoToWhiteBalancedCamera
-            ?: computeWorkingToOutputTransform(profileWorkingColorSpace, engineWorkingColorSpace)
-        val profileToEngineTransform = cameraInputTransform
-        if (directCameraInput) {
-            PLog.i(TAG, "RAW_CAMERA_WORKING_SPACE engine=$colorEngine input=direct-camera-rgb " +
-                "bridge=target-color-matrix sharedSpace=ProPhoto engineInput=wb-camera-rgb " +
-                "sensorToProfile=${linearColorCorrectionMatrix.contentToString()} " +
-                "profileToCamera=${cameraInputTransform.contentToString()} " +
-                "equivalent=disabled librawMatrixFallback=disabled")
-        }
-        val lumixRenderPlan = if (colorEngine.isLumix) {
-            check(profileWorkingColorSpace == ColorSpace.ProPhoto)
-            val sourceCalibration = actualMetadata.cameraCalibration
-            check(dngFile != null || sourceCalibration != null || !cameraColorMatchingEnabled) {
-                "Lumix requires fixed source ColorMatrix calibration for camera capture"
-            }
-            LumixProfile.createRenderPlan(
-                context, normalizedToneMappingParameters.lumixPhotoStyle, engineColorTemperature,
-                iso = actualMetadata.iso,
-                colorCorrectionCoordinate = lumixColorCorrectionCoordinate,
-            )
-        } else null
-        val leicaRenderPlan = if (colorEngine.isLeica) {
-            LeicaProfile.createRenderPlan(context).also {
-                PLog.i(TAG, "Leica M9 DSP: input=wb-camera-rgb output=linear-sRGB " +
-                    "calibration=${if (directCameraInput) "M9" else "capture-device"} " +
-                    "curve=${it.curveIndex} " +
-                    "matrix=2 branch=R>=G contrast=2 saturation=2 localMapping=shared-PGTM " +
-                    "photonHdr=${normalizedToneMappingParameters.usePhotonHdr}")
-            }
-        } else null
-        val canonRenderPlan = if (colorEngine.isCanon) {
-            check(profileWorkingColorSpace == ColorSpace.ProPhoto)
-            CanonProfile.createRenderPlan(context, normalizedToneMappingParameters.canonPictureStyle)
-        } else null
-        if (colorEngine.isCanon) {
-            PLog.i(TAG, "Canon EOS R5 rendering: style=${normalizedToneMappingParameters.canonPictureStyle} " +
-                "calibration=${if (directCameraInput) "EOS-R5" else "capture-device"} " +
-                "input=wb-camera-rgb profileToCamera=${cameraInputTransform.contentToString()} " +
-                "target=${targetCamera?.assetPath} position=after-public-pgtm " +
-                "kernel=0x1f5b20 nativeOutput=YUV referenceISO=100 " +
-                "photonHdr=${normalizedToneMappingParameters.usePhotonHdr}")
-        }
-        if (colorEngine.isLumix) {
-            PLog.i(TAG, "Lumix S9 equivalent Camera RGB pipeline: style=${normalizedToneMappingParameters.lumixPhotoStyle} " +
-                "sourceWhite=${actualMetadata.whitePointXy?.contentToString()} " +
-                "engineWhite=${engineWhitePointXy?.contentToString()} " +
-                "profileSpace=$profileWorkingColorSpace profileToCamera=${cameraInputTransform.contentToString()} " +
-                "calibration=ColorMatrix target=${targetCamera?.assetPath} " +
-                "colorMatching=$cameraColorMatchingEnabled inputMode=${if (directCameraInput) "original" else "matched"} " +
-                "photoStyleCoordinateSource=${if (lumixColorCorrectionCoordinate != null) "rw2-0x011c" else "kelvin-polyline"} " +
-                "photoStyleCoordinate=${lumixRenderPlan?.colorCorrectionCoordinate} " +
-                "photoStyleHighWeight=${lumixRenderPlan?.highWeight} " +
-                "lutInput=shaped-camera-rgb output=display-code-values decoded-for-linear-output-pass")
-        }
-        // Headroom clipping uses the source sensor's actual gains and source CCM.
-        // Target RGB is already white balanced after the profile-to-camera matrix.
-        val hncsCameraDomainGains = activeHncsCameraGains
+        val profileToEngineTransform = computeWorkingToOutputTransform(
+            profileWorkingColorSpace, engineWorkingColorSpace,
+        )
         val linearCameraWhite = resolveLinearCameraWhite(
             metadata = actualMetadata,
             dcpRenderPlan = activeDcpRenderPlan
         )
-        if (colorEngine.isHncs) {
-            PLog.i(
-                TAG,
-                "HNCS pipeline: branch=X2DII100C_equivalent_CbYCrY_LUT " +
-                    "profile=${hncsRenderPlan?.profileId} intent=${hncsRenderPlan?.renderIntent} " +
-                    "cct=${hncsRenderPlan?.colorTemperature} " +
-                    "input=${if (dngFile != null) "DNG_FILE" else "MEMORY"} " +
-                    "whiteXY=${actualMetadata.whitePointXy?.contentToString()} " +
-                    "wb=${actualMetadata.whiteBalanceGains.contentToString()} " +
-                    "baselineEv=${actualMetadata.baselineExposure} " +
-                    "filmCurve=${rawHncsFilmCurveMode.persistedValue} " +
-                    "source=${hncsRenderPlan?.sourceFile} " +
-                    "profileSpace=$profileWorkingColorSpace " +
-                    "calibration=ColorMatrix target=${targetCamera?.assetPath} " +
-                    "colorMatching=$cameraColorMatchingEnabled inputMode=${if (directCameraInput) "original" else "matched"} " +
-                    "gammaFilter=${hncsRenderPlan?.gamma?.filterEnabled}"
-            )
-        }
         logRawDcpPipeline(
             metadata = actualMetadata,
             profilePlanSource = profilePlanSource,
@@ -3810,8 +3441,7 @@ class RawDemosaicProcessor {
             val effectiveExposureCompensation = rawExposureCompensation
             val effectiveHighlightsAdjustment = rawHighlightsAdjustment
             val engineDefaultExposureCompensation = colorEngine.defaultExposureCompensationEv
-            val engineExposureCompensation =
-                normalizedToneMappingParameters.engineExposureCompensationEv(colorEngine)
+            val engineExposureCompensation = 0f
             val profileExposureCompensation =
                 effectiveExposureCompensation + engineDefaultExposureCompensation + engineExposureCompensation
             val profileExposureUniforms = computeProfileExposureUniforms(
@@ -3886,16 +3516,9 @@ class RawDemosaicProcessor {
                         clampProfileRgb = clampProfileRgb,
                         supportProfileOverrange = supportProfileOverrange,
                         hueSatMapSupportsOverrange = hueSatMapSupportsOverrange,
-                        hncsCameraDomainGains = hncsCameraDomainGains,
                         colorEngine = colorEngine,
                         activeDcpRenderPlan = activeDcpRenderPlan,
                         profileExposureUniforms = profileExposureUniforms,
-                        spectralFilmLut = spektrafilmLut,
-                        fotufilm = fotufilmRequest,
-                        hncsRenderPlan = hncsRenderPlan,
-                        lumixRenderPlan = lumixRenderPlan,
-                        canonRenderPlan = canonRenderPlan,
-                        leicaRenderPlan = leicaRenderPlan,
                         engineWorkingColorSpace = engineWorkingColorSpace,
                         profileToEngineTransform = profileToEngineTransform,
                         shadowsHighlightsParams = shadowsHighlightsParams,
@@ -3934,7 +3557,7 @@ class RawDemosaicProcessor {
             // the exact post-matrix 2^EV gain.
             checkGlError("Before LinearRcdPass")
 
-            if (usesGuidedToneUpsample(outputGeometry, colorEngine, spektrafilmLut)) {
+            if (usesGuidedToneUpsample(outputGeometry)) {
                 mgcSharpen.guided.prepare(denoiseProfileTextureId, actualWidth, actualHeight,
                     actualMetadata.whiteBalanceGains, outputGeometry.mgcFinishResolution)
                 renderLinearRcdPass(
@@ -3953,7 +3576,6 @@ class RawDemosaicProcessor {
                     applyDngBaselineExposure = applyLinearDngBaselineExposure,
                     clampProfileRgb = clampProfileRgb,
                     hueSatMapSupportsOverrange = hueSatMapSupportsOverrange,
-                    hncsCameraDomainGains = hncsCameraDomainGains,
                     label = "GuidedLowLinearRcdPass"
                 )
             }
@@ -3974,7 +3596,6 @@ class RawDemosaicProcessor {
                 applyDngBaselineExposure = applyLinearDngBaselineExposure,
                 clampProfileRgb = clampProfileRgb,
                 hueSatMapSupportsOverrange = hueSatMapSupportsOverrange,
-                hncsCameraDomainGains = hncsCameraDomainGains,
                 label = "LinearRcdPass"
             )
 
@@ -4007,134 +3628,34 @@ class RawDemosaicProcessor {
             // }
             // demosaicWidth = 0; demosaicHeight = 0
             // 5. 第二步：Combined Pass (HDR Linear -> LDR sRGB + LUT)
-            val combinedInputTexture = if (colorEngine == RawRenderingEngine.DarktableFilmic) {
-                val reconstructedTexture = renderDarktableFilmicHighlightReconstruction(
-                    sourceTextureId = demosaicTextureId,
-                    width = actualWidth,
-                    height = actualHeight,
-                    rawToneMappingParameters = rawToneMappingParameters,
-                    profileExposureUniforms = profileExposureUniforms,
-                    profileToEngineTransform = profileToEngineTransform,
-                    metadata = actualMetadata,
-                    applyProfileGainTableMap = hasProfileGainTableMap,
-                    profileBaselineExposureOffsetEv =
-                        dcpBaselineExposureOffsetOrZero(activeDcpRenderPlan),
-                )
-                if (reconstructedTexture == 0) {
-                    PLog.e(TAG, "Darktable Filmic highlight reconstruction failed")
-                    return@withContext null
-                }
-                reconstructedTexture
-            } else {
-                demosaicTextureId
-            }
-            val combinedProfileExposureUniforms =
-                if (colorEngine == RawRenderingEngine.DarktableFilmic) {
-                    ProfileExposureUniforms.NEUTRAL
-                } else {
-                    profileExposureUniforms
-                }
-            val combinedProfileToEngineTransform =
-                if (colorEngine == RawRenderingEngine.DarktableFilmic) {
-                    identityMatrix3x3()
-                } else {
-                    profileToEngineTransform
-            }
-            if (mgcSharpen.guided.isPrepared && colorEngine == RawRenderingEngine.DarktableFilmic) {
-                mgcSharpen.guided.downsampleReconstructedColor(combinedInputTexture)
-            }
             val toneInputTexture = if (mgcSharpen.guided.isPrepared) {
                 mgcSharpen.guided.profileTexture
-            } else combinedInputTexture
+            } else demosaicTextureId
             val toneWidth = if (mgcSharpen.guided.isPrepared) mgcSharpen.guided.lowWidth else actualWidth
             val toneHeight = if (mgcSharpen.guided.isPrepared) mgcSharpen.guided.lowHeight else actualHeight
             val toneGlobalWidth = if (mgcSharpen.guided.isPrepared) mgcSharpen.guided.globalWidth else actualWidth
             val toneGlobalHeight = if (mgcSharpen.guided.isPrepared) mgcSharpen.guided.globalHeight else actualHeight
             setupCombinedFramebuffer(toneWidth, toneHeight)
             val combinedStart = System.currentTimeMillis()
-            var hdrReferencePreparedFromCombinedInput = false
-            val combinedOutput = try {
-                val output = renderCombinedPass(
-                    metadata = actualMetadata,
-                    inputTextureId = toneInputTexture,
-                    dcpRenderPlan = activeDcpRenderPlan,
-                    applyDcpHueSatMap = deferDcpHueSatUntilAfterPgtm,
-                    profileExposureUniforms = combinedProfileExposureUniforms,
-                    spectralFilmLut = spektrafilmLut,
-                    fotufilm = fotufilmRequest,
-                    hncsRenderPlan = hncsRenderPlan,
-                    lumixRenderPlan = lumixRenderPlan,
-                    canonRenderPlan = canonRenderPlan,
-                    leicaRenderPlan = leicaRenderPlan,
-                    colorEngine = colorEngine,
-                    outputWorkingColorSpace = engineWorkingColorSpace,
-                    profileToEngineTransform = combinedProfileToEngineTransform,
-                    shadowsHighlightsParams = shadowsHighlightsParams,
-                    rawBlacksAdjustment = rawBlackPointCorrection,
-                    rawWhitesAdjustment = rawWhitePointCorrection,
-                    rawToneMappingParameters = rawToneMappingParameters,
-                    applyProfileGainTableMap =
-                        hasProfileGainTableMap && colorEngine != RawRenderingEngine.DarktableFilmic,
-                    viewportWidth = toneWidth,
-                    viewportHeight = toneHeight,
-                    globalWidth = toneGlobalWidth,
-                    globalHeight = toneGlobalHeight,
-                )
-                // Filmic's wavelet reconstruction owns its prepared engine-domain source. Render
-                // the HDR reference before releasing those framebuffers so SDR and HDR consume
-                // the same reconstructed input without applying PGTM/exposure a second time.
-                if (output != null && renderHdrReference &&
-                    colorEngine == RawRenderingEngine.DarktableFilmic
-                ) {
-                    hdrReferencePreparedFromCombinedInput = try {
-                        setupHdrReferenceFramebuffer(actualWidth, actualHeight)
-                        renderHdrReferencePass(
-                            metadata = actualMetadata,
-                            inputTextureId = combinedInputTexture,
-                            dcpRenderPlan = activeDcpRenderPlan,
-                            spectralFilmLut = spektrafilmLut,
-                            hncsRenderPlan = hncsRenderPlan,
-                            lumixRenderPlan = lumixRenderPlan,
-                            canonRenderPlan = canonRenderPlan,
-                            leicaRenderPlan = leicaRenderPlan,
-                            colorEngine = colorEngine,
-                            outputWorkingColorSpace = engineWorkingColorSpace,
-                            profileToEngineTransform = combinedProfileToEngineTransform,
-                            profileExposureUniforms = combinedProfileExposureUniforms,
-                            sceneExposureGain = hdrReferenceSceneExposureGain,
-                            rawToneMappingParameters = rawToneMappingParameters,
-                            applyProfileGainTableMap = hasProfileGainTableMap,
-                            applyDcpHueSatMap = deferDcpHueSatUntilAfterPgtm,
-                            coordinateInput = if (hasProfileGainTableMap) {
-                                RawEngineTonePass.HdrCoordinateInput(
-                                    textureId = demosaicTextureId,
-                                    profileToEngineTransform = profileToEngineTransform,
-                                    profileExposureLinearGain =
-                                        profileExposureUniforms.linearGain,
-                                )
-                            } else {
-                                null
-                            },
-                        )
-                        true
-                    } catch (cancellation: CancellationException) {
-                        throw cancellation
-                    } catch (error: OutOfMemoryError) {
-                        PLog.e(TAG, "Unable to prepare Filmic HDR reference; using fallback", error)
-                        releaseHdrReferenceFramebuffer()
-                        false
-                    } catch (error: Exception) {
-                        PLog.e(TAG, "Filmic HDR reference preparation failed; using fallback", error)
-                        releaseHdrReferenceFramebuffer()
-                        false
-                    }
-                }
-                output
-            } finally {
-                if (colorEngine == RawRenderingEngine.DarktableFilmic) {
-                    filmicHighlightReconstructionAlgorithm.releaseFramebuffers()
-                }
-            }
+            val combinedOutput = renderCombinedPass(
+                metadata = actualMetadata,
+                inputTextureId = toneInputTexture,
+                dcpRenderPlan = activeDcpRenderPlan,
+                applyDcpHueSatMap = deferDcpHueSatUntilAfterPgtm,
+                profileExposureUniforms = profileExposureUniforms,
+                colorEngine = colorEngine,
+                outputWorkingColorSpace = engineWorkingColorSpace,
+                profileToEngineTransform = profileToEngineTransform,
+                shadowsHighlightsParams = shadowsHighlightsParams,
+                rawBlacksAdjustment = rawBlackPointCorrection,
+                rawWhitesAdjustment = rawWhitePointCorrection,
+                rawToneMappingParameters = rawToneMappingParameters,
+                applyProfileGainTableMap = hasProfileGainTableMap,
+                viewportWidth = toneWidth,
+                viewportHeight = toneHeight,
+                globalWidth = toneGlobalWidth,
+                globalHeight = toneGlobalHeight,
+            )
             if (combinedOutput == null) {
                 PLog.e(TAG, "Combined Pass failed for colorEngine=$colorEngine")
                 return@withContext null
@@ -4163,22 +3684,6 @@ class RawDemosaicProcessor {
 
             // 7. 第四步：输出旋转 (Output Pass)
             setupOutputFramebuffer(finalWidth, finalHeight)
-            // MGC RAISR magnifies on its own, so this path finalizes the frame on
-            // its native grid and lifts it in one RAISR step instead of letting
-            // RawOutputPass resample it with Lanczos-3.
-            val raisrNativeGeometry = if (outputGeometry.raisrUpsample) {
-                outputGeometry.nativeGrid()
-            } else {
-                null
-            }
-            // MGC derives the refine strength from the resample rate between the
-            // luma it upscales and the final output, i.e. the crop-to-output
-            // ratio including RAW digital zoom.
-            val raisrResampleRate = if (outputGeometry.raisrUpsample) {
-                outputGeometry.cropToOutputResampleRate
-            } else {
-                1f
-            }
             val outputStart = System.currentTimeMillis()
             renderOutputPass(
                 actualRotation,
@@ -4186,15 +3691,12 @@ class RawDemosaicProcessor {
                 actualHeight,
                 bounds,
                 sourceTextureForOutput,
-                geometry = raisrNativeGeometry ?: outputGeometry,
+                geometry = outputGeometry,
             )
             PLog.d(TAG, "Output Pass took: ${System.currentTimeMillis() - outputStart}ms")
             // HDR must use this exact finalized SDR color as well. Keep it through HDR output;
             // processInternal's finally releases it on success, failure, or cancellation.
-            // The RAISR branch below holds it one step longer: a refused upscale re-renders
-            // this same finalized texture on the Lanczos-3 grid, so it may only be released
-            // once the lifted chain has actually produced the frame.
-            if (!renderHdrReference && raisrNativeGeometry == null) releaseSharpenFramebuffer()
+            if (!renderHdrReference) releaseSharpenFramebuffer()
 
             // 8. 读取结果。先单独等待 GPU，避免把前面所有异步 shader 工作记到 readPixels。
             val upstreamStackTiming = borrowedGpuSource?.stackCompletionTimeline?.awaitPending(
@@ -4207,8 +3709,6 @@ class RawDemosaicProcessor {
             )
             val materializationStartNs = System.nanoTime()
             var pixelTransferAndBitmapNs = 0L
-            var raisrUpscaleNs = 0L
-            var fallbackRenderNs = 0L
             fun readSdrPixels(width: Int, height: Int, label: String = "SDR"): Bitmap? {
                 val startNs = System.nanoTime()
                 return try {
@@ -4217,64 +3717,15 @@ class RawDemosaicProcessor {
                     pixelTransferAndBitmapNs += System.nanoTime() - startNs
                 }
             }
-            var raisrApplied = false
-            val finalBitmap = if (raisrNativeGeometry != null) {
-                val nativeBitmap = readSdrPixels(
-                    raisrNativeGeometry.width,
-                    raisrNativeGeometry.height,
-                    label = "SDR RAISR input",
-                )
-                val upscaled = nativeBitmap?.let {
-                    val raisrStartNs = System.nanoTime()
-                    try {
-                        mgcRaisrUpscale.upscale(it, raisrResampleRate)
-                    } finally {
-                        raisrUpscaleNs += System.nanoTime() - raisrStartNs
-                        it.recycle()
-                    }
-                }
-                raisrApplied = upscaled != null
-                if (upscaled != null) {
-                    if (!renderHdrReference) releaseSharpenFramebuffer()
-                    upscaled
-                } else {
-                    // The lifted chain can refuse a frame - no band scratch, or a
-                    // driver status - and the shot still has to complete. Reset
-                    // the output pass to the Lanczos-3 grid, exactly as when
-                    // RAISR is not the selected algorithm at all.
-                    PLog.w(
-                        TAG,
-                        "MGC RAISR unavailable for the untiled ${raisrNativeGeometry.width}x" +
-                            "${raisrNativeGeometry.height} output; using Lanczos-3",
-                    )
-                    val fallbackRenderStartNs = System.nanoTime()
-                    renderOutputPass(
-                        actualRotation,
-                        actualWidth,
-                        actualHeight,
-                        bounds,
-                        sourceTextureForOutput,
-                        geometry = outputGeometry,
-                    )
-                    fallbackRenderNs += System.nanoTime() - fallbackRenderStartNs
-                    val fallback = readSdrPixels(finalWidth, finalHeight, "SDR Lanczos fallback")
-                    if (!renderHdrReference) releaseSharpenFramebuffer()
-                    fallback
-                }
-            } else {
-                readSdrPixels(finalWidth, finalHeight)
-            }
+            val finalBitmap = readSdrPixels(finalWidth, finalHeight)
             val outputMaterializationNs = System.nanoTime() - materializationStartNs
-            val outputOverheadNs = outputMaterializationNs - pixelTransferAndBitmapNs -
-                raisrUpscaleNs - fallbackRenderNs
+            val outputOverheadNs = outputMaterializationNs - pixelTransferAndBitmapNs
             PLog.d(
                 TAG,
                 "RAW output materialization timing target=SDR " +
                     "upstreamStackGpuWait=${upstreamStackTiming?.totalWaitMs ?: 0L}ms " +
                     "renderGpuQueueWait=${outputGpuQueueWaitMs}ms " +
                     "pixelTransferAndBitmap=${pixelTransferAndBitmapNs / 1_000_000.0}ms " +
-                    "raisrUpscale=${raisrUpscaleNs / 1_000_000.0}ms raisrApplied=$raisrApplied " +
-                    "fallbackRender=${fallbackRenderNs / 1_000_000.0}ms " +
                     "outputOverhead=${outputOverheadNs / 1_000_000.0}ms " +
                     "total=${outputMaterializationNs / 1_000_000.0}ms",
             )
@@ -4296,38 +3747,20 @@ class RawDemosaicProcessor {
             val hdrReferenceBitmap = if (renderHdrReference) {
                 val hdrStartNs = System.nanoTime()
                 try {
-                    if (!hdrReferencePreparedFromCombinedInput) {
-                        setupHdrReferenceFramebuffer(actualWidth, actualHeight)
-                        renderHdrReferencePass(
-                            metadata = actualMetadata,
-                            inputTextureId = demosaicTextureId,
-                            dcpRenderPlan = activeDcpRenderPlan,
-                            spectralFilmLut = spektrafilmLut,
-                            hncsRenderPlan = hncsRenderPlan,
-                            lumixRenderPlan = lumixRenderPlan,
-                            canonRenderPlan = canonRenderPlan,
-                            leicaRenderPlan = leicaRenderPlan,
-                            colorEngine = colorEngine,
-                            outputWorkingColorSpace = engineWorkingColorSpace,
-                            profileToEngineTransform = profileToEngineTransform,
-                            profileExposureUniforms = profileExposureUniforms,
-                            sceneExposureGain = hdrReferenceSceneExposureGain,
-                            rawToneMappingParameters = rawToneMappingParameters,
-                            applyProfileGainTableMap = hasProfileGainTableMap,
-                            applyDcpHueSatMap = deferDcpHueSatUntilAfterPgtm,
-                        )
-                    }
-                    if (raisrApplied) {
-                        // The HDR gain reference is resampled on the GPU from the
-                        // finalized texture, so it cannot consume the CPU RAISR
-                        // result; it stays on the Lanczos-3 grid while the SDR
-                        // base is magnified by RAISR.
-                        PLog.w(
-                            TAG,
-                            "MGC RAISR is active; the Ultra HDR gain reference keeps " +
-                                "Lanczos-3 resampling while the SDR base uses RAISR",
-                        )
-                    }
+                    setupHdrReferenceFramebuffer(actualWidth, actualHeight)
+                    renderHdrReferencePass(
+                        metadata = actualMetadata,
+                        inputTextureId = demosaicTextureId,
+                        dcpRenderPlan = activeDcpRenderPlan,
+                        colorEngine = colorEngine,
+                        outputWorkingColorSpace = engineWorkingColorSpace,
+                        profileToEngineTransform = profileToEngineTransform,
+                        profileExposureUniforms = profileExposureUniforms,
+                        sceneExposureGain = hdrReferenceSceneExposureGain,
+                        rawToneMappingParameters = rawToneMappingParameters,
+                        applyProfileGainTableMap = hasProfileGainTableMap,
+                        applyDcpHueSatMap = deferDcpHueSatUntilAfterPgtm,
+                    )
                     renderOutputPass(
                         actualRotation,
                         actualWidth,
@@ -4502,13 +3935,6 @@ class RawDemosaicProcessor {
                     )
             }
             vgnDemosaicAlgorithm.setTileTexturePoolingEnabled(true)
-            // The refine chain derives its strength from this rate, exactly like the
-            // untiled path; the tiled path owns its own scope.
-            val raisrResampleRate = if (config.outputGeometry.raisrUpsample) {
-                config.outputGeometry.cropToOutputResampleRate
-            } else {
-                1f
-            }
             // One tile's source, developed up to the tone stage's input: CFA upload, demosaic,
             // denoise and the linear profile pass, leaving the result in demosaicTextureId.
             suspend fun prepareTileSource(tile: RawRenderTile) {
@@ -4577,7 +4003,7 @@ class RawDemosaicProcessor {
                     fullImageWidth = config.fullWidth,
                     fullImageHeight = config.fullHeight,
                 )
-                if (usesGuidedToneUpsample(config.outputGeometry, config.colorEngine, config.spectralFilmLut)) {
+                if (usesGuidedToneUpsample(config.outputGeometry)) {
                     val resolution = config.outputGeometry.mgcFinishResolution
                     check(working.left % resolution.processingPeriod == 0 &&
                         working.top % resolution.processingPeriod == 0)
@@ -4597,7 +4023,6 @@ class RawDemosaicProcessor {
                         applyDngBaselineExposure = config.applyLinearDngBaselineExposure,
                         clampProfileRgb = config.clampProfileRgb,
                         hueSatMapSupportsOverrange = config.hueSatMapSupportsOverrange,
-                        hncsCameraDomainGains = config.hncsCameraDomainGains,
                         label = "GuidedLowLinearRcdTilePass",
                     )
                 }
@@ -4615,7 +4040,6 @@ class RawDemosaicProcessor {
                     applyDngBaselineExposure = config.applyLinearDngBaselineExposure,
                     clampProfileRgb = config.clampProfileRgb,
                     hueSatMapSupportsOverrange = config.hueSatMapSupportsOverrange,
-                    hncsCameraDomainGains = config.hncsCameraDomainGains,
                     label = "LinearRcdTilePass",
                 )
 
@@ -4625,96 +4049,6 @@ class RawDemosaicProcessor {
                 val tempFramebuffer = demosaicFramebufferId
                 demosaicFramebufferId = linearOutputFramebufferId
                 linearOutputFramebufferId = tempFramebuffer
-            }
-
-            val tileSpektrafilm = config.spectralFilmLut?.let { lut ->
-                if (lut.graph == null || lut.tuning.halation.boostEv <= 0f) {
-                    lut
-                } else {
-                    val meteringStartNs = System.nanoTime()
-                    val fullSource = RawTileRect(0, 0, config.fullWidth, config.fullHeight)
-                    val outputBounds = config.outputSourceBounds
-                    val meteringTiles = if (outputBounds == Rect(0, 0, config.fullWidth, config.fullHeight)) {
-                        config.tiles
-                    } else {
-                        // The highlight reference belongs to the entire exposed frame. Each
-                        // core is measured once, with a RAW apron around the demosaic input.
-                        RawTilePlanner.plan(
-                            sourceWidth = config.fullWidth,
-                            sourceHeight = config.fullHeight,
-                            outputSourceBounds = fullSource,
-                            rotation = 0,
-                            coreEdgePx = RAW_TILE_MAX_CORE_EDGE_PX,
-                            supportPx = RAW_TILE_SUPPORT_PX,
-                            cfaPeriod = RawCfaCorrection.repeatPatternDim(config.metadata.cfaPattern)[0],
-                        )
-                    }
-                    var maximum = 0f
-                    for (tile in meteringTiles) {
-                        currentCoroutineContext().ensureActive()
-                        prepareTileSource(tile)
-                        val working = tile.sourceWorking
-                        val core = tile.sourceCore
-                        maximum = maxOf(
-                            maximum,
-                            engineTonePass.measureSpectralMaximum(
-                                tileToneInput(config, demosaicTextureId, working),
-                                core.left - working.left,
-                                core.top - working.top,
-                                core.width,
-                                core.height,
-                            ),
-                        )
-                    }
-                    check(maximum.isFinite()) { "Invalid Spektrafilm frame maximum: $maximum" }
-                    if (rawTileTextureWidth != firstWorking.width || rawTileTextureHeight != firstWorking.height) {
-                        releaseTiledRenderFramebuffers()
-                        vgnDemosaicAlgorithm.setTileTexturePoolingEnabled(true)
-                    }
-                    PLog.i(
-                        TAG,
-                        "Spektrafilm tiled highlight reference: tiles=${meteringTiles.size} maximum=$maximum " +
-                            "elapsed=${(System.nanoTime() - meteringStartNs) / 1_000_000}ms",
-                    )
-                    lut.copy(frameMaximum = maximum)
-                }
-            }
-
-            // Fotufilm meters the whole frame before any tile develops (Auto Levels, Lab Scan,
-            // regional tone): every tile's core is developed to the tone input once and folded
-            // into a reduced whole-frame image, then the frame is built from it for all tiles.
-            val tileFotufilm = config.fotufilm?.let { request ->
-                val probe = FotufilmRuntime.buildFrame(
-                    request.context, request.document, config.fullWidth, config.fullHeight,
-                    measureFlareOnDevice = false,
-                )
-                if (!probe.wantsSceneMetering && !probe.wantsFlareMean) {
-                    request
-                } else {
-                    val meteringStartNs = System.nanoTime()
-                    val accumulator = FotufilmMeteringAccumulator(config.fullWidth, config.fullHeight)
-                    for (tile in config.tiles) {
-                        currentCoroutineContext().ensureActive()
-                        prepareTileSource(tile)
-                        val working = tile.sourceWorking
-                        val cells = engineTonePass.meterFotufilmTile(
-                            input = tileToneInput(config, demosaicTextureId, working),
-                            coreLeft = tile.sourceCore.left - working.left,
-                            coreTop = tile.sourceCore.top - working.top,
-                            coreWidth = tile.sourceCore.width,
-                            coreHeight = tile.sourceCore.height,
-                            cellSize = accumulator.cellSize,
-                        ) ?: return null
-                        accumulator.add(cells)
-                    }
-                    val image = accumulator.image("tiles-${config.fullWidth}x${config.fullHeight}-$meteringStartNs")
-                    PLog.i(
-                        TAG,
-                        "Fotufilm tiled metering: tiles=${config.tiles.size} image=${image.width}x${image.height} " +
-                            "elapsed=${(System.nanoTime() - meteringStartNs) / 1_000_000}ms",
-                    )
-                    request.copy(metering = image)
-                }
             }
 
             suspend fun developWorkingTile(tile: RawRenderTile): Boolean {
@@ -4728,12 +4062,6 @@ class RawDemosaicProcessor {
                     dcpRenderPlan = config.activeDcpRenderPlan,
                     applyDcpHueSatMap = config.deferDcpHueSatUntilAfterPgtm,
                     profileExposureUniforms = config.profileExposureUniforms,
-                    spectralFilmLut = tileSpektrafilm,
-                    fotufilm = tileFotufilm,
-                    hncsRenderPlan = config.hncsRenderPlan,
-                    lumixRenderPlan = config.lumixRenderPlan,
-                    canonRenderPlan = config.canonRenderPlan,
-                    leicaRenderPlan = config.leicaRenderPlan,
                     colorEngine = config.colorEngine,
                     outputWorkingColorSpace = config.engineWorkingColorSpace,
                     profileToEngineTransform = config.profileToEngineTransform,
@@ -4767,11 +4095,6 @@ class RawDemosaicProcessor {
                         metadata = config.metadata,
                         inputTextureId = demosaicTextureId,
                         dcpRenderPlan = config.activeDcpRenderPlan,
-                        spectralFilmLut = tileSpektrafilm,
-                        hncsRenderPlan = config.hncsRenderPlan,
-                        lumixRenderPlan = config.lumixRenderPlan,
-                        canonRenderPlan = config.canonRenderPlan,
-                        leicaRenderPlan = config.leicaRenderPlan,
                         colorEngine = config.colorEngine,
                         outputWorkingColorSpace = config.engineWorkingColorSpace,
                         profileToEngineTransform = config.profileToEngineTransform,
@@ -4791,23 +4114,10 @@ class RawDemosaicProcessor {
                 return true
             }
 
-            // A large optical apron can make distinct output cores share one source rectangle.
-            // Keep those cores consecutive so they can read the same sharpened and HDR textures.
-            val canReuseWorkingTile = tileSpektrafilm?.let { lut ->
-                lut.graph?.let { graph ->
-                    lut.tuning.cameraDiffusion.active || (graph.printing && lut.tuning.enlargerDiffusion.active)
-                }
-            } == true
-            val outputTiles = if (canReuseWorkingTile) {
-                config.tiles.groupBy { it.sourceWorking }.values.flatten()
-            } else {
-                config.tiles
-            }
-            var lastDevelopedWorking: RawTileRect? = null
             var developedWorkingTiles = 0
             val tileRenderingStartNs = System.nanoTime()
             setupOutputFramebuffer(maximumOutputWidth, maximumOutputHeight)
-            for (tile in outputTiles) {
+            for (tile in config.tiles) {
                 currentCoroutineContext().ensureActive()
                 val tileStartNs = System.nanoTime()
                 val scaledCore = config.outputGeometry.scaleRegion(tile.outputCore)
@@ -4828,12 +4138,8 @@ class RawDemosaicProcessor {
                     "RAW tile rotation mapping mismatch: output=${tile.outputCore} " +
                         "source=${tile.sourceCore}"
                 }
-                val developWorking = !canReuseWorkingTile || working != lastDevelopedWorking
-                if (developWorking) {
-                    if (!developWorkingTile(tile)) return null
-                    lastDevelopedWorking = working
-                    developedWorkingTiles++
-                }
+                if (!developWorkingTile(tile)) return null
+                developedWorkingTiles++
 
                 if (config.includeHdrReference) {
                     renderOutputPass(
@@ -4865,76 +4171,6 @@ class RawDemosaicProcessor {
                         hdrTileBitmap.recycle()
                     }
                 }
-                // MGC RAISR magnifies the tile itself. The working texture is in
-                // source orientation, so the core is read back in source-local
-                // coordinates and upscaled; the native chain adds the halo its
-                // RAISR/refine/Polysharp stages need inside the tile and crops it again, then the
-                // caller rotates the result into output orientation.
-                val raisrTile: Bitmap? = if (config.outputGeometry.raisrUpsample) {
-                    var upscaledTile: Bitmap? = null
-                    raisrTransfer.read(
-                        texture = sharpenTextureId,
-                        width = workWidth,
-                        height = workHeight,
-                        capacityPixels = workWidth.toLong() * workHeight,
-                        label = "raisrTile",
-                    ) { rgba ->
-                        upscaledTile = mgcRaisrUpscale.upscaleTile(
-                            buffer = rgba,
-                            tileWidth = workWidth,
-                            tileHeight = workHeight,
-                            coreLeft = localSourceCore.left,
-                            coreTop = localSourceCore.top,
-                            coreWidth = localSourceCore.width(),
-                            coreHeight = localSourceCore.height(),
-                            resampleRate = raisrResampleRate,
-                        )
-                    }
-                    val nativeTile = upscaledTile
-                    if (nativeTile == null) {
-                        PLog.e(TAG, "MGC RAISR produced no tile for ${localSourceCore}")
-                        null
-                    } else {
-                        val orientedTile =
-                            mgcRaisrUpscale.rotateForOutput(nativeTile, config.rotation)
-                        if (orientedTile !== nativeTile) {
-                            nativeTile.recycle()
-                        }
-                        // RAISR magnifies by exactly 2x, so the tile must land on
-                        // its scaled core. With RAW digital-zoom resampling the
-                        // 1x grid is the physical output size and the core is not
-                        // exactly doubled; drawing it anyway would misplace pixels,
-                        // so this tile falls back to Lanczos-3 instead.
-                        if (orientedTile.width != scaledCore.width ||
-                            orientedTile.height != scaledCore.height
-                        ) {
-                            PLog.e(
-                                TAG,
-                                "MGC RAISR tile is ${orientedTile.width}x${orientedTile.height} " +
-                                    "but its scaled core is ${scaledCore.width}x${scaledCore.height}; " +
-                                    "this tile falls back to Lanczos-3",
-                            )
-                            orientedTile.recycle()
-                            null
-                        } else {
-                            orientedTile
-                        }
-                    }
-                } else {
-                    null
-                }
-                if (raisrTile != null) {
-                    try {
-                        sdrCanvas.drawBitmap(
-                            raisrTile,
-                            scaledCore.left.toFloat(),
-                            scaledCore.top.toFloat(),
-                            copyPaint,
-                        )
-                    } finally {
-                        raisrTile.recycle()
-                    }
-                } else {
                 renderOutputPass(
                     rotation = config.rotation,
                     width = workWidth,
@@ -4961,15 +4197,14 @@ class RawDemosaicProcessor {
                 } finally {
                     tileBitmap.recycle()
                 }
-                }
                 GlesGpuScheduler.waitForGpuCheckpoint(TAG, "RAW tile ${tile.index + 1}")
                 PLog.d(
                     TAG,
                     "RAW_TILE_DONE index=${tile.index + 1}/${config.tiles.size} " +
                         "output=${tile.outputCore} source=${tile.sourceCore} work=$working " +
                         "scaled=$scaledCore localCore=$localSourceCore " +
-                        "developed=$developWorking " +
-                        "upscale=${if (config.outputGeometry.raisrUpsample) "raisr" else "lanczos"} " +
+                        "developed=true " +
+                        "upscale=lanczos " +
                         "tookMs=${(System.nanoTime() - tileStartNs) / 1_000_000}",
                 )
             }
@@ -5080,7 +4315,6 @@ class RawDemosaicProcessor {
 
     private fun releaseTiledRenderFramebuffers() {
         mgcSharpen.releaseBuffers()
-        raisrTransfer.releaseBuffers()
         vgnDemosaicAlgorithm.setTileTexturePoolingEnabled(false)
         if (rawTextureId != 0) {
             GLES30.glDeleteTextures(1, intArrayOf(rawTextureId), 0)
@@ -7176,12 +6410,6 @@ class RawDemosaicProcessor {
         inputTextureId: Int = demosaicTextureId,
         dcpRenderPlan: DcpRenderPlan? = null,
         applyDcpHueSatMap: Boolean = true,
-        spectralFilmLut: SpectralFilmLut? = null,
-        fotufilm: FotufilmRenderRequest? = null,
-        hncsRenderPlan: HncsRenderPlan? = null,
-        lumixRenderPlan: LumixRenderPlan? = null,
-        canonRenderPlan: CanonRenderPlan? = null,
-        leicaRenderPlan: LeicaRenderPlan? = null,
         colorEngine: RawRenderingEngine = RawRenderingEngine.AdobeCurve,
         outputWorkingColorSpace: ColorSpace = ColorSpace.ProPhoto,
         profileToEngineTransform: FloatArray = identityMatrix3x3(),
@@ -7206,12 +6434,6 @@ class RawDemosaicProcessor {
                 inputTextureId = inputTextureId,
                 dcpRenderPlan = dcpRenderPlan,
                 applyDcpHueSatMap = applyDcpHueSatMap,
-                spectralFilmLut = spectralFilmLut,
-                fotufilm = fotufilm,
-                hncsRenderPlan = hncsRenderPlan,
-                lumixRenderPlan = lumixRenderPlan,
-                canonRenderPlan = canonRenderPlan,
-                leicaRenderPlan = leicaRenderPlan,
                 colorEngine = colorEngine,
                 profileToEngineTransform = profileToEngineTransform,
                 profileExposureUniforms = profileExposureUniforms,
@@ -7232,34 +6454,15 @@ class RawDemosaicProcessor {
         ) {
             return null
         }
-        var linearOutputTextureId = engineToneTextureId
-        if (colorEngine.isHncs) {
-            setupAdjustmentFramebuffer(viewportWidth, viewportHeight)
-            if (!renderHncsOutputLinearPass(
-                    inputTextureId = engineToneTextureId,
-                    outputTransform = outputTransform,
-                    targetFramebufferId = adjustmentFramebufferId,
-                    viewportWidth = viewportWidth,
-                    viewportHeight = viewportHeight,
-                )
-            ) {
-                return null
-            }
-            linearOutputTextureId = adjustmentTextureId
-        }
-
+        val linearOutputTextureId = engineToneTextureId
         val srgbInputTextureId = if (needsAdjustmentPass(
                 shadowsHighlightsParams = shadowsHighlightsParams,
                 rawBlacksAdjustment = rawBlacksAdjustment,
                 rawWhitesAdjustment = rawWhitesAdjustment
             )
         ) {
-            val adjustmentTargetFramebufferId = if (colorEngine.isHncs) {
-                engineToneFramebufferId
-            } else {
-                setupAdjustmentFramebuffer(viewportWidth, viewportHeight)
-                adjustmentFramebufferId
-            }
+            setupAdjustmentFramebuffer(viewportWidth, viewportHeight)
+            val adjustmentTargetFramebufferId = adjustmentFramebufferId
             if (!renderAdjustmentPass(
                     inputTextureId = linearOutputTextureId,
                     shadowsHighlightsParams = shadowsHighlightsParams,
@@ -7272,7 +6475,7 @@ class RawDemosaicProcessor {
             ) {
                 return null
             }
-            if (colorEngine.isHncs) engineToneTextureId else adjustmentTextureId
+            adjustmentTextureId
         } else {
             linearOutputTextureId
         }
@@ -7291,48 +6494,10 @@ class RawDemosaicProcessor {
         )
     }
 
-    /**
-     * Matches the SDR branch of Phocus colorspaceconvert:
-     * Gamma22_EOTF -> source RGB to XYZ -> Bradford -> XYZ to destination RGB.
-     *
-     * [outputTransform] already contains the three linear matrix operations, so
-     * this pass keeps their original order while avoiding an unnecessary XYZ
-     * intermediate.
-     */
-    private fun renderHncsOutputLinearPass(
-        inputTextureId: Int,
-        outputTransform: FloatArray,
-        targetFramebufferId: Int,
-        viewportWidth: Int,
-        viewportHeight: Int,
-    ): Boolean {
-        val targetTextureId = when (targetFramebufferId) {
-            adjustmentFramebufferId -> adjustmentTextureId
-            engineToneFramebufferId -> engineToneTextureId
-            else -> 0
-        }
-        return hncsOutputLinearPass.render(
-            HncsOutputLinearPass.Input(
-                textureId = inputTextureId,
-                targetFramebufferId = targetFramebufferId,
-                targetTextureId = targetTextureId,
-                outputTransform = outputTransform,
-                width = viewportWidth,
-                height = viewportHeight,
-            ),
-        ) != null
-    }
-
     private fun renderEngineTonePass(
         inputTextureId: Int,
         dcpRenderPlan: DcpRenderPlan?,
         applyDcpHueSatMap: Boolean,
-        spectralFilmLut: SpectralFilmLut?,
-        fotufilm: FotufilmRenderRequest? = null,
-        hncsRenderPlan: HncsRenderPlan?,
-        lumixRenderPlan: LumixRenderPlan?,
-        canonRenderPlan: CanonRenderPlan?,
-        leicaRenderPlan: LeicaRenderPlan?,
         colorEngine: RawRenderingEngine,
         profileToEngineTransform: FloatArray,
         profileExposureUniforms: ProfileExposureUniforms,
@@ -7370,12 +6535,6 @@ class RawDemosaicProcessor {
                 profileExposure = profileExposureUniforms,
                 dcpRenderPlan = dcpRenderPlan,
                 applyDcpHueSatMap = applyDcpHueSatMap,
-                spectralFilmLut = spectralFilmLut,
-                hncsRenderPlan = hncsRenderPlan,
-                lumixRenderPlan = lumixRenderPlan,
-                canonRenderPlan = canonRenderPlan,
-                leicaRenderPlan = leicaRenderPlan,
-                fotufilm = fotufilm,
                 bindProfileGainTable = { program ->
                     if (metadata != null) {
                         bindProfileGainTableMap(
@@ -7394,41 +6553,6 @@ class RawDemosaicProcessor {
             ),
         ) != null
     }
-
-    /** Meter from the same profile-corrected source used to develop the tile. */
-    private fun tileToneInput(
-        config: RawTileRenderConfig,
-        inputTextureId: Int,
-        working: RawTileRect,
-    ): RawEngineTonePass.Input = RawEngineTonePass.Input(
-        textureId = inputTextureId,
-        targetFramebufferId = engineToneFramebufferId,
-        targetTextureId = engineToneTextureId,
-        colorEngine = config.colorEngine,
-        profileToEngineTransform = config.profileToEngineTransform,
-        outputTransform = computeWorkingToOutputTransform(config.engineWorkingColorSpace, ColorSpace.SRGB),
-        globalOriginX = working.left,
-        globalOriginY = working.top,
-        fullImageWidth = config.fullWidth,
-        fullImageHeight = config.fullHeight,
-        width = working.width,
-        height = working.height,
-        toneMappingParameters = config.rawToneMappingParameters,
-        profileExposure = config.profileExposureUniforms,
-        dcpRenderPlan = config.activeDcpRenderPlan,
-        applyDcpHueSatMap = config.deferDcpHueSatUntilAfterPgtm,
-        spectralFilmLut = config.spectralFilmLut,
-        hncsRenderPlan = null,
-        fotufilm = config.fotufilm,
-        bindProfileGainTable = { program ->
-            bindProfileGainTableMap(
-                program = program,
-                metadata = config.metadata,
-                applyProfileGainTableMap = config.hasProfileGainTableMap,
-                profileBaselineExposureOffsetEv = dcpBaselineExposureOffsetOrZero(config.activeDcpRenderPlan),
-            )
-        },
-    )
 
     private fun needsAdjustmentPass(
         shadowsHighlightsParams: ShadowsHighlightsParams,
@@ -7486,232 +6610,6 @@ class RawDemosaicProcessor {
         ) != null
     }
 
-    private fun renderDarktableFilmicHighlightReconstruction(
-        sourceTextureId: Int,
-        width: Int,
-        height: Int,
-        rawToneMappingParameters: RawToneMappingParameters,
-        profileExposureUniforms: ProfileExposureUniforms,
-        profileToEngineTransform: FloatArray,
-        metadata: RawMetadata,
-        applyProfileGainTableMap: Boolean,
-        profileBaselineExposureOffsetEv: Float,
-    ): Int {
-        return filmicHighlightReconstructionAlgorithm.execute(
-            DarktableFilmicHighlightReconstructionAlgorithm.Input(
-                sourceTextureId = sourceTextureId,
-                width = width,
-                height = height,
-                rawToneMappingParameters = rawToneMappingParameters,
-                profileExposureEv = profileExposureUniforms.exposureEv,
-                profileExposureLinearGain = profileExposureUniforms.linearGain,
-                bindPreparedInput = { program ->
-                    bindProfileGainTableMap(
-                        program = program,
-                        metadata = metadata,
-                        applyProfileGainTableMap = applyProfileGainTableMap,
-                        profileBaselineExposureOffsetEv = profileBaselineExposureOffsetEv,
-                    )
-                    GLES30.glUniform2f(
-                        GLES30.glGetUniformLocation(program, "uGlobalUvOrigin"),
-                        0f,
-                        0f,
-                    )
-                    GLES30.glUniform2f(
-                        GLES30.glGetUniformLocation(program, "uGlobalUvScale"),
-                        1f,
-                        1f,
-                    )
-                    GLES30.glUniform1f(
-                        GLES30.glGetUniformLocation(program, "uProfileExposureLinearGain"),
-                        profileExposureUniforms.linearGain,
-                    )
-                    GLES30.glUniformMatrix3fv(
-                        GLES30.glGetUniformLocation(program, "uProfileToEngineTransform"),
-                        1,
-                        false,
-                        transposeMatrix3x3(profileToEngineTransform),
-                        0,
-                    )
-                },
-            ),
-        )?.textureId ?: 0
-    }
-
-    private fun computeFilmicToneCurveUniforms(params: RawToneMappingParameters): FilmicToneCurveUniforms {
-        val blackSource = min(
-            params.filmicBlackRelativeExposure,
-            params.filmicWhiteRelativeExposure - RawToneMappingParameters.MIN_DYNAMIC_RANGE_EV
-        )
-        val whiteSource = max(
-            params.filmicWhiteRelativeExposure,
-            blackSource + RawToneMappingParameters.MIN_DYNAMIC_RANGE_EV
-        )
-        val dynamicRange = max(RawToneMappingParameters.MIN_DYNAMIC_RANGE_EV, whiteSource - blackSource)
-        val inputMin = 2.0f.pow(blackSource) * FILMIC_GREY_SOURCE
-        val inputMax = 2.0f.pow(whiteSource) * FILMIC_GREY_SOURCE
-
-        val blackDisplay = FILMIC_DISPLAY_BLACK.pow(1f / FILMIC_OUTPUT_POWER)
-        val whiteDisplay = 1f
-        val greyDisplay = FILMIC_GREY_SOURCE.pow(1f / FILMIC_OUTPUT_POWER)
-        val greyLog = (abs(blackSource) / dynamicRange).coerceIn(0.001f, 0.999f)
-
-        var contrast = FILMIC_DEFAULT_CONTRAST * (dynamicRange / FILMIC_DEFAULT_DYNAMIC_RANGE)
-        var minContrast = 1f
-        minContrast = max(minContrast, (whiteDisplay - greyDisplay) / max(1f - greyLog, 1e-5f))
-        minContrast = max(minContrast, (greyDisplay - blackDisplay) / max(greyLog, 1e-5f))
-        contrast = contrast.coerceIn(minContrast + FILMIC_SAFETY_MARGIN, 100f)
-
-        val linearIntercept = greyDisplay - contrast * greyLog
-        val displayRange = whiteDisplay - blackDisplay
-        val xmin = (
-            blackDisplay + FILMIC_SAFETY_MARGIN * displayRange - linearIntercept
-            ) / contrast
-        val xmax = (
-            whiteDisplay - FILMIC_SAFETY_MARGIN * displayRange - linearIntercept
-            ) / contrast
-
-        val toeLog = ((1f - FILMIC_LATITUDE) * greyLog + FILMIC_LATITUDE * xmin)
-            .coerceIn(0f, greyLog)
-        val shoulderLog = ((1f - FILMIC_LATITUDE) * greyLog + FILMIC_LATITUDE * xmax)
-            .coerceIn(greyLog, 1f)
-        val toeDisplay = toeLog * contrast + linearIntercept
-        val shoulderDisplay = shoulderLog * contrast + linearIntercept
-
-        val m1 = FloatArray(3)
-        val m2 = FloatArray(3)
-        val m3 = FloatArray(3)
-        val m4 = FloatArray(3)
-        val m5 = FloatArray(3)
-
-        val toe = solveFilmicToe(toeLog.toDouble(), toeDisplay.toDouble(), blackDisplay.toDouble(), contrast.toDouble())
-        val shoulder = solveFilmicShoulder(
-            shoulderLog.toDouble(),
-            shoulderDisplay.toDouble(),
-            whiteDisplay.toDouble(),
-            contrast.toDouble()
-        )
-        m5[0] = toe[0].toFloat()
-        m4[0] = toe[1].toFloat()
-        m3[0] = toe[2].toFloat()
-        m2[0] = toe[3].toFloat()
-        m1[0] = toe[4].toFloat()
-
-        m5[1] = shoulder[0].toFloat()
-        m4[1] = shoulder[1].toFloat()
-        m3[1] = shoulder[2].toFloat()
-        m2[1] = shoulder[3].toFloat()
-        m1[1] = shoulder[4].toFloat()
-
-        m1[2] = (toeDisplay - contrast * toeLog)
-        m2[2] = contrast
-        m3[2] = 0f
-        m4[2] = 0f
-        m5[2] = 0f
-
-        return FilmicToneCurveUniforms(
-            blackRelativeExposure = blackSource,
-            whiteRelativeExposure = whiteSource,
-            dynamicRange = dynamicRange,
-            inputMin = max(inputMin, 1e-8f),
-            inputMax = max(inputMax, inputMin + 1e-8f),
-            latitudeMin = toeLog,
-            latitudeMax = shoulderLog,
-            m1 = m1,
-            m2 = m2,
-            m3 = m3,
-            m4 = m4,
-            m5 = m5
-        )
-    }
-
-    private fun solveFilmicToe(
-        toeLog: Double,
-        toeDisplay: Double,
-        blackDisplay: Double,
-        contrast: Double
-    ): DoubleArray {
-        val x2 = toeLog * toeLog
-        val x3 = x2 * toeLog
-        val x4 = x3 * toeLog
-        return solveLinearSystem(
-            arrayOf(
-                doubleArrayOf(0.0, 0.0, 0.0, 0.0, 1.0),
-                doubleArrayOf(0.0, 0.0, 0.0, 1.0, 0.0),
-                doubleArrayOf(x4, x3, x2, toeLog, 1.0),
-                doubleArrayOf(4.0 * x3, 3.0 * x2, 2.0 * toeLog, 1.0, 0.0),
-                doubleArrayOf(12.0 * x2, 6.0 * toeLog, 2.0, 0.0, 0.0)
-            ),
-            doubleArrayOf(blackDisplay, 0.0, toeDisplay, contrast, 0.0)
-        )
-    }
-
-    private fun solveFilmicShoulder(
-        shoulderLog: Double,
-        shoulderDisplay: Double,
-        whiteDisplay: Double,
-        contrast: Double
-    ): DoubleArray {
-        val x2 = shoulderLog * shoulderLog
-        val x3 = x2 * shoulderLog
-        val x4 = x3 * shoulderLog
-        return solveLinearSystem(
-            arrayOf(
-                doubleArrayOf(1.0, 1.0, 1.0, 1.0, 1.0),
-                doubleArrayOf(4.0, 3.0, 2.0, 1.0, 0.0),
-                doubleArrayOf(x4, x3, x2, shoulderLog, 1.0),
-                doubleArrayOf(4.0 * x3, 3.0 * x2, 2.0 * shoulderLog, 1.0, 0.0),
-                doubleArrayOf(12.0 * x2, 6.0 * shoulderLog, 2.0, 0.0, 0.0)
-            ),
-            doubleArrayOf(whiteDisplay, 0.0, shoulderDisplay, contrast, 0.0)
-        )
-    }
-
-    private fun solveLinearSystem(matrix: Array<DoubleArray>, values: DoubleArray): DoubleArray {
-        val size = values.size
-        for (column in 0 until size) {
-            var pivot = column
-            for (row in column + 1 until size) {
-                if (abs(matrix[row][column]) > abs(matrix[pivot][column])) {
-                    pivot = row
-                }
-            }
-            if (pivot != column) {
-                val tmpRow = matrix[column]
-                matrix[column] = matrix[pivot]
-                matrix[pivot] = tmpRow
-                val tmpValue = values[column]
-                values[column] = values[pivot]
-                values[pivot] = tmpValue
-            }
-
-            val pivotValue = matrix[column][column]
-            if (abs(pivotValue) < 1e-12) {
-                PLog.w(TAG, "Filmic spline solve hit a near-singular matrix; using neutral row")
-                continue
-            }
-
-            for (row in column + 1 until size) {
-                val factor = matrix[row][column] / pivotValue
-                for (col in column until size) {
-                    matrix[row][col] -= factor * matrix[column][col]
-                }
-                values[row] -= factor * values[column]
-            }
-        }
-
-        val result = DoubleArray(size)
-        for (row in size - 1 downTo 0) {
-            var sum = values[row]
-            for (col in row + 1 until size) {
-                sum -= matrix[row][col] * result[col]
-            }
-            val denominator = matrix[row][row]
-            result[row] = if (abs(denominator) < 1e-12) 0.0 else sum / denominator
-        }
-        return result
-    }
-
     private fun computeWorkingToOutputTransform(
         workingSpace: ColorSpace,
         outputSpace: ColorSpace
@@ -7723,9 +6621,6 @@ class RawDemosaicProcessor {
     }
 
     private fun computeXyzD50ToGamut(colorSpace: ColorSpace): FloatArray? {
-        if (colorSpace == ColorSpace.HNCS) {
-            return invertMatrix3x3(HncsProfileManager.HNCS_RGB_TO_XYZ_D50)
-        }
         val primaries = colorSpace.primaries
         val whitePoint = colorSpace.whitePoint
         if (primaries.size != 6 || whitePoint.size != 2) return null
@@ -7816,11 +6711,6 @@ class RawDemosaicProcessor {
         metadata: RawMetadata,
         inputTextureId: Int,
         dcpRenderPlan: DcpRenderPlan?,
-        spectralFilmLut: SpectralFilmLut?,
-        hncsRenderPlan: HncsRenderPlan?,
-        lumixRenderPlan: LumixRenderPlan?,
-        canonRenderPlan: CanonRenderPlan?,
-        leicaRenderPlan: LeicaRenderPlan?,
         colorEngine: RawRenderingEngine,
         outputWorkingColorSpace: ColorSpace,
         profileToEngineTransform: FloatArray,
@@ -7880,11 +6770,6 @@ class RawDemosaicProcessor {
                         profileExposure = profileExposureUniforms,
                         dcpRenderPlan = dcpRenderPlan,
                         applyDcpHueSatMap = applyDcpHueSatMap,
-                        spectralFilmLut = spectralFilmLut,
-                        hncsRenderPlan = hncsRenderPlan,
-                        lumixRenderPlan = lumixRenderPlan,
-                        canonRenderPlan = canonRenderPlan,
-                        leicaRenderPlan = leicaRenderPlan,
                         bindProfileGainTable = { program ->
                             bindProfileGainTableMap(
                                 program = program,
@@ -8321,34 +7206,17 @@ class RawDemosaicProcessor {
         applyDngBaselineExposure: Boolean,
         clampProfileRgb: Boolean,
         hueSatMapSupportsOverrange: Boolean,
-        hncsCameraDomainGains: FloatArray? = null,
         textureBounds: FloatArray = floatArrayOf(0f, 0f, 1f, 1f),
         areaSampleFootprint: FloatArray = floatArrayOf(0f, 0f),
         useAreaSampleMaximum: Boolean = false,
         textureRotation: Int = 0,
         label: String
     ) {
-        val hncsCameraDomain = hncsCameraDomainGains?.let { gains ->
-            HncsCameraDomain.resolve(
-                compositeCameraToWorkingMatrix = colorCorrectionMatrix,
-                cameraGains = gains,
-                baselineExposureEv = if (applyDngBaselineExposure) {
-                    metadata.baselineExposure
-                } else {
-                    0f
-                },
-                additionalExposureEv = rawExposureCompensation,
-            )
-        }
         val linearCameraWhite = sanitizeCameraWhite(cameraWhite)
         val exposureGain = computeLinearExposureGain(
             metadata,
-            rawExposureCompensation = if (hncsCameraDomain == null) {
-                rawExposureCompensation
-            } else {
-                0f
-            },
-            applyDngBaselineExposure = hncsCameraDomain == null && applyDngBaselineExposure
+            rawExposureCompensation = rawExposureCompensation,
+            applyDngBaselineExposure = applyDngBaselineExposure
         )
         checkNotNull(
             linearRcdPass.render(
@@ -8358,14 +7226,14 @@ class RawDemosaicProcessor {
                     targetTextureId = 0,
                     width = viewportWidth,
                     height = viewportHeight,
-                    colorCorrectionMatrix =
-                        hncsCameraDomain?.cameraToWorkingMatrix ?: colorCorrectionMatrix,
+                    colorCorrectionMatrix = colorCorrectionMatrix,
                     cameraWhite = linearCameraWhite,
                     exposureGain = exposureGain,
-                    hncsCameraDomainGain = hncsCameraDomain?.normalizedGain,
-                    hncsInputEv = hncsCameraDomain?.inputEv ?: 1f,
-                    hncsHighlightTruncation = hncsCameraDomain?.hrTrunc ?: 1f,
-                    hncsHighlightMaximum = hncsCameraDomain?.hrMax ?: 1f,
+                    // Keep the original shared linear GLSL and its disabled HNCS inputs.
+                    hncsCameraDomainGain = null,
+                    hncsInputEv = 1f,
+                    hncsHighlightTruncation = 1f,
+                    hncsHighlightMaximum = 1f,
                     clampProfileRgb = clampProfileRgb,
                     hueSatMapSupportsOverrange = hueSatMapSupportsOverrange,
                     textureBounds = textureBounds,
@@ -9391,16 +8259,13 @@ class RawDemosaicProcessor {
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
 
         engineTonePass.release()
-        hncsOutputLinearPass.release()
         adjustmentPass.release()
         srgbPass.release()
         sharpenPass.release()
         mgcSharpen.release()
         denoiseTransfer.release()
-        raisrTransfer.release()
         outputPass.release()
         hdrReferencePass.release()
-        filmicHighlightReconstructionAlgorithm.release()
 
         demosaicNoisePropagationCalibrator.release()
         vgnDemosaicAlgorithm.release()

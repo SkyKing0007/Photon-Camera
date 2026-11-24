@@ -26,12 +26,6 @@ internal class RawEngineTonePass(
         val profileExposure: RawProfileExposureGl.Uniforms,
         val dcpRenderPlan: DcpRenderPlan?,
         val applyDcpHueSatMap: Boolean,
-        val spectralFilmLut: SpectralFilmLut?,
-        val hncsRenderPlan: HncsRenderPlan?,
-        val lumixRenderPlan: LumixRenderPlan? = null,
-        val canonRenderPlan: CanonRenderPlan? = null,
-        val leicaRenderPlan: LeicaRenderPlan? = null,
-        val fotufilm: FotufilmRenderRequest? = null,
         val bindProfileGainTable: (program: Int) -> Unit,
     ) {
         fun toColorResources() = RawEngineColorResources(
@@ -41,12 +35,6 @@ internal class RawEngineTonePass(
             outputTransform = outputTransform,
             dcpRenderPlan = dcpRenderPlan,
             applyDcpHueSatMap = applyDcpHueSatMap,
-            spectralFilmLut = spectralFilmLut,
-            hncsRenderPlan = hncsRenderPlan,
-            lumixRenderPlan = lumixRenderPlan,
-            canonRenderPlan = canonRenderPlan,
-            leicaRenderPlan = leicaRenderPlan,
-            fotufilm = fotufilm,
         )
     }
 
@@ -60,61 +48,20 @@ internal class RawEngineTonePass(
     )
 
     private val adobeCurveAlgorithm = AdobeCurveToneAlgorithm(quad, dcpTextures, curveTextures)
-    private val agxAlgorithm = AgXToneAlgorithm(quad)
-    private val spektrafilmAlgorithm = SpektrafilmToneAlgorithm(quad)
-    private val spektrafilmScannerPass = SpektrafilmScannerPass(quad)
-    private val spektrafilmGraph = SpektrafilmGraphToneStage(quad)
-    private val darktableSigmoidAlgorithm = DarktableSigmoidToneAlgorithm(quad)
-    private val darktableFilmicAlgorithm = DarktableFilmicToneAlgorithm(quad)
-    private val hncsAlgorithm = HncsToneAlgorithm(quad)
-    private val lumixAlgorithm = LumixToneAlgorithm(quad)
-    private val canonAlgorithm = CanonToneAlgorithm(quad)
-    private val leicaAlgorithm = LeicaToneAlgorithm(quad)
-    private val fotufilmStage = FotufilmToneStage(quad)
 
-    fun render(input: Input): Output? {
-        if (input.colorEngine == RawRenderingEngine.Spektrafilm && input.spectralFilmLut?.graph != null) {
-            return spektrafilmGraph.render(input)
-        }
-        spektrafilmGraph.discardInactiveGraph()
-        return when {
-            input.colorEngine.isFotufilm -> fotufilmStage.render(input)
-            input.colorEngine == RawRenderingEngine.Spektrafilm && input.spectralFilmLut != null ->
-                spektrafilmScannerPass.render(input, spektrafilmAlgorithm)
-            else -> algorithmFor(input.colorEngine).render(input)
-        }
-    }
-
-    internal fun measureSpectralMaximum(input: Input, left: Int, top: Int, width: Int, height: Int): Float =
-        spektrafilmGraph.measureMaximum(input, left, top, width, height)
-
-    /** Whole-frame metering contribution of one full-resolution tile; see [FotufilmToneStage.meterTile]. */
-    internal fun meterFotufilmTile(
-        input: Input,
-        coreLeft: Int,
-        coreTop: Int,
-        coreWidth: Int,
-        coreHeight: Int,
-        cellSize: Int,
-    ): FotufilmMeterCells? = fotufilmStage.meterTile(input, coreLeft, coreTop, coreWidth, coreHeight, cellSize)
+    fun render(input: Input): Output? = algorithmFor(input.colorEngine).render(input)
 
     internal fun bindColorResources(program: Int, resources: RawEngineColorResources) =
         algorithmFor(resources.colorEngine).bindColorResources(program, resources)
 
-    fun prewarm(colorEngine: RawRenderingEngine): Boolean = if (colorEngine.isFotufilm) {
-        fotufilmStage.prewarm()
-    } else {
+    fun prewarm(colorEngine: RawRenderingEngine): Boolean =
         algorithmFor(colorEngine).prewarm()
-    }
 
     fun renderHdrReference(
         input: Input,
         sceneExposureGain: Float,
         coordinateInput: HdrCoordinateInput?,
-    ): Output? = if (input.colorEngine.isFotufilm) {
-        // Fotufilm delivers an SDR print (upstream: paper output is SDR); no HDR reference exists.
-        error("Fotufilm has no HDR reference rendering")
-    } else algorithmFor(input.colorEngine).renderHdrReference(
+    ): Output? = algorithmFor(input.colorEngine).renderHdrReference(
         input = input,
         sceneExposureGain = sceneExposureGain,
         coordinateInput = coordinateInput,
@@ -122,17 +69,6 @@ internal class RawEngineTonePass(
 
     fun release() {
         adobeCurveAlgorithm.release()
-        agxAlgorithm.release()
-        spektrafilmAlgorithm.release()
-        spektrafilmScannerPass.release()
-        spektrafilmGraph.release()
-        darktableSigmoidAlgorithm.release()
-        darktableFilmicAlgorithm.release()
-        hncsAlgorithm.release()
-        lumixAlgorithm.release()
-        canonAlgorithm.release()
-        leicaAlgorithm.release()
-        fotufilmStage.release()
         dcpTextures.release()
         curveTextures.release()
     }
@@ -140,15 +76,6 @@ internal class RawEngineTonePass(
     private fun algorithmFor(colorEngine: RawRenderingEngine): RawRenderingEngineToneAlgorithm {
         return when (colorEngine) {
             RawRenderingEngine.AdobeCurve -> adobeCurveAlgorithm
-            RawRenderingEngine.AgX -> agxAlgorithm
-            RawRenderingEngine.Spektrafilm -> spektrafilmAlgorithm
-            RawRenderingEngine.DarktableSigmoid -> darktableSigmoidAlgorithm
-            RawRenderingEngine.DarktableFilmic -> darktableFilmicAlgorithm
-            RawRenderingEngine.Hncs -> hncsAlgorithm
-            RawRenderingEngine.Lumix -> lumixAlgorithm
-            RawRenderingEngine.Canon -> canonAlgorithm
-            RawRenderingEngine.Leica -> leicaAlgorithm
-            RawRenderingEngine.Fotufilm -> fotufilmStage.inputAlgorithm
         }
     }
 
@@ -166,7 +93,7 @@ internal class RawEngineTonePass(
         fun hdrBaseCurveFragmentShaderFor(colorEngine: RawRenderingEngine): String {
             return hdrBaseCurveFragmentShader(
                 shaderDefinition = shaderDefinitionFor(colorEngine),
-                isHncs = colorEngine.isHncs,
+                isHncs = false,
             )
         }
 
@@ -360,15 +287,6 @@ internal class RawEngineTonePass(
         ): RawEngineToneShaderDefinition {
             return when (colorEngine) {
                 RawRenderingEngine.AdobeCurve -> AdobeCurveToneShader.DEFINITION
-                RawRenderingEngine.AgX -> AgXToneShader.DEFINITION
-                RawRenderingEngine.Spektrafilm -> SpektrafilmToneShader.DEFINITION
-                RawRenderingEngine.DarktableSigmoid -> DarktableSigmoidToneShader.DEFINITION
-                RawRenderingEngine.DarktableFilmic -> DarktableFilmicToneShader.DEFINITION
-                RawRenderingEngine.Hncs -> HncsToneShader.DEFINITION
-                RawRenderingEngine.Lumix -> LumixToneShader.DEFINITION
-                RawRenderingEngine.Canon -> CanonToneShader.DEFINITION
-                RawRenderingEngine.Leica -> LeicaToneShader.DEFINITION
-                RawRenderingEngine.Fotufilm -> FotufilmInputToneShader.DEFINITION
             }
         }
 

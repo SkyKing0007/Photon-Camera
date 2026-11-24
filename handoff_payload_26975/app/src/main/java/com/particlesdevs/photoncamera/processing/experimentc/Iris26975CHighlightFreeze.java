@@ -1,9 +1,9 @@
 package com.particlesdevs.photoncamera.processing.experimentc;
 
 /**
- * C-only shutter-time adapter for the existing Iris highlight exposure decision.
- * Reads an already-computed, sensor-timestamped Iris recipe; never invokes A/B
- * image processing, recalculates scene highlights, or creates an extra bracket.
+ * C-only shutter-time negative exposure application. The active route uses only
+ * the shutter-local C RAW meter, never A/B recipe state or extra brackets.
+ * The legacy pure arithmetic method is retained for historical host regressions.
  * Every NORMAL RAW in C receives this single immutable SS/ISO pair.
  */
 public final class Iris26975CHighlightFreeze {
@@ -25,12 +25,41 @@ public final class Iris26975CHighlightFreeze {
 
     private Iris26975CHighlightFreeze() {}
 
+    public static Decision freezeOwnMeter(boolean manual, long shutter, int iso,
+            float protectionEv, long minShutter, long maxShutter, int minIso, int maxIso) {
+        // A missing C observation is NOT a zero-clipping measurement.
+        boolean measured = Float.isFinite(protectionEv) && protectionEv >= 0f && protectionEv <= MAX_PROTECTION_EV;
+        double energy = (double)shutter * iso;
+        double target = measured ? energy * Math.pow(2.0, -protectionEv) : energy;
+        // Reuse the same negative-only capture arithmetic, with a local same-sample
+        // decision instead of an external recipe. No fake sensor timestamp is used.
+        return apply(manual, shutter, iso, measured && protectionEv > .03f,
+                target, minShutter, maxShutter, minIso, maxIso,
+                "C_PRIVATE_RAW_METER");
+    }
+
     public static Decision freeze(boolean userManual, long previewExposureNs, int previewIso,
             long physicalPreviewTimestampNs, long currentCameraGeneration,
             boolean irisRecipeReady, long recipeGeneration, long recipeTimestampNs,
             double recipeEnergy, float recipeOffsetEv,
             long sensorMinExposureNs, long sensorMaxExposureNs,
             int sensorMinIso, int sensorMaxIso) {
+        // User manual choices outrank all automatic Iris highlight recipes.
+        boolean usable = !(userManual || !irisRecipeReady || recipeGeneration != currentCameraGeneration ||
+                physicalPreviewTimestampNs <= 0 || recipeTimestampNs <= 0 ||
+                Math.abs((double) physicalPreviewTimestampNs - recipeTimestampNs) > MAX_RECIPE_AGE_NS ||
+                !Float.isFinite(recipeOffsetEv) || recipeOffsetEv >= -0.03f ||
+                recipeOffsetEv < -MAX_PROTECTION_EV - 0.01f ||
+                !Double.isFinite(recipeEnergy) || recipeEnergy <= 0.0);
+
+        return apply(userManual, previewExposureNs, previewIso, usable, recipeEnergy,
+                sensorMinExposureNs, sensorMaxExposureNs, sensorMinIso, sensorMaxIso,
+                "IRIS_HIGHLIGHT_RECIPE_FROZEN");
+    }
+
+    private static Decision apply(boolean userManual, long previewExposureNs, int previewIso,
+            boolean usable, double recipeEnergy, long sensorMinExposureNs, long sensorMaxExposureNs,
+            int sensorMinIso, int sensorMaxIso, String authority) {
         if (previewExposureNs <= 0 || previewIso <= 0 ||
                 sensorMinExposureNs <= 0 || sensorMaxExposureNs < sensorMinExposureNs ||
                 sensorMinIso <= 0 || sensorMaxIso < sensorMinIso ||
@@ -40,14 +69,7 @@ public final class Iris26975CHighlightFreeze {
         }
         Decision unchanged = new Decision(previewExposureNs, previewIso, 0f,
                 userManual ? "IRIS_MANUAL" : "PHYSICAL_PREVIEW");
-        // User manual choices outrank all automatic Iris highlight recipes.
-        if (userManual || !irisRecipeReady || recipeGeneration != currentCameraGeneration ||
-                physicalPreviewTimestampNs <= 0 || recipeTimestampNs <= 0 ||
-                Math.abs((double) physicalPreviewTimestampNs - recipeTimestampNs) > MAX_RECIPE_AGE_NS ||
-                !Float.isFinite(recipeOffsetEv) || recipeOffsetEv >= -0.03f ||
-                recipeOffsetEv < -MAX_PROTECTION_EV - 0.01f ||
-                !Double.isFinite(recipeEnergy) || recipeEnergy <= 0.0) return unchanged;
-
+        if (userManual || !usable) return unchanged;
         final double baselineEnergy = (double) previewExposureNs * previewIso;
         // The preview may ALREADY carry Iris highlight protection. Compare with
         // its absolute recipe rather than subtracting the EV offset a second time.
@@ -74,7 +96,6 @@ public final class Iris26975CHighlightFreeze {
         if (actualEnergy > baselineEnergy || actualEnergy < baselineEnergy *
                 Math.pow(2.0, -MAX_PROTECTION_EV) * 0.985) return unchanged;
         float actualEv = (float) (Math.log(baselineEnergy / actualEnergy) / Math.log(2.0));
-        return new Decision(selectedShutter, selectedIso, actualEv,
-                "IRIS_HIGHLIGHT_RECIPE_FROZEN");
+        return new Decision(selectedShutter, selectedIso, actualEv, authority);
     }
 }

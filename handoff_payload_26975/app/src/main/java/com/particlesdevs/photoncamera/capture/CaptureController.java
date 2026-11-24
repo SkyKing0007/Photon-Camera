@@ -304,7 +304,37 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     private final ArrayDeque<Image> mIris26975CZslRingBuffer = new ArrayDeque<>();
     private final HashMap<Long, TotalCaptureResult> mIris26975CZslResultMap = new HashMap<>();
     private volatile boolean mIris26975CZslPreviewSelected = false;
+    // Immutable request ownership is recorded before submission. No hidden Camera2 APIs.
+    private volatile CaptureRequest mIris26975CProvenRawPreviewRequest;
+    private volatile CameraCaptureSession mIris26975CProvenRawPreviewSession;
+    private volatile ImageReader mIris26975CProvenRawPreviewReader;
+    private volatile CaptureRequest mIris26975CProvenMeterRequest;
+    private volatile CameraCaptureSession mIris26975CProvenMeterSession;
+    private volatile TotalCaptureResult mIris26975CLatestMeterResult;
+
+    private void iris26975CRecordPreviewRequest(CameraCaptureSession session,
+            CaptureRequest.Builder builder, CaptureRequest request) {
+        mIris26975CProvenMeterRequest = null;
+        mIris26975CLatestMeterResult = null;
+        mIris26975CProvenRawPreviewRequest = null;
+        if (mIris26975CPreviewHalOffActive && iris26975CSelectedForCapture() &&
+                mIris26974PreviewTargetOwner == builder) {
+            mIris26975CProvenMeterSession = session;
+            mIris26975CProvenMeterRequest = request;
+        }
+        if (mIris26975CZslPreviewSelected && iris26975CSelectedForMotion() &&
+                mIris26974PreviewTargetOwner == builder && mIris26974PreviewRawTargetAdded &&
+                mImageReaderRaw != null) {
+            mIris26975CProvenRawPreviewSession = session;
+            mIris26975CProvenRawPreviewReader = mImageReaderRaw;
+            mIris26975CProvenRawPreviewRequest = request;
+        }
+    }
     private Integer mIris26975COriginalAntibanding = null;
+    private Integer mIris26975CFactoryPreviewAntibanding = null;
+    private Integer mIris26975COriginalAeMode, mIris26975COriginalIso, mIris26975COriginalComp, mIris26975COriginalPriority;
+    private Boolean mIris26975COriginalAeLock;
+    private Long mIris26975COriginalShutter, mIris26975COriginalDuration;
 
     private void iris26975CClearOwnZslLocked() {
         while (!mIris26975CZslRingBuffer.isEmpty()) {
@@ -525,9 +555,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                      * Preserve its exact real RAW leases, bounded by the selected
                      * 2..30 count and ImageReader acquisition headroom.
                      */
-                    if (mIris26975CZslPreviewSelected) {
+                    if (iris26975CSelectedForMotion()) {
                         synchronized (mZslBufferLock) {
-                            if (!mZslCapturing) {
+                            if (mIris26975CZslPreviewSelected && reader == mImageReaderRaw && !mZslCapturing) {
                                 mIris26975CZslRingBuffer.addLast(img);
                                 if (!mIris26548FirstZslRaw) mIris26548FirstZslRaw = true;
                                 final int selected = Math.max(0, Math.min(30,
@@ -965,7 +995,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             if (exposure != null) mPreviewExposureTime = (long) exposure;
             if (iso != null) mPreviewIso = (int) iso;
             if (focus != null) mFocus = (float) focus;
-            if (isZslMode()) {
+            if (isZslMode() && !iris26975CSelectedForMotion()) {
                 updateMotionUnifiedExposure(request, result);
                 /*
                  * IRIS_26413_MOTION_V2_HAL_AE_STABLE_PREVIEW
@@ -1029,6 +1059,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             mFlashed = state != null && state == CaptureResult.FLASH_STATE_PARTIAL || state == CaptureResult.FLASH_STATE_FIRED;
             mPreviewCaptureResult = result;
             mPreviewCaptureRequest = request;
+            if (request == mIris26975CProvenMeterRequest && session == mIris26975CProvenMeterSession &&
+                    session == mCaptureSession && iris26975CSelectedForCapture())
+                mIris26975CLatestMeterResult = result;
             /* Only a confirmed result from the currently installed new session
              * may authorize a front/rear preview handoff. A late old callback
              * cannot release the reused SurfaceTexture while it holds old frames. */
@@ -1108,11 +1141,16 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             Long sensorTimestamp = result.get(CaptureResult.SENSOR_TIMESTAMP);
             if (sensorTimestamp != null && PhotonCamera.getSettings().selectedMode == CameraMode.MOTION) {
                 synchronized (mZslBufferLock) {
-                    if (mIris26975CZslPreviewSelected) {
-                        mIris26975CZslResultMap.put(sensorTimestamp, result);
-                        while (mIris26975CZslResultMap.size() > MAX_ZSL_RESULT_METADATA) {
-                            Long oldest = Collections.min(mIris26975CZslResultMap.keySet());
-                            mIris26975CZslResultMap.remove(oldest);
+                    if (iris26975CSelectedForMotion()) {
+                        if (mIris26975CZslPreviewSelected && session == mCaptureSession &&
+                                mImageReaderRaw != null && request == mIris26975CProvenRawPreviewRequest &&
+                                session == mIris26975CProvenRawPreviewSession &&
+                                mImageReaderRaw == mIris26975CProvenRawPreviewReader) {
+                            mIris26975CZslResultMap.put(sensorTimestamp, result);
+                            while (mIris26975CZslResultMap.size() > MAX_ZSL_RESULT_METADATA) {
+                                Long oldest = Collections.min(mIris26975CZslResultMap.keySet());
+                                mIris26975CZslResultMap.remove(oldest);
+                            }
                         }
                     } else {
                         mZslResultMap.put(sensorTimestamp, result);
@@ -1122,6 +1160,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                         }
                     }
                 }
+                if (!iris26975CSelectedForMotion()) {
                 Long requestedExposure =
                         request.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
                 Long actualMotionExposure =
@@ -1174,6 +1213,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                         + ";MotionCandidateFrames=" + mMotionCandidateFrames
                         + ";MotionActiveZone=" + mMotionActiveZone
                         + ";ManualFrames=" + mMotionManualFrames;
+                }
             }
             process(result);
             cameraEventsListener.onPreviewCaptureCompleted(result);
@@ -1746,6 +1786,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             final com.hinnka.mycamera.processor.Iris26972CCamera2ShutterSession c =
                     mIris26972CShutterSession;
             mIris26972CShutterSession = null;
+            mIris26975CProvenMeterRequest = null;
+            mIris26975CLatestMeterResult = null;
+            mIris26975CProvenRawPreviewRequest = null;
             if (c != null) c.close();
             final android.os.HandlerThread cRawThread = mIris26974CRawCallbackThread;
             mIris26974CRawCallbackThread = null;
@@ -6206,7 +6249,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
         return iris26909OwnsManualPreview() && !iris26909UserManualExposure();
     }
     private void iris26910GuardPreviewExposure() {
-        if (iris26910PreserveBManualExposure()) iris26909PutBManualOnBuilder();
+        if (!iris26975CSelectedForMotion() && iris26910PreserveBManualExposure()) iris26909PutBManualOnBuilder();
     }
 
     /* IRIS_26975_C_PREVIEW_ZSL_HAL_OFF
@@ -6222,12 +6265,14 @@ private long mMotionUnifiedLastUpdateMs = 0L;
     private Integer mIris26975CPreviewOriginalNr = null;
     private Integer mIris26975CPreviewOriginalEdge = null;
 
-    private void iris26975CApplyPreviewHalOff() {
-        final CaptureRequest.Builder builder = mPreviewRequestBuilder;
-        if (builder == null) return;
+    private boolean iris26975CSelectedForMotion() {
+        return isZslMode() && getAuthoritativeCameraMode() == CameraMode.MOTION && iris26975CSelectedForCapture();
+    }
+
+    private boolean iris26975CSelectedForCapture() {
         boolean cSelected = false;
-        if (!mIsRecordingVideo && isZslMode() &&
-                getAuthoritativeCameraMode() == CameraMode.MOTION &&
+        final CameraMode mode = getAuthoritativeCameraMode();
+        if (!mIsRecordingVideo && ((isZslMode() && mode == CameraMode.MOTION) || mode == CameraMode.NIGHT) &&
                 physicalID != null && !physicalID.isEmpty()) {
             try {
                 cSelected = "C".equals(com.particlesdevs.photoncamera.settings
@@ -6239,10 +6284,19 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                         selectionError);
             }
         }
+        return cSelected;
+    }
+
+    private void iris26975CApplyPreviewHalOff() {
+        final CaptureRequest.Builder builder = mPreviewRequestBuilder;
+        if (builder == null) return;
+        final boolean cSelected = iris26975CSelectedForCapture();
         if (!cSelected) {
             synchronized (mZslBufferLock) {
                 if (mIris26975CZslPreviewSelected) iris26975CClearOwnZslLocked();
                 mIris26975CZslPreviewSelected = false;
+                mIris26975CProvenMeterRequest = null;
+                mIris26975CLatestMeterResult = null;
             }
             if (mIris26975CPreviewHalOffActive) {
                 builder.set(CaptureRequest.NOISE_REDUCTION_MODE,
@@ -6251,7 +6305,19 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                         mIris26975CPreviewOriginalEdge);
                 builder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE,
                         mIris26975COriginalAntibanding);
+                builder.set(CaptureRequest.CONTROL_AE_MODE, mIris26975COriginalAeMode);
+                builder.set(CaptureRequest.CONTROL_AE_LOCK, mIris26975COriginalAeLock);
+                builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, mIris26975COriginalShutter);
+                builder.set(CaptureRequest.SENSOR_SENSITIVITY, mIris26975COriginalIso);
+                builder.set(CaptureRequest.SENSOR_FRAME_DURATION, mIris26975COriginalDuration);
+                builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mIris26975COriginalComp);
+                if (android.os.Build.VERSION.SDK_INT >= 36 && mCameraCharacteristics != null &&
+                        mCameraCharacteristics.getAvailableCaptureRequestKeys() != null &&
+                        mCameraCharacteristics.getAvailableCaptureRequestKeys().contains(CaptureRequest.CONTROL_AE_PRIORITY_MODE))
+                    builder.set(CaptureRequest.CONTROL_AE_PRIORITY_MODE, mIris26975COriginalPriority);
                 mIris26975CPreviewHalOffActive = false;
+                // Reapply B's own policy only after C relinquishes this shared builder.
+                iris26910GuardPreviewExposure();
                 mIris26975CPreviewOriginalNr = null;
                 mIris26975CPreviewOriginalEdge = null;
                 mIris26975COriginalAntibanding = null;
@@ -6282,26 +6348,73 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             if (!mIris26975CPreviewHalOffActive) {
                 mIris26975CPreviewOriginalNr = builder.get(CaptureRequest.NOISE_REDUCTION_MODE);
                 mIris26975CPreviewOriginalEdge = builder.get(CaptureRequest.EDGE_MODE);
-                mIris26975COriginalAntibanding = builder.get(
-                        CaptureRequest.CONTROL_AE_ANTIBANDING_MODE);
+                mIris26975COriginalAntibanding = builder.get(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE);
+                mIris26975COriginalAeMode = builder.get(CaptureRequest.CONTROL_AE_MODE);
+                mIris26975COriginalAeLock = builder.get(CaptureRequest.CONTROL_AE_LOCK);
+                mIris26975COriginalShutter = builder.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
+                mIris26975COriginalIso = builder.get(CaptureRequest.SENSOR_SENSITIVITY);
+                mIris26975COriginalDuration = builder.get(CaptureRequest.SENSOR_FRAME_DURATION);
+                mIris26975COriginalComp = builder.get(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION);
+                if (android.os.Build.VERSION.SDK_INT >= 36)
+                    mIris26975COriginalPriority = builder.get(CaptureRequest.CONTROL_AE_PRIORITY_MODE);
             }
             builder.set(CaptureRequest.NOISE_REDUCTION_MODE,
                     CaptureRequest.NOISE_REDUCTION_MODE_OFF);
             builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF);
-            /* Copy B's capture-only HAL AUTO antibanding setting into C's OWN
-             * preview request. C retains Iris manual SS/ISO priority and does
-             * not execute B's row-flicker corrections or reconstruction. */
-            if (iris26975CModeSupported(physical,
-                    CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES,
-                    CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO) &&
-                iris26975CModeSupported(opened,
-                    CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES,
-                    CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO)) {
-                builder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE,
-                        CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO);
+            // Pinned bjzhou Camera2Controller never writes ANTIBANDING_MODE.
+            // Restore this builder's own PREVIEW template value, not B's forced AUTO.
+            builder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE,
+                    mIris26975CFactoryPreviewAntibanding);
+            // Donor full-auto preview uses HAL AE, not the A/B shutter-priority loop.
+            final boolean manualInput = getParamController() != null &&
+                    (getParamController().getCurrentExposureValue() != 0.0 ||
+                     getParamController().getCurrentISOValue() != 0.0);
+            if (!manualInput) {
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+                builder.set(CaptureRequest.CONTROL_AE_LOCK, false);
+                builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, null);
+                builder.set(CaptureRequest.SENSOR_SENSITIVITY, null);
+                builder.set(CaptureRequest.SENSOR_FRAME_DURATION, null);
+                final android.util.Range<Integer> comp = physical.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+                if (comp != null) {
+                    int userComp = getParamController() == null ? 0 : getParamController().EV;
+                    builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+                            Math.max(comp.getLower(), Math.min(comp.getUpper(), userComp)));
+                }
+            } else {
+                // Original donor caps manual PHOTO preview at 1/15s, while still capture uses
+                // the full explicit user shutter. Do not alter the user's requested still value.
+                final long userSs = Math.round(getParamController().getCurrentExposureValue());
+                final int userIso = (int)Math.round(getParamController().getCurrentISOValue());
+                final Long priorSs = builder.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
+                final Integer priorIso = builder.get(CaptureRequest.SENSOR_SENSITIVITY);
+                final android.util.Range<Long> ssRange = physical.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
+                final android.util.Range<Integer> isoRange = physical.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+                if (ssRange != null && isoRange != null && (userSs > 0 || priorSs != null && priorSs > 0L) &&
+                        (userIso > 0 || priorIso != null && priorIso > 0)) {
+                    long stillSs = userSs > 0 ? userSs : priorSs;
+                    int stillIso = userIso > 0 ? userIso : priorIso;
+                    builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+                    builder.set(CaptureRequest.CONTROL_AE_LOCK, false);
+                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME,
+                            Math.max(ssRange.getLower(),Math.min(ssRange.getUpper(),Math.min(stillSs,1_000_000_000L / 15L))));
+                    builder.set(CaptureRequest.SENSOR_SENSITIVITY,
+                            Math.max(isoRange.getLower(),Math.min(isoRange.getUpper(),stillIso)));
+                    builder.set(CaptureRequest.SENSOR_FRAME_DURATION,null);
+                }
+            }
+            if (android.os.Build.VERSION.SDK_INT >= 36 && opened.getAvailableCaptureRequestKeys() != null &&
+                    opened.getAvailableCaptureRequestKeys().contains(CaptureRequest.CONTROL_AE_PRIORITY_MODE)) {
+                builder.set(CaptureRequest.CONTROL_AE_PRIORITY_MODE,
+                        CameraMetadata.CONTROL_AE_PRIORITY_MODE_OFF);
             }
             mIris26975CPreviewHalOffActive = true;
             synchronized (mZslBufferLock) {
+                if (!iris26975CSelectedForMotion()) {
+                    if (mIris26975CZslPreviewSelected) iris26975CClearOwnZslLocked();
+                    mIris26975CZslPreviewSelected = false;
+                    return;
+                }
                 if (!mIris26975CZslPreviewSelected) {
                     iris26975CClearOwnZslLocked();
                     // The previous A/B rolling RAW leases must not co-own HAL
@@ -6320,6 +6433,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
 
     private static boolean iris26975CModeSupported(CameraCharacteristics characteristics,
             CameraCharacteristics.Key<int[]> key, int required) {
+        if (characteristics == null) return false;
         final int[] modes = characteristics.get(key);
         if (modes == null) return false;
         for (int mode : modes) if (mode == required) return true;
@@ -6342,7 +6456,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             iris26524ApplyZoomToPreviewBuilder();
             iris26910GuardPreviewExposure();
             iris26975CApplyPreviewHalOff();
-            session.setRepeatingRequest(mPreviewInputRequest = builder.build(), mCaptureCallback, handler);
+            mPreviewInputRequest = builder.build();
+            iris26975CRecordPreviewRequest(session, builder, mPreviewInputRequest);
+            session.setRepeatingRequest(mPreviewInputRequest, mCaptureCallback, handler);
             return true;
         } catch (IllegalStateException | IllegalArgumentException e) {
             Logger.warnShort(TAG, "Cannot rebuildPreviewBuilder()!", e);
@@ -6602,6 +6718,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
 
     private boolean iris26548MotionZslHasFrames() {
         synchronized (mZslBufferLock) {
+            if (iris26975CSelectedForMotion()) return !mIris26975CZslRingBuffer.isEmpty();
             return !mZslRingBuffer.isEmpty();
         }
     }
@@ -7555,6 +7672,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                             }
                         } else {
                             //if(mSelectedMode != CameraMode.VIDEO)
+                            iris26975CRecordPreviewRequest(mCaptureSession, mPreviewRequestBuilder, mPreviewInputRequest);
                             mCaptureSession.setRepeatingRequest(mPreviewInputRequest,
                                     mCaptureCallback, mBackgroundHandler);
                             mIris26548RepeatingSubmitted = true;
@@ -7676,6 +7794,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             mPreviewRequestBuilder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
         }
 
+        mIris26975CProvenMeterRequest = null;
+        mIris26975CLatestMeterResult = null;
+        mIris26975CFactoryPreviewAntibanding = mPreviewRequestBuilder.get(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE);
         // A new factory request is not the builder whose C-only HAL settings
         // were saved before camera/session reconfiguration.
         mIris26975CPreviewHalOffActive = false;
@@ -11586,6 +11707,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 // no other path removes it. The built request is immutable, so
                 // restoring builder RAW below does not reintroduce RAW in flight.
                 final CaptureRequest onlyPreview = builder.build();
+                mIris26975CProvenRawPreviewRequest = null;
+                mIris26975CProvenMeterRequest = null;
+                mIris26975CLatestMeterResult = null;
                 ownedSession.setRepeatingRequest(onlyPreview, mCaptureCallback,
                         mBackgroundHandler);
                 Log.i(TAG, "IRIS_26974_C_PREVIEW_ONLY_RESUMED rawTarget=false " +
@@ -11604,6 +11728,70 @@ private long mMotionUnifiedLastUpdateMs = 0L;
      * Controlled device trial now enters the independent C callback route.
      * Production readiness is still unproven. No legacy A/B save fallback.
      * No silent fallback on Camera2/RAW metadata or storage failure. */
+    /** No shared Motion recipe or image sampler. Read the most recent exact physical
+     * RAW/result pair while the C ring owns its lease; no Image escapes this lock. */
+    private com.particlesdevs.photoncamera.processing.experimentc.Iris26975CRawHighlightMeter.Measurement
+            iris26975CMeterOwnRawAtShutter(CameraCharacteristics characteristics,
+            CaptureResult preview, long baselineExposure, int baselineIso) {
+        final Long previewTs = preview.get(CaptureResult.SENSOR_TIMESTAMP);
+        final Integer white = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL);
+        final android.hardware.camera2.params.BlackLevelPattern black = characteristics.get(
+                CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
+        if (previewTs == null || previewTs <= 0L || white == null || white <= 0 || black == null)
+            return null;
+        synchronized (mZslBufferLock) {
+            final java.util.Iterator<Image> it = mIris26975CZslRingBuffer.descendingIterator();
+            while (it.hasNext()) {
+                final Image raw = it.next();
+                if (raw == null || raw.getFormat() != ImageFormat.RAW_SENSOR ||
+                        raw.getTimestamp() <= 0L || raw.getTimestamp() > previewTs ||
+                        previewTs - raw.getTimestamp() > 333_000_000L) continue;
+                final TotalCaptureResult total = mIris26975CZslResultMap.get(raw.getTimestamp());
+                if (total == null || total.getRequest() == null || mImageReaderRaw == null ||
+                        !java.util.Objects.equals(total.get(CaptureResult.SENSOR_TIMESTAMP), raw.getTimestamp()))
+                    continue;
+                if (!com.particlesdevs.photoncamera.processing.experimentc.Iris26975COffModePolicy
+                        .acceptZslRequest(total.getRequest().get(CaptureRequest.NOISE_REDUCTION_MODE),
+                                total.getRequest().get(CaptureRequest.EDGE_MODE))) continue;
+                final CaptureResult physical = physicalID.equals(mCameraDevice.getId()) ? total :
+                        total.getPhysicalCameraResults().get(physicalID);
+                if (physical == null ||
+                        !java.util.Objects.equals(physical.get(CaptureResult.SENSOR_TIMESTAMP), raw.getTimestamp()) ||
+                        !java.util.Objects.equals(physical.get(CaptureResult.SENSOR_EXPOSURE_TIME), baselineExposure) ||
+                        !java.util.Objects.equals(physical.get(CaptureResult.SENSOR_SENSITIVITY), baselineIso) ||
+                        !java.util.Objects.equals(physical.get(CaptureResult.SCALER_CROP_REGION),
+                                preview.get(CaptureResult.SCALER_CROP_REGION)) ||
+                        !java.util.Objects.equals(physical.get(CaptureResult.LENS_FOCUS_DISTANCE),
+                                preview.get(CaptureResult.LENS_FOCUS_DISTANCE))) continue;
+                if (android.os.Build.VERSION.SDK_INT >= 30 && !java.util.Objects.equals(
+                        physical.get(CaptureResult.CONTROL_ZOOM_RATIO),
+                        preview.get(CaptureResult.CONTROL_ZOOM_RATIO))) continue;
+                try {
+                    final Image.Plane[] planes = raw.getPlanes();
+                    if (planes.length != 1) continue;
+                    final android.graphics.Rect crop = raw.getCropRect();
+                    final float[] blacks = new float[4];
+                    final float[] dynamic = physical.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL);
+                    for (int phase = 0; phase < 4; phase++) {
+                        float b = dynamic != null && dynamic.length == 4 ? dynamic[phase] : Float.NaN;
+                        blacks[phase] = Float.isFinite(b) && b >= 0f && b < white ? b :
+                                black.getOffsetForIndex(phase & 1, phase >> 1);
+                    }
+                    final com.particlesdevs.photoncamera.processing.experimentc.Iris26975CRawHighlightMeter.Measurement measurement =
+                            com.particlesdevs.photoncamera.processing.experimentc.Iris26975CRawHighlightMeter.measure(planes[0].getBuffer(),
+                                    planes[0].getRowStride(), planes[0].getPixelStride(),
+                                    crop.left, crop.top, crop.right, crop.bottom, white, blacks);
+                    Log.i(TAG, "IRIS_26975_C_PRIVATE_RAW_METER ts=" + raw.getTimestamp() + " protectionEv=" + measurement.protectionEv + " mean=" + measurement.mean + " clipped=" + measurement.clippedFraction);
+                    return measurement;
+                } catch (RuntimeException badMeter) {
+                    Log.w(TAG, "IRIS_26975_C_RAW_METER_UNAVAILABLE", badMeter);
+                }
+            }
+        }
+        Log.i(TAG, "IRIS_26975_C_RAW_METER_NO_MATCHED_EVIDENCE; preserve physical preview");
+        return null;
+    }
+
     private void iris26972CStartIndependentCamera2(boolean night) {
         Log.i(TAG, "IRIS_26974_C_SHUTTER_ENTRY night=" + night + " camera=" + physicalID +
                 " sessionReady=" + (mCaptureSession != null));
@@ -11617,6 +11805,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
          * runtime are intentionally ARM64-only. Iris still packages its
          * historical v7a A/B libraries, but C must reject a 32-bit process
          * BEFORE capture rather than creating a photo it cannot finish. */
+        if (android.os.Build.VERSION.SDK_INT < 34) {
+            iris26679RejectShutter("C_ULTRA_HDR_API_REQUIRED",
+                    "Experiment C always-on Ultra HDR requires Android 14 or later");
+            return;
+        }
         if (!android.os.Process.is64Bit()) {
             iris26679RejectShutter("C_ARM64_DONOR_NATIVE_REQUIRED",
                     "Experiment C needs a 64-bit ARM process for donor native RAW");
@@ -11695,158 +11888,95 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                     "Experiment C requires Camera2 NR OFF and sharpening OFF");
             return;
         }
-        /* C-owned capture-only flicker input. Never call A/B row-flicker image
-         * processing or derive an unverified manual exposure from HAL AUTO. */
-        final Integer cPreviewAntibanding = mPreviewRequestBuilder == null ? null :
-                mPreviewRequestBuilder.get(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE);
-        final CaptureResult cFlickerPhysicalPreview =
-                mPreviewCaptureResult instanceof TotalCaptureResult ?
-                (physicalID.equals(mCameraDevice.getId()) ?
-                    (TotalCaptureResult)mPreviewCaptureResult :
-                    ((TotalCaptureResult)mPreviewCaptureResult).getPhysicalCameraResults()
-                        .get(physicalID)) : null;
-        final Integer cObservedAntibanding = cFlickerPhysicalPreview == null ? null :
-                cFlickerPhysicalPreview.get(CaptureResult.CONTROL_AE_ANTIBANDING_MODE);
-        final Integer cFrozenAntibanding = com.particlesdevs.photoncamera.processing.experimentc
-                .Iris26975CFlickerModeFreeze.freeze(
-                        cObservedAntibanding,cPreviewAntibanding,
-                        cPhysicalCharacteristics.get(
-                                CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES));
+        // Original RAWmax still template owns antibanding. No C manual mains solver,
+        // no copied B AUTO override, and no claim of device-level flicker elimination.
         final int requestedFrames = PhotonCamera.getSettings().frameCount;
         // Iris's existing slider is authoritative for the exact Sabre RAW count.
-        // Experiment C honors exactly the selected existing 2..30 frame slider.
-        // Never submit 31..50 RAW requests or silently clip an invalid count.
+        // SettingsActivity already caps the effective Motion/C slider maximum at 30.
+        // C Sabre requires at least two frames; never silently reinterpret 1 (unprocessed RAW).
         // A physical device lacking RAW capacity fails the admission check.
         final int frames = requestedFrames;
         if (frames < 2 || frames > com.particlesdevs.photoncamera.processing.experimentc.Iris26972CContract.MAX_NORMAL_FRAMES) {
             iris26679RejectShutter("C_INVALID_FROZEN_BURST_COUNT",
-                    "Experiment C cannot honor the selected Iris RAW frame count");
+                    "Experiment C Pro Sabre requires 2–30 RAW frames; select a count in Settings");
             return;
         }
-        final TotalCaptureResult preview = mPreviewCaptureResult instanceof TotalCaptureResult
-                ? (TotalCaptureResult) mPreviewCaptureResult : null;
+        final TotalCaptureResult preview = mIris26975CLatestMeterResult;
         // Freeze the actual physical preview sensor metadata for C. Logical
         // multi-camera metadata is not proof of a particular RAW sensor's SS/ISO.
         final CaptureResult cPhysicalPreview = preview == null ? null :
                 (physicalID.equals(mCameraDevice.getId()) ? preview :
                     preview.getPhysicalCameraResults().get(physicalID));
-        /* IRIS_26975_C_MANUAL_SS_ISO_INPUT_BOUNDARY
-         * Iris owns the user-facing manual SS/ISO controls. When the user has
-         * explicitly requested either manual control, freeze the ACTUAL preview
-         * request (which ParamController has already capped/clamped), never a
-         * potentially stale HAL preview result. The same pair is applied to all
-         * C RAW_SENSOR capture requests, and only exact matching ZSL frames
-         * are eligible. This is input transfer, not A/B exposure processing.
-         * If either requested value is missing, fail before touching the reader.
-         * In auto mode, preserve the physical HAL result selected by Iris AE
-         * and its existing shutter-first/highlight-protection decisions.
+        /* Pinned bjzhou Camera2Controller applyExposureSettings / applyMultiFrameCaptureConsistency:
+         * auto preview uses HAL metering, then ordinary RAWmax freezes its measured SS/ISO
+         * into AE-OFF same-exposure still requests. Original RAW min-shutter default is 0.
+         * Explicit Iris SS/ISO controls supply donor state inputs, not A/B exposure recipes.
+         * The only intentional adaptation is bounded C-private RAW highlight protection.
          */
-        final boolean cUserManualExposure = getParamController() != null &&
-                (getParamController().getCurrentExposureValue() != 0.0 ||
-                 getParamController().getCurrentISOValue() != 0.0);
-        final Integer cRequestedAe = mPreviewRequestBuilder == null ? null :
-                mPreviewRequestBuilder.get(CaptureRequest.CONTROL_AE_MODE);
-        final Long cRequestedShutter = mPreviewRequestBuilder == null ? null :
-                mPreviewRequestBuilder.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
-        final Integer cRequestedIso = mPreviewRequestBuilder == null ? null :
-                mPreviewRequestBuilder.get(CaptureRequest.SENSOR_SENSITIVITY);
-        if (cUserManualExposure && (cRequestedAe == null ||
-                cRequestedAe != CaptureRequest.CONTROL_AE_MODE_OFF ||
-                cRequestedShutter == null || cRequestedShutter <= 0L ||
-                cRequestedIso == null || cRequestedIso <= 0)) {
-            iris26679RejectShutter("C_IRIS_USER_MANUAL_PAIR_NOT_APPLIED",
-                    "Experiment C requires both actual Iris manual request values");
+        final double cUserShutter = getParamController() == null ? 0.0 : getParamController().getCurrentExposureValue();
+        final double cUserIso = getParamController() == null ? 0.0 : getParamController().getCurrentISOValue();
+        final boolean cUserManualExposure = cUserShutter != 0.0 || cUserIso != 0.0;
+        if (cPhysicalPreview == null || preview.getRequest() != mIris26975CProvenMeterRequest ||
+                mIris26975CProvenMeterSession != mCaptureSession ||
+                (!night && (preview.getRequest() != mIris26975CProvenRawPreviewRequest ||
+                mIris26975CProvenRawPreviewSession != mCaptureSession ||
+                mIris26975CProvenRawPreviewReader != mImageReaderRaw))) {
+            iris26679RejectShutter("C_DONOR_PHYSICAL_METER_NOT_READY", "Experiment C is waiting for its physical RAW preview");
             return;
         }
-        final Long cBaselineExposure = cUserManualExposure ? cRequestedShutter :
-                (cPhysicalPreview == null ? null :
-                 cPhysicalPreview.get(CaptureResult.SENSOR_EXPOSURE_TIME));
-        final Integer cBaselineIso = cUserManualExposure ? cRequestedIso :
-                (cPhysicalPreview == null ? null :
-                 cPhysicalPreview.get(CaptureResult.SENSOR_SENSITIVITY));
-        /* IRIS_26975_C_FROZEN_IRIS_HIGHLIGHT_INPUT_ONLY
-         * Freeze the existing Iris read-only highlight RECIPE at shutter,
-         * never import A/B rendering, extra SHORT frames or negative EV twice.
-         * Manual SS/ISO always wins; recipe must be fresh, from this camera
-         * generation, and reduce (never increase) the physical HAL product.
-         */
-        final com.particlesdevs.photoncamera.processing.experimentc
-                .Iris26975CHighlightFreeze.Decision cHighlightDecision;
+        final CaptureRequest cProducingRequest = preview.getRequest();
+        final Integer cRequestedAe = cProducingRequest.get(CaptureRequest.CONTROL_AE_MODE);
+        final Long cRequestedShutter = cProducingRequest.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
+        final Integer cRequestedIso = cProducingRequest.get(CaptureRequest.SENSOR_SENSITIVITY);
+        final Long cActualShutter = cPhysicalPreview.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+        final Integer cActualIso = cPhysicalPreview.get(CaptureResult.SENSOR_SENSITIVITY);
+        final Integer cActualAe = cPhysicalPreview.get(CaptureResult.CONTROL_AE_MODE);
+        final com.particlesdevs.photoncamera.processing.experimentc.Iris26975CDonorExposurePolicy.Pair donorExposure;
+        final com.particlesdevs.photoncamera.processing.experimentc.Iris26975CHighlightFreeze.Decision cHighlightDecision;
         try {
-            if (cBaselineExposure == null || cBaselineIso == null ||
-                    cPhysicalPreview == null || cBaselineExposure <= 0L || cBaselineIso <= 0)
-                throw new IllegalArgumentException("physical shutter result unavailable");
-            final android.util.Range<Long> cExposureRange = cPhysicalCharacteristics.get(
-                    CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
-            final android.util.Range<Integer> cIsoRange = cPhysicalCharacteristics.get(
-                    CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
-            if (cExposureRange == null || cIsoRange == null)
-                throw new IllegalArgumentException("physical sensor exposure ranges unavailable");
-            final Long cPhysicalTimestamp = cPhysicalPreview.get(
-                    CaptureResult.SENSOR_TIMESTAMP);
-            cHighlightDecision = com.particlesdevs.photoncamera.processing.experimentc
-                    .Iris26975CHighlightFreeze.freeze(
-                        cUserManualExposure, cBaselineExposure, cBaselineIso,
-                        cPhysicalTimestamp == null ? 0L : cPhysicalTimestamp,
-                        mIris26548CameraHealthGeneration, mMotion26713RecipeReady,
-                        mMotion26713RecipeGeneration,
-                        mMotion26713RecipeBaselineTimestampNs,
-                        mMotion26713RecipeEnergy, mMotion26713RecipeOffsetEv,
-                        cExposureRange.getLower(), cExposureRange.getUpper(),
-                        cIsoRange.getLower(), cIsoRange.getUpper());
-        } catch (RuntimeException cHighlightFailure) {
-            Log.e(TAG, "IRIS_26975_C_HIGHLIGHT_FREEZE_REJECT", cHighlightFailure);
-            iris26679RejectShutter("C_EXPOSURE_INPUT_NOT_FROZEN",
-                    "Experiment C cannot verify this physical RAW exposure");
+            final android.util.Range<Long> ss = cPhysicalCharacteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
+            final android.util.Range<Integer> gain = cPhysicalCharacteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+            final Long maxFrame = cPhysicalCharacteristics.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION);
+            if (ss == null || gain == null || cRequestedAe == null)
+                throw new IllegalArgumentException("missing physical donor exposure authority");
+            final int expectedAe = cUserManualExposure ? CaptureRequest.CONTROL_AE_MODE_OFF : CaptureRequest.CONTROL_AE_MODE_ON;
+            if (cRequestedAe != expectedAe || (cActualAe != null && cActualAe != expectedAe))
+                throw new IllegalArgumentException("donor preview AE state not settled");
+            donorExposure = com.particlesdevs.photoncamera.processing.experimentc.Iris26975CDonorExposurePolicy.freeze(
+                    cUserShutter, cUserIso, cActualShutter, cActualIso, cRequestedShutter, cRequestedIso,
+                    ss.getLower(), ss.getUpper(), gain.getLower(), gain.getUpper(), maxFrame);
+            final com.particlesdevs.photoncamera.processing.experimentc.Iris26975CRawHighlightMeter.Measurement meter =
+                    cUserManualExposure ? null : iris26975CMeterOwnRawAtShutter(cPhysicalCharacteristics,cPhysicalPreview,
+                            donorExposure.shutterNs,donorExposure.iso);
+            final boolean cHighlightCompatible = com.particlesdevs.photoncamera.processing.experimentc.Iris26975CDonorExposurePolicy.allowHighlightAdjustment(
+                    cPhysicalPreview.get(CaptureResult.CONTROL_AE_ANTIBANDING_MODE),
+                    cPhysicalPreview.get(CaptureResult.STATISTICS_SCENE_FLICKER));
+            if (meter != null && meter.protectionEv > .03f && !cHighlightCompatible)
+                Log.i(TAG,"IRIS_26975_C_HIGHLIGHT_DEFERRED preserveDonorMeteredFlickerExposure=true");
+            cHighlightDecision = com.particlesdevs.photoncamera.processing.experimentc.Iris26975CHighlightFreeze.freezeOwnMeter(
+                    cUserManualExposure, donorExposure.shutterNs, donorExposure.iso,
+                    meter == null || !cHighlightCompatible ? Float.NaN : meter.protectionEv,
+                    ss.getLower(), ss.getUpper(), gain.getLower(), gain.getUpper());
+        } catch (RuntimeException invalid) {
+            Log.e(TAG,"IRIS_26975_C_DONOR_EXPOSURE_REJECT",invalid);
+            iris26679RejectShutter("C_DONOR_EXPOSURE_NOT_READY", "Experiment C cannot verify this physical RAW exposure");
             return;
         }
-        /* C Night is its own fresh RAW capture with Iris's Night shutter-priority
-         * principle, not a call into either A/B Night reconstruction pipeline.
-         * A separately bracketed LONG cohort cannot be passed to a same-exposure
-         * donor Sabre engine: the C Night input remains one frozen NORMAL group. */
-        final com.particlesdevs.photoncamera.processing.experimentc
-                .Iris26975CNightExposureFreeze.Plan cNightExposure;
-        try {
-            if (night) {
-                final android.util.Range<Long> cNightShutterRange = cPhysicalCharacteristics.get(
-                        CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
-                final android.util.Range<Integer> cNightIsoRange = cPhysicalCharacteristics.get(
-                        CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
-                if (cNightShutterRange == null || cNightIsoRange == null)
-                    throw new IllegalArgumentException("C Night physical limits unavailable");
-                cNightExposure = com.particlesdevs.photoncamera.processing.experimentc
-                        .Iris26975CNightExposureFreeze.freeze(
-                                cUserManualExposure,
-                                cHighlightDecision.exposureNs, cHighlightDecision.iso,
-                                cNightShutterRange.getLower(), cNightShutterRange.getUpper(),
-                                cNightIsoRange.getLower(), cNightIsoRange.getUpper(),
-                                PhotonCamera.getSettings().exposureCompensation,
-                                cFrozenAntibanding,
-                                cHighlightDecision.appliedProtectionEv > 0f);
-            } else {
-                cNightExposure = null;
-            }
-        } catch (RuntimeException cNightError) {
-            Log.e(TAG, "IRIS_26975_C_NIGHT_EXPOSURE_REJECT", cNightError);
-            iris26679RejectShutter("C_NIGHT_PHYSICAL_EXPOSURE_INVALID",
-                    "Experiment C Night cannot freeze a safe physical exposure");
-            return;
-        }
-        final Long exposure = cNightExposure == null ?
-                cHighlightDecision.exposureNs : cNightExposure.exposureNs;
-        final Integer iso = cNightExposure == null ?
-                cHighlightDecision.iso : cNightExposure.iso;
-        Log.i(TAG, "IRIS_26975_C_INPUT_EXPOSURE manual=" + cUserManualExposure +
-                " shutterNs=" + exposure + " iso=" + iso +
-                " appliedProtectionEv=" + cHighlightDecision.appliedProtectionEv +
-                " authority=" + cHighlightDecision.authority);
-        final int[] caps = mCameraCharacteristics == null ? null :
-                mCameraCharacteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
+        final Long exposure = cHighlightDecision.exposureNs;
+        final Integer iso = cHighlightDecision.iso;
+        Log.i(TAG,"IRIS_26975_C_DONOR_SAME_EXPOSURE base=" + donorExposure.shutterNs + "/" + donorExposure.iso +
+                " frozen=" + exposure + "/" + iso + " explicitManual=" + cUserManualExposure +
+                " protectedEv=" + cHighlightDecision.appliedProtectionEv + " templateAntibanding=true");
+        final int[] caps = cPhysicalCharacteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
         boolean manual = false;
         if (caps != null) for (int cap : caps)
             if (cap == CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
                 manual = true;
-        if (!manual || exposure == null || exposure <= 0L || iso == null || iso <= 0) {
+        if (!manual || !iris26975CModeSupported(cPhysicalCharacteristics,
+                CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES, CaptureRequest.CONTROL_AE_MODE_OFF) ||
+                !iris26975CModeSupported(mCameraCharacteristics,
+                CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES, CaptureRequest.CONTROL_AE_MODE_OFF) ||
+                exposure == null || exposure <= 0L || iso == null || iso <= 0) {
             iris26679RejectShutter("C_FROZEN_MANUAL_EXPOSURE_MISSING",
                     "Camera cannot supply exact normal RAW exposure");
             return;
@@ -11914,7 +12044,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 if (image == null || image.getTimestamp() <= 0) continue;
                 final TotalCaptureResult total = mIris26975CZslResultMap.get(image.getTimestamp());
                 if (total == null || total.getRequest() == null ||
-                        !total.getRequest().getTargets().contains(cReader.getSurface()) ||
                         !java.util.Objects.equals(total.get(CaptureResult.SENSOR_TIMESTAMP),
                                 image.getTimestamp())) continue;
                 // Do not inherit A/B preview HAL processing into Experiment C.
@@ -12103,8 +12232,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                                             abortError);
                                 }
                             }
-                            if (mCaptureSession == captureSession &&
-                                    cSequenceFence.isSequenceEnded()) rebuildPreviewBuilder();
+                            if (mCaptureSession == captureSession && cSequenceFence.isSequenceEnded()) {
+                                try { rebuildPreviewBuilder(); }
+                                catch (RuntimeException restoreFailure) { Log.e(TAG,"IRIS_26975_C_PREVIEW_RESTORE_FAILURE",restoreFailure); }
+                            }
                             mState = STATE_PREVIEW;
                             Log.i(TAG, "IRIS_26974_C_TERMINAL " +
                                     "saved=" + (uri != null) + " sequenceEnd=" +
@@ -12151,9 +12282,17 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
                 b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure);
                 b.set(CaptureRequest.SENSOR_SENSITIVITY, iso);
-                if (cFrozenAntibanding != null)
-                    b.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE,
-                            cFrozenAntibanding);
+                b.set(CaptureRequest.CONTROL_AE_LOCK, false);
+                // Donor still request uses the lowest-upper FPS range for explicit manual capture.
+                // For auto-to-manual RAWmax freeze, donor leaves frame duration / antibanding at template defaults.
+                if (cUserManualExposure) {
+                    android.util.Range<Integer>[] fps = cPhysicalCharacteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+                    android.util.Range<Integer> lowest = null;
+                    if (fps != null) for (android.util.Range<Integer> range : fps)
+                        if (lowest == null || range.getUpper() < lowest.getUpper()) lowest = range;
+                    if (lowest != null) b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, lowest);
+                }
+                b.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF);
                 b.set(CaptureRequest.NOISE_REDUCTION_MODE,
                         CaptureRequest.NOISE_REDUCTION_MODE_OFF);
                 b.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF);
@@ -12316,7 +12455,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             // Before captureBurst there is no sequence to acknowledge. Once
             // entered, never assume a thrown Camera2 API call means that the
             // HAL cannot still send RAW Images; require abort/sequence-end.
-            if (!cBurstCallEntered[0]) cSequenceFence.markNeverSubmitted();
+            if (!cBurstCallEntered[0]) {
+                cSequenceFence.markNeverSubmitted();
+                // Before the normal installation point, failure must still have a terminal owner.
+                if (mIris26972CShutterSession == null && mCaptureSession == captureSession)
+                    mIris26972CShutterSession = owner;
+            }
             owner.onCaptureFailed("Camera2 submit: " + failure.getMessage());
             Log.e(TAG, "IRIS_26974_C_SUBMIT_FAILURE_FENCED " +
                     "entered=" + cBurstCallEntered[0]);
@@ -14668,6 +14812,14 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             /* IRIS_26909: autofocus/torch resets may never silently clear B's
              * single stable manual shutter/ISO repeating owner. Explicit user
              * exposure controls remain superior and are never overwritten. */
+            if (requestBuilder == mPreviewRequestBuilder && iris26975CSelectedForCapture()) {
+                // C private preview policy is applied at the repeating boundary.
+                // Do not execute the historical Motion/B AE-state takeovers.
+                if (getParamController() == null || (getParamController().getCurrentExposureValue() == 0.0 &&
+                        getParamController().getCurrentISOValue() == 0.0))
+                    requestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+                return;
+            }
             if (requestBuilder == mPreviewRequestBuilder && iris26909OwnsManualPreview()
                     && !iris26909UserManualExposure()) {
                 iris26909PutBManualOnBuilder();

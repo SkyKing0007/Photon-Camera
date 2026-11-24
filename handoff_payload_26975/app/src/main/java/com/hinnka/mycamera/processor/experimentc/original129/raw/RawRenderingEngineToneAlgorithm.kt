@@ -51,7 +51,7 @@ internal abstract class RawRenderingEngineToneAlgorithm(
         return quad.createProgram(
             RawEngineTonePass.hdrBaseCurveFragmentShader(
                 shaderDefinition = shaderDefinition,
-                isHncs = input.colorEngine.isHncs,
+                isHncs = false,
             ),
             "rawHdrBaseCurve${javaClass.simpleName}",
         ).also { hdrBaseCurveProgram = it }
@@ -430,15 +430,13 @@ internal abstract class RawRenderingEngineToneAlgorithm(
     internal fun bindColorResources(program: Int, resources: RawEngineColorResources) {
         RawToneMappingGl.bindRawToneMappingUniforms(program, resources.toneMappingParameters)
         bindEngineResources(program, resources)
-        if (!resources.colorEngine.isHncs) {
-            GLES30.glUniformMatrix3fv(
-                GLES30.glGetUniformLocation(program, "uOutputTransform"),
-                1,
-                false,
-                transpose3x3(resources.outputTransform),
-                0,
-            )
-        }
+        GLES30.glUniformMatrix3fv(
+            GLES30.glGetUniformLocation(program, "uOutputTransform"),
+            1,
+            false,
+            transpose3x3(resources.outputTransform),
+            0,
+        )
     }
 
     fun release() {

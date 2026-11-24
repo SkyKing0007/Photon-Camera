@@ -8,10 +8,4 @@ internal data class RawEngineColorResources(
     val outputTransform: FloatArray,
     val dcpRenderPlan: DcpRenderPlan?,
     val applyDcpHueSatMap: Boolean,
-    val spectralFilmLut: SpectralFilmLut?,
-    val hncsRenderPlan: HncsRenderPlan?,
-    val lumixRenderPlan: LumixRenderPlan?,
-    val canonRenderPlan: CanonRenderPlan?,
-    val leicaRenderPlan: LeicaRenderPlan?,
-    val fotufilm: FotufilmRenderRequest? = null,
 )

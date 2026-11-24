@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory(prefix='v8-stale-negative-') as td:
     assert b.prune_only_pinned_stale_stage(payload,expected,stale)==0
     legacy.write_bytes(b'TAMPERED V7')
     try:b.prune_only_pinned_stale_stage(payload,expected,stale)
-    except RuntimeError as e:assert 'tampered historical V7' in str(e)
+    except RuntimeError as e:assert 'tampered SHA-pinned historical staging file' in str(e)
     else:raise AssertionError('tampered old V7 blob accepted')
     legacy.unlink()
     unexpected=payload/'app/unexpected.kt';unexpected.write_bytes(b'unlisted')
@@ -47,6 +47,6 @@ with tempfile.TemporaryDirectory(prefix='v8-stale-negative-') as td:
     try:b.prune_only_pinned_stale_stage(payload,expected,stale)
     except RuntimeError as e:assert 'payload missing/extra' in str(e)
     else:raise AssertionError('missing current V8 blob accepted')
-assert len(b.stale_stage_manifest())==56
+assert len(b.stale_stage_manifest())==119
 print('PASS V8 strict historical stale stage cleanup, tamper/unexpected/missing negative controls')
 print('PASS negative SHA mutations x'+str(cases)+', manifest/protected equality, no missing/extra stage, identical source pre/post')

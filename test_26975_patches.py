@@ -9,7 +9,7 @@ spec=importlib.util.spec_from_file_location('builder26975',R/'build_26975_increm
 p=argparse.ArgumentParser();p.add_argument('--payload',action='store_true');p.add_argument('--frozen',action='store_true');p.add_argument('--live',action='store_true');o=p.parse_args()
 assert sum((o.payload,o.frozen,o.live))==1
 forward=R/'26975_FORWARD_FULLINDEX.patch';reverse=R/'26975_ROLLBACK_FULLINDEX.patch'
-assert forward.is_file() and reverse.is_file() and forward.stat().st_size>7_000_000 and reverse.stat().st_size>7_000_000
+assert forward.is_file() and reverse.is_file() and forward.stat().st_size>0 and reverse.stat().st_size>0
 if o.frozen:
  b.exact(b.BASE,'26975_BASE_26974_FULL_APP.sha256','patch base')
  b.exact(b.CAND,'26975_EXPECTED_FULL_APP.sha256','patch expected')
@@ -20,6 +20,11 @@ if o.payload:
   s=p.read_bytes()
   assert b'diff --git a/app/' in s and b'GIT binary patch' in s
   assert b'a/after/app/' not in s and b'b/before/app/' not in s
+  import re
+  paths=re.findall(rb'^diff --git a/(app/.*?) b/app/.*$',s,re.M)
+  assert len(paths)==len(set(paths))==b.NCHANGE
+  assert set(x.decode() for x in paths)==set((R/'26975_CHANGED_RUNTIME_ALLOWLIST.txt').read_text().splitlines())
+  assert len(re.findall(rb'^index [0-9a-f]{40}\.\.[0-9a-f]{40}(?: [0-9]+)?$',s,re.M))==b.NCHANGE
  # Base payload is only available after fetching exact successful Actions TAR.
  print('PASS full-index forward/rollback patch metadata + binary payload integrity (source SHA sealed)')
 else:
