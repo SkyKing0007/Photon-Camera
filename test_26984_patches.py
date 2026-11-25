@@ -32,7 +32,23 @@ else:
   print('PASS live source exact; frozen pair already exercised during reconstruction')
  else:
   with tempfile.TemporaryDirectory(prefix='26984patch_') as td:
-   t=pathlib.Path(td);shutil.copytree(b.BASE/'app',t/'app')
+   t=pathlib.Path(td)
+   # Reproduce V1 Git parent-discovery on the CURRENT five-file patch only.
+   # No earlier source tree or rollback is involved. Git can return zero after
+   # skipping the complete patch from a nested work directory.
+   outer=t/'parent';outer.mkdir();subprocess.run(['git','init','-q',str(outer)],check=True)
+   nested=outer/'.photon_26984_work'/'nested';nested.mkdir(parents=True)
+   changes,base,expected=b.scope()
+   for rel in changes:
+    dest=nested/rel;dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(b.BASE/rel,dest)
+   subprocess.run(['git','apply','--check','--whitespace=nowarn',str(forward)],cwd=nested,check=True)
+   subprocess.run(['git','apply','--whitespace=nowarn',str(forward)],cwd=nested,check=True)
+   assert all(b.sha(nested/rel)==base[rel] for rel in changes),'V1 parent skip not reproduced'
+   print('PASS V1 parent-repository silent patch skip reproduced on current five-file fixture')
+   # Only a disposable copy of the latest authority is used for round-trip
+   # tests; initialize its own Git root to prevent ancestor repository lookup.
+   t=t/'isolated';t.mkdir();subprocess.run(['git','init','-q',str(t)],check=True)
+   shutil.copytree(b.BASE/'app',t/'app')
    for abbrev in (7,12,40):
     for name,patch,manifest in [('forward',forward,'26984_EXPECTED_FULL_APP.sha256'),('rollback',reverse,'26984_BASE_26983_FULL_APP.sha256')]:
      cmd=['git','-c',f'core.abbrev={abbrev}','apply','--whitespace=nowarn']

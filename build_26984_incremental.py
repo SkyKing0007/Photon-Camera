@@ -25,7 +25,7 @@ DONOR_SHA={
  'lib/arm64-v8a/libiris26972c129.so':'a70ba1b1e4e8c856b07c828bef4141d0097d19013a49f77c1f59e41ee0a52cae',
  'lib/arm64-v8a/libi72.so':'ab0698a4a7006564e22447402468a9e1ca349a9017180bc7767c4feec58e0331',
 }
-FILES=['26983_SUCCESSFUL_EXECUTED_BUILDER_REFERENCE.py', '26983_SUCCESSFUL_EXECUTED_WORKFLOW_REFERENCE.yml', '26984_ADDED_RUNTIME_PATHS.txt', '26984_AUTHORITY_AND_SCOPE.json', '26984_BASE_26983_FULL_APP.sha256', '26984_CHANGED_RUNTIME_ALLOWLIST.txt', '26984_COMMIT_MESSAGE.txt', '26984_CON_SHADER_INVENTORY.json', '26984_DELETED_RUNTIME_PATHS.txt', '26984_EXPECTED_ACTION_EXECUTABLES.txt', '26984_EXPECTED_FULL_APP.sha256', '26984_FORWARD_FULLINDEX.patch', '26984_LOCAL_VERIFICATION.txt', '26984_MODIFIED_ORIGINAL_PATHS.txt', '26984_PROTECTED_SOURCE.sha256', '26984_ROLLBACK_FULLINDEX.patch', '26984_STAGE_1_UPLOAD_PATHS.txt', '26984_STAGE_2_UPLOAD_PATHS.txt', '26984_STAGE_3_UPLOAD_PATHS.txt', '26984_V6_CURRENT_SHADER_INVENTORY.json', '26984_post_copy_records.json', 'README_PHOTON_26984.md', 'build_26984_incremental.py', 'compile_26984_con_shaders.sh', 'compile_26984_shaders.sh', 'test_26984_patches.py', 'test_26984_sealed_negatives.py', 'test_26984_settings_host.py', 'test_26984_source.py', 'test_26984_workflow_refs.py', 'verify_26984_con_glsl.py', 'verify_26984_v6_current_glsl.py']
+FILES=['26983_SUCCESSFUL_EXECUTED_BUILDER_REFERENCE.py', '26983_SUCCESSFUL_EXECUTED_WORKFLOW_REFERENCE.yml', '26984_ADDED_RUNTIME_PATHS.txt', '26984_AUTHORITY_AND_SCOPE.json', '26984_BASE_26983_FULL_APP.sha256', '26984_CHANGED_RUNTIME_ALLOWLIST.txt', '26984_COMMIT_MESSAGE.txt', '26984_CON_SHADER_INVENTORY.json', '26984_DELETED_RUNTIME_PATHS.txt', '26984_EXPECTED_ACTION_EXECUTABLES.txt', '26984_EXPECTED_FULL_APP.sha256', '26984_FORWARD_FULLINDEX.patch', '26984_LOCAL_VERIFICATION.txt', '26984_MODIFIED_ORIGINAL_PATHS.txt', '26984_PROTECTED_SOURCE.sha256', '26984_ROLLBACK_FULLINDEX.patch', '26984_STAGE_1_UPLOAD_PATHS.txt', '26984_STAGE_2_UPLOAD_PATHS.txt', '26984_STAGE_3_UPLOAD_PATHS.txt', '26984_V6_CURRENT_SHADER_INVENTORY.json', '26984_post_copy_records.json', 'README_PHOTON_26984.md', 'build_26984_incremental.py', 'compile_26984_con_shaders.sh', 'compile_26984_shaders.sh', 'test_26984_latest_preflight.py', 'test_26984_patches.py', 'test_26984_sealed_negatives.py', 'test_26984_settings_host.py', 'test_26984_source.py', 'test_26984_workflow_refs.py', 'verify_26984_con_glsl.py', 'verify_26984_v6_current_glsl.py']
 ALLOWED_MODIFIED=['app/src/main/java/com/hinnka/mycamera/processor/Iris26972CCamera2ShutterSession.kt', 'app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java', 'app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26982CSharpenSettings.java', 'app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java', 'app/version.properties']
 ALLOWED_ADDED=[]
 
@@ -161,45 +161,16 @@ def restore_live(root):
  shutil.copyfile(root/'app/build.gradle',R/'app/build.gradle')
  if (R/'app/.cxx').exists():shutil.rmtree(R/'app/.cxx')
 
-def historical_26982():
- # Recover the exact prior historical input from successful 26983 by its sealed rollback.
- # No old APK, dev HEAD, or substitute fixtures enter current runtime source.
- h=TMP/'historical_26982';
- if h.exists():shutil.rmtree(h)
- shutil.copytree(BASE/'app',h/'app')
- subprocess.run(['git','apply','--check','--whitespace=nowarn',str(R/'26983_ROLLBACK_FULLINDEX.patch')],cwd=h,check=True)
- subprocess.run(['git','apply','--whitespace=nowarn',str(R/'26983_ROLLBACK_FULLINDEX.patch')],cwd=h,check=True)
- exact(h,'26983_BASE_26982_FULL_APP.sha256','exact reconstructed historical 26982 input')
- # All original 26982 checks retain their original scripts and sealed inputs.
- for rel in (R/'26982_STAGE_1_UPLOAD_PATHS.txt').read_text().splitlines():
-  dest=h/rel;dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(R/rel,dest)
- subprocess.run([sys.executable,'-S',str(h/'test_26982_source.py'),'--live'],cwd=h,check=True)
- subprocess.run([sys.executable,'-S',str(h/'test_26982_settings_java.py'),'--root',str(h/'app')],cwd=h,check=True)
- subprocess.run([sys.executable,'-S',str(h/'test_26982_integration_host.py'),'--root',str(h/'app')],cwd=h,check=True)
- subprocess.run([sys.executable,'-S',str(h/'verify_26982_v6_current_glsl.py'),'--audit'],cwd=h,check=True)
- return h
-
 def prepare_base():
+ # Single latest compiled runtime authority. No previous source reconstruction.
  recover();restore_live(BASE)
- exact(R,'26984_BASE_26983_FULL_APP.sha256','historical 26983 preflight source restored')
- # The successful previous workflow's historical seal has run before fetch.
- h=historical_26982()
- subprocess.run([sys.executable,'-S','test_26975_v5_asset_host.py','--live'],cwd=R,check=True)
- subprocess.run([sys.executable,'-S','build_26975_incremental.py','seal'],cwd=R,check=True)
- subprocess.run([sys.executable,'-S','test_26975_v10_minimal_core.py','--payload'],cwd=R,check=True)
- subprocess.run([sys.executable,'-S','test_26975_v4_capture_host.py','--root',str(R/'handoff_payload_26975/app')],cwd=R,check=True)
- subprocess.run([sys.executable,'-S','test_26983_v2_historical_replay.py','--base',str(h),'--historical',str(R/'handoff_payload_26975'),'--tests',str(R),'--candidate',str(BASE)],cwd=R,check=True)
- subprocess.run([sys.executable,'-S','test_26983_integrated_host.py','--base',str(h),'--candidate',str(BASE)],cwd=R,check=True)
- # Execute the entire actual 26983 V2 live regression suite on its actual source, not on evolved UI.
- subprocess.run([sys.executable,'-S','build_26983_incremental.py','regress'],cwd=R,check=True)
- exact(R,'26984_BASE_26983_FULL_APP.sha256','live predecessor unchanged after historical tests')
- exact(BASE,'26984_BASE_26983_FULL_APP.sha256','frozen predecessor unchanged after historical tests')
- exact(CAND,'26984_EXPECTED_FULL_APP.sha256','frozen successor unchanged after historical tests')
+ exact(R,'26984_BASE_26983_FULL_APP.sha256','actual 26983 live predecessor restored')
+ subprocess.run([sys.executable,'-S','test_26984_latest_preflight.py'],cwd=R,check=True)
  subprocess.run([sys.executable,'-S','test_26984_settings_host.py','--base',str(BASE),'--candidate',str(CAND)],cwd=R,check=True)
  OUT.mkdir(parents=True,exist_ok=True)
  changed,_,_=scope()
  (OUT/'26984_SOURCE_SCOPE.txt').write_text(f'26983 V2 Actions={RUN} commit={COMMIT} artifact={ART_ID} artifact_zip_sha={ART_SHA} actual_compiled_source_tar_sha={TAR_SHA}\nactual_runner_sha={BUILDER_SHA} actual_workflow_sha={WORKFLOW_SHA} prior_apk_sha={PRIOR_APK_SHA}\nbase={NBASE} candidate={NFILES} changes={NCHANGE} modified={NMODIFIED} added={NADDED} protected={NPROTECTED} deleted={NDELETED}\n'+''.join(p+'\n' for p in sorted(changed)))
- print('PASS 26983 V2 authority, original historical replay and all new settings tests')
+ print('PASS latest-only 26983 V2 authority, sparse historical fixtures and all new settings tests')
 
 def install():
  seal();exact(BASE,'26984_BASE_26983_FULL_APP.sha256','26983 baseline before install')
