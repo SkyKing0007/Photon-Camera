@@ -26,6 +26,36 @@ public final class GlesIris26983COnLkrBridge {
     private static final int STATS=16, TUNING_COUNT=28;
     static { System.loadLibrary("iris26983conlkr"); }
 
+    private static final java.util.concurrent.atomic.AtomicBoolean VULKAN_PREWARM =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** Once per process, C ON only. Separate Vulkan device, shared private cache;
+     * capture never waits for this optional optimization. */
+    public static void prewarmAsync(Context app, java.util.function.BooleanSupplier stillIdle) {
+        if (!stillIdle.getAsBoolean() || !VULKAN_PREWARM.compareAndSet(false, true)) return;
+        final Thread worker = new Thread(() -> {
+            boolean success = false;
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                if (!stillIdle.getAsBoolean()) return;
+                final java.io.File dir = new java.io.File(app.getCodeCacheDir(), "iris26985c-lkr2420");
+                if (!dir.isDirectory() && !dir.mkdirs() && !dir.isDirectory()) return;
+                final long ms = Iris26985CLkrNative.nativePrewarm(dir.getAbsolutePath());
+                success = ms >= 0;
+                Log.i(TAG, "IRIS_26985_C_VULKAN_PREWARM success=" + success + " ms=" + ms);
+            } catch (Throwable failure) {
+                Log.w(TAG, "IRIS_26985_C_VULKAN_PREWARM optional failure", failure);
+            } finally {
+                if (!success) VULKAN_PREWARM.set(false);
+            }
+        }, "Iris26985CVulkanPrewarm");
+        worker.setDaemon(true);
+        try { worker.start(); } catch (RuntimeException failure) {
+            VULKAN_PREWARM.set(false);
+            Log.w(TAG, "IRIS_26985_C_VULKAN_PREWARM thread unavailable", failure);
+        }
+    }
+
     // Native adapter outputs malloc-backed RAW16; ALWAYS release via the
     // C-private native allocator once the synchronous merge completes.
     private static native ByteBuffer[] nativePrepare(ByteBuffer[] sources,
@@ -175,7 +205,7 @@ public final class GlesIris26983COnLkrBridge {
             // the *new* iteration count: for 3x2, t=1 only (zero-based).
             // Every other native knob remains the published default, NaN.
             final java.io.File cacheDir=new java.io.File(app.getCodeCacheDir(),"iris26985c-lkr2420");
-            if(!cacheDir.isDirectory() && !cacheDir.mkdirs())throw new IllegalStateException("26985 C cache unavailable");
+            if(!cacheDir.isDirectory() && !cacheDir.mkdirs() && !cacheDir.isDirectory())throw new IllegalStateException("26985 C cache unavailable");
             Iris26985CLkrNative.nativeSetCacheDir(cacheDir.getAbsolutePath());
             Iris26985CLkrNative.nativeSetPrior(false);
             // RawLens: equal-exposure captures retain the exact legacy branch. For a

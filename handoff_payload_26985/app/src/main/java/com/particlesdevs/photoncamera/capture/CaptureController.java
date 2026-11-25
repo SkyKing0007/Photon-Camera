@@ -8804,6 +8804,21 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                             if (mTouchFocus != null) mTouchFocus.onPreviewSessionReady();
                             scheduleMotion26598DeferredShutterReplay("session_configured");
                             scheduleMotion26715IdlePipelinePrewarm();
+                            // C ON preview has its own Vulkan cache; never warm A/B or C OFF.
+                            if (iris26983COnSelected() && mBackgroundHandler != null) {
+                                mBackgroundHandler.postDelayed(() -> {
+                                    try {
+                                        java.util.function.BooleanSupplier idle = () ->
+                                                mCameraDevice == directDevice && mCaptureSession == cameraCaptureSession &&
+                                                mIris26548CameraHealthGeneration == directGeneration &&
+                                                iris26983COnSelected() && iris26983CanChangeSrOwner() && !CaptureController.isProcessing;
+                                        if (idle.getAsBoolean()) com.hinnka.mycamera.processor.GlesIris26983COnLkrBridge
+                                                .prewarmAsync(PhotonCamera.getApplicationContextStatic(), idle);
+                                    } catch (RuntimeException | LinkageError failure) {
+                                        Log.w(TAG, "IRIS_26985_C_VULKAN_PREWARM skipped", failure);
+                                    }
+                                }, 1400L);
+                            }
                         }
                     } catch (Exception e) {
                         Log.e(TAG, Log.getStackTraceString(e));
