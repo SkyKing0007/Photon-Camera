@@ -1,0 +1,209 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CCamera2ShutterSession.kt b/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CCamera2ShutterSession.kt
+index 73948023c573ef876f936173fd8329c51442ab79..7894436b93bd563e7853fc14dcd6b09c55af5c12 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CCamera2ShutterSession.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CCamera2ShutterSession.kt
+@@ -35,6 +35,7 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
+     private val manager: CameraManager,
+     private val logicalId: String,
+     private val physicalId: String,
++    private val selectedLensId: String,
+     private val frameCount: Int,
+     private val night: Boolean,
+     rawReader: ImageReader,
+@@ -60,7 +61,7 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
+     private val traceTag = "Iris26974C"
+     private val applicationContext = context.applicationContext
+     private val frozenSharpenBands = com.particlesdevs.photoncamera.settings
+-        .Iris26982CSharpenSettings.freeze(applicationContext, physicalId)
++        .Iris26982CSharpenSettings.freezeSelectedLens(applicationContext, selectedLensId, physicalId)
+     // Never share a scratch directory between live/closing C sessions. A previous
+     // Camera2 GL worker may still be cancelling when a new camera opens.
+     private val privateRoot = File(applicationContext.cacheDir, "iris26972c-private")
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index fb52ae27390881995867afefd8a519620f058fa1..33cf90d86d86ac0d66eafda6140d2cc488aadb95 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -13456,7 +13456,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         try {
+             owner = new com.hinnka.mycamera.processor.Iris26972CCamera2ShutterSession(
+                     PhotonCamera.getApplicationContextStatic(), mCameraManager,
+-                    mCameraDevice.getId(), physicalID, frames, night, mImageReaderRaw,
++                    mCameraDevice.getId(), physicalID, cActualRoute.requestedOwnerId, frames, night, mImageReaderRaw,
+                     currentOrientation, shutterMillis,
+                     (uri, error) -> {
+                         Runnable deliver = () -> {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26982CSharpenSettings.java b/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26982CSharpenSettings.java
+index e9861911b325f94d700bae9c542aa6f6ce2077d4..215fdea758a56a9f2eba0195b04fe543f8fea0f8 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26982CSharpenSettings.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26982CSharpenSettings.java
+@@ -59,6 +59,65 @@ public final class Iris26982CSharpenSettings {
+         }
+     }
+ 
++    /** 26984: a selected Iris lens route is durable even when Settings pauses Camera2.
++     * Direct IDs retain their existing physical key. Composite routes get a distinct
++     * key so an old migrated route value cannot mask a newer physical value.
++     * Both UI and shutter use the same selected route; physical evidence is only
++     * needed to read older values, never to enable an editor. */
++    private static String selectedKey(String selectedId, int band) {
++        String direct = key(selectedId, band);
++        return selectedId.contains("-") ? PREFIX + "route_" + direct.substring(PREFIX.length()) : direct;
++    }
++
++    private static String readValid(SharedPreferences prefs, String name) {
++        try {
++            String raw = prefs.getString(name, null);
++            return valid(raw) ? raw : null;
++        } catch (ClassCastException ignored) { return null; }
++    }
++
++    private static String selectedValue(Context context, String selectedId, String physicalId, int band) {
++        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
++        String primary = selectedKey(selectedId, band);
++        String saved = readValid(prefs, primary);
++        if (saved != null) return saved;
++        // A physical value is more recent than the pre-26983 composite-route alias.
++        if (physicalId != null && !physicalId.trim().isEmpty()) {
++            saved = readValid(prefs, key(physicalId, band));
++            if (saved != null) return saved;
++        }
++        saved = readValid(prefs, key(selectedId, band));
++        return saved != null ? saved : "1.0";
++    }
++
++    public static PreferenceDataStore forSelectedLens(Context context, String selectedId,
++            String physicalId, int band, Runnable rebind) {
++        final Context app = context.getApplicationContext();
++        final String ui = uiKey(band);
++        final String storage = selectedKey(selectedId, band);
++        return new PreferenceDataStore() {
++            @Override public String getString(String name, String defaultValue) {
++                if (!ui.equals(name)) throw new IllegalArgumentException("unexpected C band UI key");
++                return selectedValue(app, selectedId, physicalId, band);
++            }
++            @Override public void putString(String name, String value) {
++                if (!ui.equals(name)) throw new IllegalArgumentException("unexpected C band UI key");
++                String normalized = normalizeValue(value);
++                PreferenceManager.getDefaultSharedPreferences(app).edit().putString(storage, normalized).apply();
++                if (!normalized.equals(value) && rebind != null) rebind.run();
++            }
++        };
++    }
++
++    /** Snapshot the configured session's selected route, not mutable UI state. */
++    public static float[] freezeSelectedLens(Context context, String selectedId, String physicalId) {
++        return new float[] {
++            Float.parseFloat(selectedValue(context, selectedId, physicalId, 0)),
++            Float.parseFloat(selectedValue(context, selectedId, physicalId, 1)),
++            Float.parseFloat(selectedValue(context, selectedId, physicalId, 2)),
++        };
++    }
++
+     /** Standard UniversalSeekBarPreference, with the original physical store behind a stable UI key. */
+     public static PreferenceDataStore forBand(Context context, String physicalId, int band, Runnable rebind) {
+         final Context app = context.getApplicationContext();
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+index 0cff00786218a3d93c564ea22a9cc129e09b564a..7ed742452d089c409018f65afb6007634f6dc7a9 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+@@ -156,6 +156,7 @@ public class SettingsActivity extends BaseActivity implements PreferenceFragment
+         private ActivityResultLauncher<String[]> lutImportLauncher;
+         private ActivityResultLauncher<String[]> irisNoiseModelImportLauncher;
+         private String iris26914ImportLensId;
++        private String iris26984BoundSelected;
+         private String iris26983BoundPhysical;
+ 
+         @Override
+@@ -281,37 +282,65 @@ public class SettingsActivity extends BaseActivity implements PreferenceFragment
+ 
+         }
+ 
+-        /** Same UniversalSeekBarPreference as Iris Saturation, with reversible visibility. */
++        /** Resolve legacy physical values without opening or requiring a Camera2 session.
++         * Match the existing direct/hidden-physical route policy; no logical fallback
++         * is used to import values from an unrelated physical lens. */
++        private String iris26984LegacyPhysical(String selected) {
++            if (selected == null || selected.trim().isEmpty()) return null;
++            final String requestedAtLaunch = activity.getIntent().getStringExtra("iris_26983_settings_requested_id");
++            final String physicalAtLaunch = activity.getIntent().getStringExtra("iris_26983_settings_physical_id");
++            if (selected.equals(requestedAtLaunch) && physicalAtLaunch != null && !physicalAtLaunch.isEmpty())
++                return physicalAtLaunch;
++            if (!selected.contains("-")) return selected;
++            final String physical = selected.split("-", 2)[1];
++            try {
++                android.hardware.camera2.CameraManager manager = (android.hardware.camera2.CameraManager)
++                        mContext.getSystemService(Context.CAMERA_SERVICE);
++                if (manager == null) return null;
++                String[] ids = manager.getCameraIdList();
++                if (java.util.Arrays.asList(ids).contains(physical)) return physical;
++                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
++                    for (String logical : ids) {
++                        try {
++                            if (manager.getCameraCharacteristics(logical).getPhysicalCameraIds().contains(physical))
++                                return physical;
++                        } catch (Exception ignored) { }
++                    }
++                }
++            } catch (Exception ignored) { }
++            return null;
++        }
++
++        /** Same selected-lens authority and UniversalSeekBarPreference as Iris Saturation.
++         * Physical identity is optional legacy read evidence, never a widget enable gate. */
+         private void setupIris26982CSharpening() {
+             if (mContext == null || activity == null) return;
+             final String selected = PreferenceKeys.getCameraID();
+-            final String requestedAtLaunch = activity.getIntent().getStringExtra("iris_26983_settings_requested_id");
+-            final String physicalId = Objects.equals(selected, requestedAtLaunch)
+-                    ? activity.getIntent().getStringExtra("iris_26983_settings_physical_id") : null;
++            final boolean haveSelected = selected != null && !selected.trim().isEmpty();
++            final String physicalId = iris26984LegacyPhysical(selected);
+             final String modeId = physicalId == null || physicalId.isEmpty() ? selected : physicalId;
+             final CameraMode cameraMode = CameraMode.valueOf(
+                     sCameraMode == -1 ? PreferenceKeys.getCameraModeOrdinal() : sCameraMode);
+-            final boolean visible = modeId != null && !modeId.trim().isEmpty()
++            final boolean visible = haveSelected
+                     && (cameraMode == CameraMode.MOTION || cameraMode == CameraMode.NIGHT)
+                     && !PreferenceKeys.isIrisSuperResOn()
+                     && Iris26856ABSettings.read(mContext, modeId, selected) == Iris26856ABSettings.Mode.BJZHOU_26972C;
+-            final boolean havePhysical = physicalId != null && !physicalId.trim().isEmpty();
+-            if (havePhysical && !physicalId.equals(iris26983BoundPhysical))
+-                Iris26982CSharpenSettings.migrateLegacyRoute(mContext, requestedAtLaunch, physicalId);
++            final boolean rebind = haveSelected && (!Objects.equals(selected, iris26984BoundSelected)
++                    || !Objects.equals(physicalId, iris26983BoundPhysical));
+             for (int band=0; band<3; band++) {
+                 final UniversalSeekBarPreference preference = findPreference(Iris26982CSharpenSettings.uiKey(band));
+                 if (preference == null) continue;
+-                // Bind once to the actual camera route captured when entering Settings; never to a composite ID.
+-                if (havePhysical && !physicalId.equals(iris26983BoundPhysical)) {
+-                    preference.setPreferenceDataStore(Iris26982CSharpenSettings.forBand(
+-                            mContext, physicalId, band, () -> preference.setRuntimeMaxValue(2f)));
+-                    preference.setRuntimeMaxValue(2f); // no writes on view rebind
++                if (rebind) {
++                    preference.setPreferenceDataStore(Iris26982CSharpenSettings.forSelectedLens(
++                            mContext, selected, physicalId, band, () -> preference.setRuntimeMaxValue(2f)));
++                    preference.setRuntimeMaxValue(2f);
+                 }
+-                preference.setEnabled(havePhysical);
+-                preference.setSummary(havePhysical ? "" : "Reopen settings after the physical lens is ready");
++                preference.setEnabled(haveSelected);
++                preference.setSummary((CharSequence) null);
+                 preference.setVisible(visible);
+             }
+-            if (havePhysical) iris26983BoundPhysical = physicalId;
++            iris26984BoundSelected = selected;
++            iris26983BoundPhysical = physicalId;
+         }
+ 
+         private void setupPhotoPrefixPreference() {
+diff --git a/app/version.properties b/app/version.properties
+index 76d34ef96b67db02fe4aab1c047acab62f936621..73027e7924aa5b4e3d593aed2689abd45e2ab5f9 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726983
+-VERSION_BUILD=26983
++VERSION_NAME=0.9726984
++VERSION_BUILD=26984
