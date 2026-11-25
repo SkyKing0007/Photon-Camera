@@ -484,15 +484,7 @@ extern "C" JNIEXPORT jlong JNICALL Java_com_hinnka_mycamera_processor_Iris26985C
     lkrl::Solver solver(&gpu);   // creates all pipelines
     if (!solver.ok()) return -1;
   }
-  {   // learned prior: compile for the NPU now (app tile 512 -> 512 px at 1x, 1024 px at 2x)
-    char v[PROP_VALUE_MAX] = {0};
-    if (__system_property_get("debug.iris26985c.network", v) > 0 && v[0]) setenv("IRIS26985C_LKRL_PRIOR", v, 0);
-    if (lkrl::PriorEnabled()) {
-      std::string err;
-      for (int t : PrewarmTileEdges())
-        if (!lkrl::PriorPrewarm(t, t, &err)) { __android_log_print(ANDROID_LOG_WARN, "LkrLite", "prior prewarm %d: %s", t, err.c_str()); break; }
-    }
-  }
+  // C uses Vulkan cache prewarming only; no neural prior is loaded or warmed.
   return jlong(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
