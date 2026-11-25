@@ -213,7 +213,14 @@ Status Create(Context** out_ctx) {
   VkPhysicalDeviceProperties2 props2{};
   props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
   props2.pNext = &subgroup;
-  vkGetPhysicalDeviceProperties2(chosen, &props2);
+  // Android API 26 exports Vulkan 1.0 loader symbols only. Resolve the
+  // Vulkan 1.1 core entry point at runtime, keeping the 1.0 diagnostic fallback.
+  vkGetPhysicalDeviceProperties(chosen, &props2.properties);
+  if (props2.properties.apiVersion >= VK_API_VERSION_1_1) {
+    const auto get_properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+        vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties2"));
+    if (get_properties2 != nullptr) get_properties2(chosen, &props2);
+  }
 
   auto* ctx = new Context();
   ctx->instance = instance;
