@@ -1,0 +1,279 @@
+diff --git a/app/src/main/assets/shaders/iris26983/con_fused_final_p3_gain.frag b/app/src/main/assets/shaders/iris26983/con_fused_final_p3_gain.frag
+index 85745d409a647bd04ef1ee5558c77ce904e712c1..38ebeff2871cc63258156bbfe5dedaf92ce3c5e9 100644
+--- a/app/src/main/assets/shaders/iris26983/con_fused_final_p3_gain.frag
++++ b/app/src/main/assets/shaders/iris26983/con_fused_final_p3_gain.frag
+@@ -121,9 +121,23 @@ vec3 irisBCorrectOne2x(ivec2 p){
+         atomicAdd(irisBInvalidCount,1u);
+         return vec3(0.0);
+     }
+-    // RawLens 2.4.20 already owns native highlight reconstruction and JPEG cleanup.
+-    // Keep physical clip / guide validation; never replace 2x chroma with 1x guide.
+-    return physical.rgb;
++    // Restore the proven 2.3.94 physical-clip guard. Ratios are in reference-linear
++    // WB space; extended HDR values remain extended, with no unit-white clamp.
++    float mask=max(clamp(guide.a,0.0,1.0),physical.a);
++    if(!(mask>0.0))return physical.rgb;
++    vec3 srcWb=physical.rgb*uBWhiteBalance;
++    vec3 guideWb=guide.rgb*uBWhiteBalance;
++    float ySrc=dot(srcWb,vec3(0.25,0.50,0.25));
++    float yGuide=dot(guideWb,vec3(0.25,0.50,0.25));
++    float ys=max(ySrc,uBYFloor),yg=max(yGuide,uBYFloor);
++    vec2 cSrc=vec2(srcWb.r-srcWb.g,srcWb.b-srcWb.g)/ys;
++    vec2 cGuide=vec2(guideWb.r-guideWb.g,guideWb.b-guideWb.g)/yg;
++    vec2 c=mix(cSrc,cGuide,mask);
++    vec2 rgBg=c*ys;
++    float g=ySrc-0.25*(rgBg.x+rgBg.y);
++    vec3 fixedRgb=max(vec3(g+rgBg.x,g,g+rgBg.y)/uBWhiteBalance,vec3(0.0));
++    if(!irisBFinite3(fixedRgb))atomicAdd(irisBInvalidCount,1u);
++    return irisBHalfRound(fixedRgb);
+ }
+ vec3 irisBSampleCorrectedBilinear(vec2 pos){
+     vec2 f=clamp(pos,vec2(0.0),vec2(uBTrueSize)-vec2(1.0));
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnGpuMerge.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnGpuMerge.kt
+index 2b78ba6413e7ed909a5d01184f3fb2b83f047dbf..06d473c01beeb479174aa9fa651fe5339cbc5ccd 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnGpuMerge.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnGpuMerge.kt
+@@ -7,6 +7,7 @@ import android.opengl.GLES30
+ import android.opengl.GLES31
+ import com.hinnka.mycamera.utils.PLog
+ import com.particlesdevs.photoncamera.processing.processor.Iris26983COnRgba16fCarrier
++import com.particlesdevs.photoncamera.processing.render.Parameters
+ import java.nio.ByteBuffer
+ import java.nio.ByteOrder
+ 
+@@ -91,7 +92,8 @@ internal class GlesIris26983COnGpuMerge(
+     fun run(frames: List<RawStackFrame>, referenceFrameNumber: Long, referenceTimestamp: Long,
+             referenceBlack: FloatArray, sensorWhite: Int,
+             color: GlesIris26983COnColorContract.Snapshot,
+-            alternativeHighlight: Boolean, previewP995: Float, linearOutput: Iris26985CLinearOutput): Result {
++            alternativeHighlight: Boolean, previewP995: Float, linearOutput: Iris26985CLinearOutput,
++            parameters: Parameters): Result {
+         check(!used); used=true
+         val context=EGL14.eglGetCurrentContext()
+         check(context != EGL14.EGL_NO_CONTEXT) { "26983 C ON requires current GLES processing context" }
+@@ -126,9 +128,13 @@ internal class GlesIris26983COnGpuMerge(
+             }
+             GlesGpuScheduler.memoryBarrier()
+             checkGlError("26983 C ON native LKR 50MP RGB + sensor clip")
+-            // 2.4.20 owns directional/chroma and highlight cleanup. Lens shading was applied
+-            // once in the shared float result; never repeat the historical Lab/median path.
+-            val sensorRgb=nativeRgb
++            // The latest donor median/defringe already ran in the striped RGB32F callback.
++            // The independent proven RAWR Lab and post-Lab neutral veto were not superseded.
++            // Native RGB has been freed and the DNG is already published: JPEG-only correction.
++            val jpegColor=linearOutput.refreshJpegColor(parameters)
++            val correctionStart=System.nanoTime()
++            val sensorRgb=renderCOnPostLkr(nativeRgb,nativeClip,jpegColor,outputW,outputH)
++            PLog.i("Iris26983COnGpu","IRIS_26987_C_ON_RESTORE_PROTECTIONS donorMedian=2.4.20 purpleDefringe=1.0 rawrLab=true smoothWhite=true clipGuide=true repeatedMedian=false dngUnchanged=true ms=${(System.nanoTime()-correctionStart)/1_000_000L}")
+             val guideRgb=createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+             val guideClip=createTexture(width,height,GLES30.GL_R16F,GLES30.GL_NEAREST)
+             val p=linkProgram(iris26876DerivedGuideShader,"iris_26983_con_2x_derived_1x_guide")
+@@ -220,11 +226,14 @@ internal class GlesIris26983COnGpuMerge(
+         }
+     }
+ 
+-    /** Active LKR-only branch of renderRawrBPostAmaze26856, no legacy FCC or second denoise. */
++    /** Preserve the proven independent Lab + post-Lab veto in reference-linear units.
++     * Input has the latest donor median, purple defringe and HDR-scaled white window.
++     * Lab uses matched HAL WB and CCM; inverse WB restores the original sensor basis.
++     * No second median, no LSC, no unit-white clamp, no DNG mutation. */
+     private fun renderCOnPostLkr(input: Int, nativeClip: Int, snapshot: GlesIris26983COnColorContract.Snapshot,
+                                  w: Int,h: Int): Int {
+         check(input in textures && nativeClip in textures && w==width*2 && h==height*2)
+-        var temporary=0; var median=0; var lab=0; var neutral=0; var succeeded=false
++        var temporary=0; var lab=0
+         try {
+             val applyProgram=linkProgram(GlesIris26983COnColorContract.applyAmazeWbForLabFcc,
+                 "iris_26983_con_temporary_wb_no_extra_noise")
+@@ -237,26 +246,23 @@ internal class GlesIris26983COnGpuMerge(
+             draw(applyProgram,w,h,intArrayOf(temporary))
+             GlesGpuScheduler.memoryBarrier()
+             checkGlError("26983 C ON temporary WB for Lab")
+-            median=renderIris26932LkrMedian(temporary,w,h,nativeClip,gains)
+-            lab=renderRawrLabDefringe26856(median,snapshot.postWbCameraToSrgb,1f,w,h)
++            lab=renderRawrLabDefringe26856(temporary,snapshot.postWbCameraToSrgb,1f,w,h)
+             val program=linkProgram(GlesIris26983COnSmoothWhite.shader,"iris_26983_con_post_lab_neutral_reconciliation")
+-            neutral=createTexture(w,h,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
++            // Reuse the now-unread original target. Both samples are separate live textures.
++            check(input!=temporary && input!=lab && temporary!=lab)
+             GLES30.glUseProgram(program)
+             bindTexture(program,"uWbRgb",0,lab)
+-            bindTexture(program,"uPreLabWbRgb",1,median)
++            bindTexture(program,"uPreLabWbRgb",1,temporary)
+             uniform2i(program,"uSize",w,h)
+             val inverse=snapshot.inverseWhiteBalance
+             GLES30.glUniform3f(GLES30.glGetUniformLocation(program,"uInverseAmazeWb"),inverse[0],inverse[1],inverse[2])
+-            draw(program,w,h,intArrayOf(neutral))
++            draw(program,w,h,intArrayOf(input))
+             GlesGpuScheduler.memoryBarrier()
+-            checkGlError("26983 C ON Lab inverse-WB camera RGB")
+-            succeeded=true
+-            return neutral
++            checkGlError("26987 C ON Lab inverse-WB extended camera RGB")
++            return input
+         } finally {
+             if(temporary!=0) releaseOwnedTexture(temporary,"26983 temporary WB")
+-            if(median!=0) releaseOwnedTexture(median,"26983 median")
+             if(lab!=0) releaseOwnedTexture(lab,"26983 Lab")
+-            if(!succeeded && neutral!=0) releaseOwnedTexture(neutral,"26983 rejected neutral RGB")
+         }
+     }
+     private fun ensureIris26859BLensMapTexture() {
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnPipeline.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnPipeline.kt
+index a43d0eb6c71aa381180de40317b031a0fab28a88..f7b37ecfc31eb2c1b89ce772256a123de508ab28 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnPipeline.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnPipeline.kt
+@@ -65,7 +65,6 @@ object GlesIris26983COnPipeline {
+             }
+             return linearOutput.dngSaved
+         }
+-        val exactClipWb = calculationWhiteBalance26836(wb)
+         val lsc = parameters.gainMap?.copyOf()?.takeIf { values ->
+             val map = parameters.mapSize
+             map != null && map.x > 0 && map.y > 0 && values.size.toLong() == map.x.toLong()*map.y*4 &&
+@@ -82,7 +81,7 @@ object GlesIris26983COnPipeline {
+             MergeEgl.create().use {
+                 GlesIris26983COnGpuMerge(app,w,h,cfa,lsc,lscWidth,lscHeight).run(
+                     frozenFrames,referenceNumber,referenceTimestamp,referenceBlack.copyOf(),sensorWhite,color,
+-                    alternativeHighlight,previewP995,linearOutput
++                    alternativeHighlight,previewP995,linearOutput,parameters
+                 ).use { merge ->
+                     val prepared=GlesIris26983COnGuidePublication.prepare(merge,w,h)
+                     carriers=prepared
+@@ -92,6 +91,9 @@ object GlesIris26983COnPipeline {
+                 }
+             }
+             check(EGL14.eglGetCurrentContext()==EGL14.EGL_NO_CONTEXT)
++            // The merge refreshed color calibration from the exact native reference.
++            val exactClipWb=calculationWhiteBalance26836(parameters.motionV2ColorGains)
++            val exactExif=linearOutput.referenceExif(exif)
+             val prepared=checkNotNull(carriers)
+             val packed=checkNotNull(true2x)
+             check(packed.width==Math.multiplyExact(w,2) && packed.height==Math.multiplyExact(h,2) &&
+@@ -114,9 +116,9 @@ object GlesIris26983COnPipeline {
+                 }
+                 bitmap=preview
+                 check(!preview.isRecycled)
+-                saved=if(heic) ImageSaver.Util.saveC26983SuperResGpuHeic(output,preview,98,exif,packed,
++                saved=if(heic) ImageSaver.Util.saveC26983SuperResGpuHeic(output,preview,98,exactExif,packed,
+                     prepared.final1x,parameters,post.cropSize,tone,watermark,exactClipWb,clipYFloor)
+-                else ImageSaver.Util.saveC26983SuperResGpuJpeg(output,preview,98,exif,packed,
++                else ImageSaver.Util.saveC26983SuperResGpuJpeg(output,preview,98,exactExif,packed,
+                     prepared.final1x,parameters,post.cropSize,tone,watermark,exactClipWb,clipYFloor)
+                 check(saved) { "26983 C ON private publication failed; no 1x fallback" }
+             } finally {
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/Iris26985CLinearOutput.kt b/app/src/main/java/com/hinnka/mycamera/processor/Iris26985CLinearOutput.kt
+index e63544c97edbc01dca170aea7388d9cc25db77c9..410ec401101ad8a578f2b9636d7da50354ce18c6 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/Iris26985CLinearOutput.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/Iris26985CLinearOutput.kt
+@@ -11,6 +11,8 @@ import android.os.Build
+ import android.provider.MediaStore
+ import com.hinnka.mycamera.processor.experimentc.lkr2420.*
+ import com.particlesdevs.photoncamera.processing.MotionBatch
++import com.particlesdevs.photoncamera.processing.render.Parameters
++import com.particlesdevs.photoncamera.api.ParseExif
+ import com.particlesdevs.photoncamera.util.SimpleStorageHelper
+ import java.nio.ByteBuffer
+ import java.nio.ByteOrder
+@@ -25,6 +27,7 @@ class Iris26985CLinearOutput internal constructor(
+     var dngSaved=false
+         private set
+     private var consumed=false
++    private var referenceTimestamp:Long?=null
+     private val physical= requireNotNull(batch.iris26524OwnerCameraId)
+     private fun capture(ts:Long):CaptureResult {
+         val frame=batch.frames.single { it.timestamp==ts }
+@@ -60,6 +63,24 @@ class Iris26985CLinearOutput internal constructor(
+         // RawLens LkrMerge uses unity when neutral metadata is unavailable.
+         return floatArrayOf(1f,1f,1f)
+     }
++    /** Use the same exact reference for the existing Iris JPEG calibration and Lab.
++     * No color conversion is performed on the DNG buffer by this function. */
++    internal fun refreshJpegColor(parameters:Parameters):GlesIris26983COnColorContract.Snapshot {
++        val ts=checkNotNull(referenceTimestamp)
++        val result=capture(ts)
++        parameters.recalculateCOnColor26987(characteristics,result)
++        val snapshot=GlesIris26983COnColorContract.freeze(parameters.motionV2ColorGains,
++            parameters.motionV2ColorTransform,parameters.motionV2DirectColorValid)
++        com.particlesdevs.photoncamera.util.Log.i("Iris26987CColor", "IRIS_26987_C_ON_EXACT_REFERENCE ts=$ts physical=$physical donorWb=${referenceWb(ts).contentToString()} labWb=${snapshot.amazeWhiteBalance.contentToString()} neutral=${parameters.whitePoint.contentToString()}")
++        return snapshot
++    }
++    internal fun referenceExif(original:ParseExif.ExifData):ParseExif.ExifData {
++        val ref=ParseExif.parse(capture(checkNotNull(referenceTimestamp)),batch.referenceRequest)
++        // Preserve the capture transaction's timestamp and existing EXIF policy.
++        ref.DATETIME=original.DATETIME
++        ref.IMAGE_DESCRIPTION=null
++        return ref
++    }
+     private fun matrix(t:ColorSpaceTransform?):ImmutableDoubleValues?=t?.let { m ->
+         ImmutableDoubleValues(DoubleArray(9){m.getElement(it/3,it%3).toDouble()})
+     }
+@@ -67,6 +88,8 @@ class Iris26985CLinearOutput internal constructor(
+         check(!consumed);consumed=true
+         val result=capture(ts)
+         val f=batch.frames.single{it.timestamp==ts}
++        check(f.iris26985CBracketEv==0f) { "26987 non-zero EV reconstruction reference" }
++        referenceTimestamp=ts
+         val pixels=rgb.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
+         require(pixels.capacity()>=Math.multiplyExact(Math.multiplyExact(w,h),3))
+         val shading=result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/Iris26983COnBatchPublication.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/Iris26983COnBatchPublication.java
+index 5739faba1fe823e7021a92cf3d42d2674d93400a..d1a6b8a6c5305225e29347645c6c3b22cd958665 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/Iris26983COnBatchPublication.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/Iris26983COnBatchPublication.java
+@@ -4,7 +4,6 @@ import android.content.Context;
+ import android.hardware.camera2.CameraCharacteristics;
+ import com.hinnka.mycamera.processor.GlesIris26983COnMotionIngress;
+ import com.hinnka.mycamera.processor.Iris26985CLinearOutput;
+-import com.particlesdevs.photoncamera.api.Camera2ApiAutoFix;
+ import com.particlesdevs.photoncamera.api.ParseExif;
+ import com.particlesdevs.photoncamera.processing.ImageFrame;
+ import com.particlesdevs.photoncamera.processing.ImagePath;
+@@ -38,7 +37,8 @@ public final class Iris26983COnBatchPublication {
+             dng=rawSaver>=1?java.nio.file.Paths.get(candidate+".dng"):null;
+             jpeg=rawSaver!=2?java.nio.file.Paths.get(candidate+".jpg"):null;
+             ParseExif.ExifData exif=ParseExif.parse(batch.referenceResult,batch.referenceRequest);
+-            Camera2ApiAutoFix.ApplyRes(batch.referenceResult);
++            // C ON consumes the original capture-owned metadata. ApplyRes rewrites the
++            // live global CaptureResult, not this immutable reference; do not call it here.
+             exif.IMAGE_DESCRIPTION=null;
+             Iris26983COnCapturePreparation.Prepared prepared=Iris26983COnCapturePreparation.prepare(characteristics,batch);
+             if(prepared.referenceTimestamp!=reference)throw new IllegalStateException("26985 reference changed");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index 7cd45879a8cea605b579655e9f086ab5544a60be..0d702a62dbfa05916d2c414143c68ce9719ac891 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -813,7 +813,21 @@ public class Parameters {
+     public float[] customNeutral;
+ 
+     public void ReCalcColor(boolean customNeutr, CaptureResult result) {
+-        CameraCharacteristics characteristics = CaptureController.mCameraCharacteristics;
++        ReCalcColor(customNeutr, result, CaptureController.mCameraCharacteristics);
++    }
++
++    /** C ON only: color calibration must use the capture-owned physical camera and
++     * exact zero-EV LKR reconstruction reference, not a live Camera2 result. */
++    public void recalculateCOnColor26987(CameraCharacteristics characteristics, CaptureResult result) {
++        if (!iris26983COnSelected || iris26906ExperimentBSelected || !motionV2Active ||
++                irisNightActive || !motionV2SuperResOutputEnabled || characteristics == null || result == null)
++            throw new IllegalStateException("26987 foreign C ON color reference");
++        ReCalcColor(false, result, characteristics);
++        if (!motionV2DirectColorValid)
++            throw new IllegalStateException("26987 exact C ON color calibration unavailable");
++    }
++
++    private void ReCalcColor(boolean customNeutr, CaptureResult result, CameraCharacteristics characteristics) {
+ 
+         /*
+          * IRIS_26418_MOTION_V2_DIRECT_HAL_COLOR_METADATA
+diff --git a/app/version.properties b/app/version.properties
+index fe8f17705b62b01f703729bd13153726c57dd851..0d705c535564f7fd1dc45eb7431aee8b92d20f22 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726986
+-VERSION_BUILD=26986
++VERSION_NAME=0.9726987
++VERSION_BUILD=26987
