@@ -1,0 +1,1 @@
+26986 C-only candidate. Upload stage 1, then stage 2 workflow, then stage 3 trigger. 26985 V2 actual runtime authority. Real shader, NDK, Android Kotlin/Java, assemble and artifact publication remain mandatory Actions gates. Device IQ, Lightroom, full capture speed not proven.
