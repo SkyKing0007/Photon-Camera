@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+package com.hinnka.mycamera.processor.experimentc.lkr2420
+
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+
+/**
+ * UNIVERSAL HUB — permanent shared CPU worker pool. Never remove: HDR/HDR+
+ * pipelines and future code shard row/tile loops here via [forEachShard].
+ *
+ * Shared CPU worker pool: unpack, alignment, robustness, precision and
+ * accumulation are all row/tile-sharded here.
+ *
+ * Shards are contiguous index ranges run in order; every shard executes the
+ * same serial code as the single-threaded path, so sharding never changes a
+ * single floating-point operation or its order — output is bitwise-identical
+ * for any worker count. Callers keep their own buffers (disjoint writes,
+ * shared reads); the join provides the only needed visibility edge.
+ */
+internal object ShardWorkers {
+    /** Test override for the worker count (exact-output equivalence checks). */
+    @Volatile var overrideCount: Int? = null
+
+    val count: Int get() = overrideCount ?: defaultCount
+
+    private val defaultCount: Int by lazy {
+        // Shards are disjoint and order-free, so any worker count is
+        // bitwise-identical. Up-to-8-core devices resolve exactly as
+        // before; many-core desktops scale to 16 instead of idling half
+        // the die. Override with -Diris26985c.sr.workers.max=N when embedding.
+        val cap = System.getProperty("iris26985c.sr.workers.max")?.toIntOrNull()
+            ?.takeIf { it >= 1 } ?: 16
+        Runtime.getRuntime().availableProcessors().coerceIn(2, cap)
+    }
+
+    private val pool by lazy {
+        Executors.newFixedThreadPool(defaultCount) { task ->
+            Thread(task, "iris26985c-rawsr-worker").apply { isDaemon = true }
+        }
+    }
+
+    /**
+     * Runs [block] over the contiguous shard partition of [0, total).
+     * Inline when a single worker is selected. Failures join first: every
+     * submitted shard runs to completion, then the first failure is rethrown.
+     */
+    fun forEachShard(total: Int, block: (start: Int, endExclusive: Int) -> Unit) {
+        val workers = count.coerceIn(1, total.coerceAtLeast(1))
+        if (workers == 1) {
+            block(0, total)
+            return
+        }
+        val span = (total + workers - 1) / workers
+        val pending = ArrayList<Future<*>>(workers)
+        var start = 0
+        while (start < total) {
+            val end = minOf(start + span, total)
+            val s = start
+            val e = end
+            pending.add(pool.submit { block(s, e) })
+            start = end
+        }
+        var first: Throwable? = null
+        for (future in pending) {
+            try {
+                future.get()
+            } catch (thrown: Throwable) {
+                if (first == null) first = thrown.cause ?: thrown
+            }
+        }
+        if (first != null) throw first
+    }
+}
