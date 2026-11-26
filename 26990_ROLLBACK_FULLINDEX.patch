@@ -1,0 +1,297 @@
+diff --git a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp
+index 75fe45a96f37032357b62c79aed4428fbe0bd6ea..280e221384ad5bdb83751b914b2a26f120d44fcc 100644
+--- a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp
++++ b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp
+@@ -226,7 +226,7 @@ bool Solver::solveEnd(PendingPtr* pend, std::vector<float>* x_out, SolveStats* s
+   if (!fin_cpu && prm.fallback_chroma <= 0.0f) {
+     LiteSolver::FinishArgs fa{{prm.wb[0], prm.wb[1], prm.wb[2]}, prm.clip, prm.grain, prm.equalize_strength,
+                               prm.notch, prm.highlight_desat, {prm.hl_ratio[0], prm.hl_ratio[1], prm.hl_ratio[2]},
+-                              false, 0 /* C: 2.3.94 highlight rule; no rim reconstruction */};
++                              !(std::getenv("IRIS26985C_LKRL_HL_REC") && std::getenv("IRIS26985C_LKRL_HL_REC")[0] == '0'), 2 * prm.s};
+     std::string ferr;
+     fin_done = lite_.finish(z.data(), x_out, H, W, fa, T.nscale.empty() ? nullptr : &T.nscale, &ferr);
+     if (!fin_done) std::fprintf(stderr, "lkr-lite: gpu finish failed (%s), CPU path\n", ferr.c_str());
+diff --git a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp
+index 6c37b60450598330a233dfe9b3de6c4002c30339..0c0937fb47fb1e670b8664a23a2b8b137cb0856d 100644
+--- a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp
++++ b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp
+@@ -241,17 +241,101 @@ void FinishLook(const float* z, float* x, int H, int W, const SolveParams& prm,
+       }
+     }
+   }
+-  // Iris C trial: restore RawLens 2.3.94 highlight rule only.
+-  // Neutralise only pixels with no remaining unsaturated colour channel.
+-  // One-channel clipping is common in sunsets: the other channels still
+-  // contain valid colour. Do not expand this mask into coloured neighbours.
++  // Blown highlights go white (user 2026-11-19). Once ANY channel clips, its true value is unknown
++  // (>= clip), so the remaining channels' ratio is false colour: a sun glow with only green clipped
++  // turned pink after white balance (IMG_20260928_185731_891), and a merge of frames clipping in
++  // different channels turned yellow. Strength follows the brightest raw channel (smoothstep from
++  // 0.85 clip to clip: a soft edge, the sensor clip level is not noise), target = neutral at the pixel's
++  // wb-space luma, so brightness is kept. (Before: only pixels with ALL channels near clip;
++  // LKRL_HL_OLD=1 restores that.)
++  // Highlight reconstruction (2026-11-20, inpaint opposed; user: Samsung hdrplus clouds came out flat
++  // white although only green was clipped -- red kept the whole cloud texture). Each channel near its
++  // clip (same soft edge as below) moves towards max(itself, ratio_c x mean of the other two in wb space),
++  // so the cloud keeps the shape the unclipped channels recorded and the colour of its unclipped edge.
++  // Output can exceed the clip; the white rule below then only acts where ALL channels clip.
++  static const bool hl_rec_off = std::getenv("IRIS26985C_LKRL_HL_REC") && std::getenv("IRIS26985C_LKRL_HL_REC")[0] == '0';
++  const bool hl_rec = prm.highlight_desat && !hl_rec_off && !std::getenv("IRIS26985C_LKRL_HL_OLD");
++  // Dilated per-channel clip (fin.comp mode 7): bright pixels count a channel clipped when it clips within
++  // 2 s px (the merge leaves too-low values inside a channel's clipped area -> dark specks once rebuilt).
++  std::vector<float> xd;
++  if (hl_rec) {
++    const float lo = 0.85f * prm.clip;
++    const int r = 2 * prm.s;
++    xd.assign(x, x + 3 * HW);
++    for (int Y = 0; Y < H; ++Y)
++      for (int X = 0; X < W; ++X) {
++        const size_t i = size_t(Y) * W + X;
++        if (std::max(x[i], std::max(x[HW + i], x[2 * HW + i])) <= lo) continue;
++        for (int dy = -r; dy <= r; ++dy)
++          for (int dx = -r; dx <= r; ++dx) {
++            const size_t j = size_t(std::clamp(Y + dy, 0, H - 1)) * W + size_t(std::clamp(X + dx, 0, W - 1));
++            for (int c = 0; c < 3; ++c) xd[c * HW + i] = std::max(xd[c * HW + i], x[c * HW + j]);
++          }
++      }
++  }
++  if (hl_rec) {
++    const float lo = 0.85f * prm.clip, hi = prm.clip;
++    for (size_t i = 0; i < HW; ++i) {
++      const float v[3] = {x[i], x[HW + i], x[2 * HW + i]};
++      if (std::max(v[0], std::max(v[1], v[2])) <= lo) continue;
++      float m[3], u[3];   // clipped share; scene level each channel implies (wb space / rim colour)
++      for (int c = 0; c < 3; ++c) {
++        const float t = std::clamp((xd[c * HW + i] - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f);
++        m[c] = t * t * (3.0f - 2.0f * t);
++        u[c] = v[c] * prm.wb[c] / prm.hl_ratio[c];
++      }
++      for (int c = 0; c < 3; ++c) {
++        if (m[c] <= 0.0f) continue;
++        // From the other channels, each weighted by how unclipped it is (a clipped one reads low).
++        const int a = (c + 1) % 3, b = (c + 2) % 3;
++        const float wa = 1.0f - m[a], wbb = 1.0f - m[b];
++        if (wa + wbb <= 1e-3f) continue;   // all clipped: the white rule below
++        const float rec = prm.hl_ratio[c] * (wa * u[a] + wbb * u[b]) / (wa + wbb) / prm.wb[c];
++        x[c * HW + i] = v[c] + m[c] * (std::max(v[c], rec) - v[c]);
++      }
++      // Colour from the rim, brightness from the reconstruction: where neighbouring pixels clip in
++      // different channels (perforated metal near Nyquist, 133623) each was rebuilt from another
++      // channel -> colour speckle. Keep the rebuilt level U (mean implied level), rim colour, by the
++      // largest clipped share.
++      const float mm = std::max(m[0], std::max(m[1], m[2]));
++      if (mm > 0.0f) {
++        float U = 0.0f;
++        for (int c = 0; c < 3; ++c) U += x[c * HW + i] * prm.wb[c] / prm.hl_ratio[c];
++        U *= 1.0f / 3.0f;
++        for (int c = 0; c < 3; ++c) x[c * HW + i] += mm * (U * prm.hl_ratio[c] / prm.wb[c] - x[c * HW + i]);
++      }
++    }
++  }
+   if (prm.highlight_desat) {
+-    const float lo = 0.92f * prm.clip, hi = prm.clip;
++    static const bool hl_old = std::getenv("IRIS26985C_LKRL_HL_OLD") != nullptr;
++    const float lo = (hl_old ? 0.92f : 0.85f) * prm.clip, hi = prm.clip;
++    // HDR (prm.clip > 1, reference units): the output white is the HDR clip, not 1, so white is capped
++    // there; a cap at 1 dragged every highlight above the 0 EV frame's clip down (synthetic bracket 1.5-3x
++    // clip read 0.88 of the reachable level). Normal merges (clip <= 1) are unchanged.
++    const float wmin = std::min(prm.wb[0], std::min(prm.wb[1], prm.wb[2])) * std::max(1.0f, prm.clip);
+     for (size_t i = 0; i < HW; ++i) {
+-      const float mn = std::min(x[i], std::min(x[HW + i], x[2 * HW + i]));
+-      const float m = std::clamp((mn - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f);
++      // With reconstruction: white only where every channel clipped (min channel); else the old rules.
++      float d[3] = {x[i], x[HW + i], x[2 * HW + i]};
++      if (hl_rec && std::max(d[0], std::max(d[1], d[2])) > 0.85f * prm.clip)
++        for (int c = 0; c < 3; ++c) d[c] = std::max(d[c], xd[c * HW + i]);
++      const float v = (hl_old || hl_rec) ? std::min(d[0], std::min(d[1], d[2]))
++                                         : std::max(x[i], std::max(x[HW + i], x[2 * HW + i]));
++      float m = std::clamp((v - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f);
++      if (!hl_old) m = m * m * (3.0f - 2.0f * m);
+       if (m <= 0.0f) continue;
+-      const float L = q[0] * x[i] + q[1] * x[HW + i] + q[2] * x[2 * HW + i];   // wb-space luma
++      float L = q[0] * x[i] + q[1] * x[HW + i] + q[2] * x[2 * HW + i];   // wb-space luma
++      // The output is stored clamped to [0, 1] per camera channel (16-bit DNG): a neutral brighter than
++      // min(wb) would get its least-gained channel (G) cut back and turn pink again, so white is capped there.
++      if (!hl_old && !hl_rec) L = std::min(L, wmin);
++      if (hl_rec) {
++        // Every channel clipped: the scene is at least as bright as the most-gained channel implies
++        // (max over c of v_c wb_c / col_c), the level the reconstructed surroundings reach; at the clip
++        // level it read as dark specks inside cloud cores. Rim colour, as the reconstruction.
++        float U = 0.0f;
++        for (int c = 0; c < 3; ++c) U = std::max(U, d[c] * prm.wb[c] / prm.hl_ratio[c]);
++        for (int c = 0; c < 3; ++c) x[c * HW + i] += m * (U * prm.hl_ratio[c] / prm.wb[c] - x[c * HW + i]);
++        continue;
++      }
+       for (int c = 0; c < 3; ++c) {
+         const float neutral = L / prm.wb[c];
+         x[c * HW + i] += m * (neutral - x[c * HW + i]);
+diff --git a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp
+index 23a1d8c4296bde8c7b15524a026671bca7edc78e..504973adf09822b1d49c37938f00b34a22af5680 100644
+--- a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp
++++ b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp
+@@ -243,6 +243,8 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+   // the robust threshold too lenient and smeared a moving car).
+   // Runs beside the coarse alignment below, which does not use it.
+   double t = now_ms();
++  float hl_ratio[3] = {1.0f, 1.0f, 1.0f};
++  size_t hl_cells = 0;
+   std::thread noise_fit([&] {
+     const double tn = now_ms();
+     std::vector<float> c(size_t(g.w) * g.h);
+@@ -261,6 +263,28 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+     // every robust / temporal test reject all frames. Fall back to the
+     // level-independent MAD sigma as read noise.
+     if (S.a <= 0 && S.b < 0.25f * S.sigma * S.sigma) S.b = S.sigma * S.sigma;
++    // Highlight reconstruction colour (SolveParams::hl_ratio): white-balanced rim colour (G = 1), summed over the reference's 2x2 cells in the soft-clip band (brightest channel in
++    // [0.85 clip, clip), every channel unclipped) -- the unclipped rim of clipped areas, the same band
++    // the reconstruction blends over. Sums = brightness-weighted, so the bright rim dominates.
++    {
++      const float clip = prm.solve.clip, lo = 0.85f * clip;
++      double sc[3] = {0, 0, 0}, so[3] = {0, 0, 0};
++      size_t nb = 0;
++      for (int y = 0; y + 1 < g.h; y += 2)
++        for (int x = 0; x + 1 < g.w; x += 2) {
++          const float* r0 = c.data() + size_t(y) * g.w + x;
++          const float v[3] = {r0[0], 0.5f * (r0[1] + r0[g.w]), r0[g.w + 1]};
++          const float mx = std::max(v[0], std::max(r0[1], std::max(r0[g.w], v[2])));
++          if (mx < lo || mx >= clip) continue;
++          const float vw[3] = {v[0] * wb[0], v[1] * wb[1], v[2] * wb[2]};
++          for (int k = 0; k < 3; ++k) { sc[k] += vw[k]; so[k] += 0.5 * (vw[(k + 1) % 3] + vw[(k + 2) % 3]); }
++          ++nb;
++        }
++      // Rim colour normalised to green (wb space); a clipped channel is rebuilt from the unclipped ones.
++      for (int k = 0; k < 3; ++k) hl_ratio[k] = (nb >= 64 && sc[1] > 0) ? float(std::clamp(sc[k] / sc[1], 0.25, 4.0)) : 1.0f;
++      (void)so;
++      hl_cells = nb;
++    }
+     S.ms_noise = now_ms() - tn;
+   });
+ 
+@@ -395,6 +419,10 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+   sp.sigma_max = prm.smax_x * S.sigma;
+   sp.sigma_end = prm.end_x * S.sigma;
+   sp.wb = wb;
++  for (int k = 0; k < 3; ++k) sp.hl_ratio[k] = hl_ratio[k];
++  if (const char* v = std::getenv("IRIS26985C_LKRL_HL_LOG"))
++    if (v[0] == '1') std::fprintf(stderr, "lkr-lite: highlight ratios R %.3f G %.3f B %.3f from %zu rim cells\n",
++                                  hl_ratio[0], hl_ratio[1], hl_ratio[2], hl_cells);
+   if (prm.paper_parity) {
+     sp.prior_gain = 1.0f;
+     sp.grain = 0.0f;
+@@ -1044,8 +1072,21 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+       S.lfc_ms = float(now_ms() - tl); S.lfc_wu = ls.wu; S.lfc_wv = ls.wv;
+     }
+   }
+-  // C legacy highlight mode: retain the true bracket-derived hdr_white,
+-  // not a synthetic headroom extension from opposed-inpaint rim colours.
++  // Highlight reconstruction (FinishLook) can lift clipped channels above the output white (clouds whose
++  // green clipped: rebuilt from red / blue). Report the reached level as the white, as an HDR merge does,
++  // so writers scale instead of clamping one channel (a clamped green turns the cloud pink). 99.99th
++  // percentile of the values above the white: a lone ringing overshoot does not darken the whole file.
++  static const bool hl_rec_env_off = std::getenv("IRIS26985C_LKRL_HL_REC") && std::getenv("IRIS26985C_LKRL_HL_REC")[0] == '0';
++  if (prm.solve.highlight_desat && hl_cells >= 64 && !hl_rec_env_off && !std::getenv("IRIS26985C_LKRL_HL_OLD")) {
++    std::vector<float> over;
++    for (size_t i = 0, n3 = size_t(*out_w) * *out_h * 3; i < n3; ++i)
++      if (rgb_data[i] > S.hdr_white) over.push_back(rgb_data[i]);
++    if (over.size() >= 16) {
++      const size_t q = size_t(double(over.size() - 1) * 0.9999);
++      std::nth_element(over.begin(), over.begin() + q, over.end());
++      S.hdr_white = std::max(S.hdr_white, over[q]);
++    }
++  }
+   S.ms_total = now_ms() - t0;
+   if (st) *st = S;
+   return true;
+diff --git a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
+index c17e3bb4406243c6633b1baccfa8a005b98eb8e6..9bce93e9c69118736a04e2c9982a70fccceb6ac5 100644
+--- a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
++++ b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
+@@ -155,7 +155,10 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
+     else unsetenv("IRIS26985C_LKRL_SCHEDULE");
+     // Speed A/B (2026-11-20): debug.lkr.coarsethr = coarse alignment threads ("-" = default).
+     if (__system_property_get("debug.iris26985c.coarsethr", v) > 0 && v[0] && v[0] != '-') setenv("IRIS26985C_LKRL_COARSE_THR", v, 1);
+-    // C trial highlight policy is fixed locally, never set a process-global highlight switch.
++    // Blown-highlight neutralise A/B: debug.lkr.hlold=1 = the old all-channels-clipped rule (pink / yellow).
++    if (__system_property_get("debug.iris26985c.hlold", v) > 0 && v[0] == '1') setenv("IRIS26985C_LKRL_HL_OLD", "1", 0);
++    // Highlight reconstruction A/B: debug.lkr.hlrec = 0 off (read once per process).
++    if (__system_property_get("debug.iris26985c.hlrec", v) > 0 && v[0]) setenv("IRIS26985C_LKRL_HL_REC", v, 0);
+     // A/B of the DCT look: debug.lkr.fb = 0 no DCT pass; debug.lkr.prior = 1 / 0 forces shadow-luma denoise on / off.
+     if (__system_property_get("debug.iris26985c.fb", v) > 0 && v[0]) setenv("IRIS26985C_LKRL_FB", v, 0);
+     // A/B of the coarse LK iteration cap: debug.lkr.coarseit = 40 restores the old cap.
+@@ -292,7 +295,6 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
+   if (st.hdr_white > 1.0f) LKR_LOG("hdr: white %.3f (output level of the clip)", st.hdr_white);
+   if (!st.gpu_profile.empty())
+     LKR_LOG("gpu profile (sum of %d workers, ms): %s", st.workers, st.gpu_profile.c_str());
+-  LKR_LOG("highlight: 2.3.94 all-channels rule; opposed inpaint off; bracket HDR preserved");
+   LKR_LOG("mode: %s", dct ? "DCT x-step" : "no prior");
+   LKR_LOG("look: prior %.2f grain %.2f (sigma %.5f)", st.prior_gain, st.grain, st.sigma);
+   LKR_LOG("merge %dx%d s=%d K=%d tiles %d: noise %.0f coarse %.0f tiles %.0f (gpu %.0f prior %.0f) total %.0f ms",
+diff --git a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp
+index 5df4300c7657da9759b3d979adebff2cb43e7169..5923b8ef074b548ebba1e8df4871e1d6a6ff0ca0 100644
+--- a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp
++++ b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp
+@@ -1603,9 +1603,9 @@ bool LiteSolver::finish(const float* z, std::vector<float>* x, int H, int W, con
+   struct FinPush { int32_t H, W, mode, pl, sm, has_ns, notch, desat; float wbr, wbg, wbb, clip, grain, eqs, p0, p1;
+                    float hr, hg, hb, hrec; };
+   static_assert(sizeof(FinPush) == 80, "fin push");
+-  FinPush f{H, W, 0, 0, 0, hns ? 1 : 0, fa.notch ? 1 : 0, fa.desat ? 2 : 0 /* donor legacy all-channels rule */, fa.wb[0], fa.wb[1], fa.wb[2],
++  FinPush f{H, W, 0, 0, 0, hns ? 1 : 0, fa.notch ? 1 : 0, fa.desat ? (std::getenv("IRIS26985C_LKRL_HL_OLD") ? 2 : 1) : 0, fa.wb[0], fa.wb[1], fa.wb[2],
+             fa.clip, fa.grain, fa.eq_strength, float(fa.hl_radius), 0.0f, fa.hl_ratio[0], fa.hl_ratio[1], fa.hl_ratio[2],
+-            0.0f /* no opposed inpaint */};
++            fa.hl_rec ? 1.0f : 0.0f};
+   gpu_->resetSets();
+   VkDescriptorSet st = gpu_->set(fin_, {&bx, &bz, &bns, &bp, &bt, &bm, &bk});
+   const uint32_t gx = div_up(uint32_t(W), 16), gy = div_up(uint32_t(H), 16);
+@@ -1622,7 +1622,7 @@ bool LiteSolver::finish(const float* z, std::vector<float>* x, int H, int W, con
+   }
+   if (fa.grain > 0.0f || fa.notch) run(5);
+   if (fa.grain > 0.0f && fa.notch) notch(0);
+-  // C legacy highlight mode: never dispatch opposed-inpaint clipping dilation.
++  if (fa.desat && fa.hl_rec) run(7);   // highlight reconstruction: dilated per-channel clip (P1..P3)
+   run(6);
+   if (!gpu_->submit()) return fail("fin submit");
+   x->assign(bx.as<float>(), bx.as<float>() + 3 * HW);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26856ABSettings.java b/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26856ABSettings.java
+index 402dc8e2c23e9c892effcd4897c32990dff185e0..89ca09dbbe9bdebc6708fe5fada8d5b2be9536fa 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26856ABSettings.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26856ABSettings.java
+@@ -50,9 +50,9 @@ public final class Iris26856ABSettings {
+         if (preferences.contains(PREFIX + physical)) return resolvedStoredMode(preferences,PREFIX + physical);
+         if (logicalId != null && preferences.contains(PREFIX + logicalId))
+             return resolvedStoredMode(preferences,PREFIX + logicalId);
+-        // 26990: unset intent defaults to C. An explicit exit from C retains
+-        // the old per-lens A/B behavior (including B for other unset lenses).
+-        return preferences.contains(C_SESSION) ? Mode.AMAZE_26855 : Mode.BJZHOU_26972C;
++        // 26890: only UNSET per-lens intent defaults to B. Explicit A, B, AB,
++        // and invalid restored preference strings retain their existing behavior.
++        return Mode.AMAZE_26855;
+     }
+     private static Mode resolvedStoredMode(SharedPreferences preferences,String key) {
+         Mode saved=Mode.parse(preferences.getString(key,"A"));
+@@ -77,12 +77,10 @@ public final class Iris26856ABSettings {
+             // Synchronous persistence before the existing main-lens app restart.
+             if(!prefs.edit().putBoolean(C_SESSION,true).commit())
+                 throw new IllegalStateException("C selection not persisted");
+-        } else {
+-            // A/B must also explicitly leave the implicit default-C session.
+-            // Store the lens intent and exit atomically before any lens/app restart.
++        } else if(prefs.getBoolean(C_SESSION,false) || Mode.parse(prefs.getString(key,"A"))==Mode.BJZHOU_26972C) {
+             if(!prefs.edit().putBoolean(C_SESSION,false).putString(key,mode.id).commit())
+-                throw new IllegalStateException("A/B selection not persisted");
+-        }
++                throw new IllegalStateException("C exit selection not persisted");
++        } else prefs.edit().putString(key,mode.id).apply();
+     }
+     /** Includes logical and Camera2-advertised physical IDs. No zoom-value identity guesses. */
+     public static SortedSet<String> cameraIds(Context context) {
+diff --git a/app/version.properties b/app/version.properties
+index 69297df1809efdf3eabddaa3113bbb9ec4dbe4dd..9c0d3609a818e5a8dd1bf87ef78c46dc5ef0a693 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726990
+-VERSION_BUILD=26990
++VERSION_NAME=0.9726989
++VERSION_BUILD=26989
