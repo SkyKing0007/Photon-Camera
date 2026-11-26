@@ -1,0 +1,960 @@
+diff --git b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp
+index 280e221384ad5bdb83751b914b2a26f120d44fcc..75fe45a96f37032357b62c79aed4428fbe0bd6ea 100644
+--- b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp
++++ a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp
+@@ -226,7 +226,7 @@ bool Solver::solveEnd(PendingPtr* pend, std::vector<float>* x_out, SolveStats* s
+   if (!fin_cpu && prm.fallback_chroma <= 0.0f) {
+     LiteSolver::FinishArgs fa{{prm.wb[0], prm.wb[1], prm.wb[2]}, prm.clip, prm.grain, prm.equalize_strength,
+                               prm.notch, prm.highlight_desat, {prm.hl_ratio[0], prm.hl_ratio[1], prm.hl_ratio[2]},
+-                              !(std::getenv("IRIS26985C_LKRL_HL_REC") && std::getenv("IRIS26985C_LKRL_HL_REC")[0] == '0'), 2 * prm.s};
++                              false, 0 /* C: 2.3.94 highlight rule; no rim reconstruction */};
+     std::string ferr;
+     fin_done = lite_.finish(z.data(), x_out, H, W, fa, T.nscale.empty() ? nullptr : &T.nscale, &ferr);
+     if (!fin_done) std::fprintf(stderr, "lkr-lite: gpu finish failed (%s), CPU path\n", ferr.c_str());
+diff --git b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp
+index 0c0937fb47fb1e670b8664a23a2b8b137cb0856d..6c37b60450598330a233dfe9b3de6c4002c30339 100644
+--- b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp
++++ a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp
+@@ -241,101 +241,17 @@ void FinishLook(const float* z, float* x, int H, int W, const SolveParams& prm,
+       }
+     }
+   }
+-  // Blown highlights go white (user 2026-11-19). Once ANY channel clips, its true value is unknown
+-  // (>= clip), so the remaining channels' ratio is false colour: a sun glow with only green clipped
+-  // turned pink after white balance (IMG_20260928_185731_891), and a merge of frames clipping in
+-  // different channels turned yellow. Strength follows the brightest raw channel (smoothstep from
+-  // 0.85 clip to clip: a soft edge, the sensor clip level is not noise), target = neutral at the pixel's
+-  // wb-space luma, so brightness is kept. (Before: only pixels with ALL channels near clip;
+-  // LKRL_HL_OLD=1 restores that.)
+-  // Highlight reconstruction (2026-11-20, inpaint opposed; user: Samsung hdrplus clouds came out flat
+-  // white although only green was clipped -- red kept the whole cloud texture). Each channel near its
+-  // clip (same soft edge as below) moves towards max(itself, ratio_c x mean of the other two in wb space),
+-  // so the cloud keeps the shape the unclipped channels recorded and the colour of its unclipped edge.
+-  // Output can exceed the clip; the white rule below then only acts where ALL channels clip.
+-  static const bool hl_rec_off = std::getenv("IRIS26985C_LKRL_HL_REC") && std::getenv("IRIS26985C_LKRL_HL_REC")[0] == '0';
+-  const bool hl_rec = prm.highlight_desat && !hl_rec_off && !std::getenv("IRIS26985C_LKRL_HL_OLD");
+-  // Dilated per-channel clip (fin.comp mode 7): bright pixels count a channel clipped when it clips within
+-  // 2 s px (the merge leaves too-low values inside a channel's clipped area -> dark specks once rebuilt).
+-  std::vector<float> xd;
+-  if (hl_rec) {
+-    const float lo = 0.85f * prm.clip;
+-    const int r = 2 * prm.s;
+-    xd.assign(x, x + 3 * HW);
+-    for (int Y = 0; Y < H; ++Y)
+-      for (int X = 0; X < W; ++X) {
+-        const size_t i = size_t(Y) * W + X;
+-        if (std::max(x[i], std::max(x[HW + i], x[2 * HW + i])) <= lo) continue;
+-        for (int dy = -r; dy <= r; ++dy)
+-          for (int dx = -r; dx <= r; ++dx) {
+-            const size_t j = size_t(std::clamp(Y + dy, 0, H - 1)) * W + size_t(std::clamp(X + dx, 0, W - 1));
+-            for (int c = 0; c < 3; ++c) xd[c * HW + i] = std::max(xd[c * HW + i], x[c * HW + j]);
+-          }
+-      }
+-  }
+-  if (hl_rec) {
+-    const float lo = 0.85f * prm.clip, hi = prm.clip;
+-    for (size_t i = 0; i < HW; ++i) {
+-      const float v[3] = {x[i], x[HW + i], x[2 * HW + i]};
+-      if (std::max(v[0], std::max(v[1], v[2])) <= lo) continue;
+-      float m[3], u[3];   // clipped share; scene level each channel implies (wb space / rim colour)
+-      for (int c = 0; c < 3; ++c) {
+-        const float t = std::clamp((xd[c * HW + i] - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f);
+-        m[c] = t * t * (3.0f - 2.0f * t);
+-        u[c] = v[c] * prm.wb[c] / prm.hl_ratio[c];
+-      }
+-      for (int c = 0; c < 3; ++c) {
+-        if (m[c] <= 0.0f) continue;
+-        // From the other channels, each weighted by how unclipped it is (a clipped one reads low).
+-        const int a = (c + 1) % 3, b = (c + 2) % 3;
+-        const float wa = 1.0f - m[a], wbb = 1.0f - m[b];
+-        if (wa + wbb <= 1e-3f) continue;   // all clipped: the white rule below
+-        const float rec = prm.hl_ratio[c] * (wa * u[a] + wbb * u[b]) / (wa + wbb) / prm.wb[c];
+-        x[c * HW + i] = v[c] + m[c] * (std::max(v[c], rec) - v[c]);
+-      }
+-      // Colour from the rim, brightness from the reconstruction: where neighbouring pixels clip in
+-      // different channels (perforated metal near Nyquist, 133623) each was rebuilt from another
+-      // channel -> colour speckle. Keep the rebuilt level U (mean implied level), rim colour, by the
+-      // largest clipped share.
+-      const float mm = std::max(m[0], std::max(m[1], m[2]));
+-      if (mm > 0.0f) {
+-        float U = 0.0f;
+-        for (int c = 0; c < 3; ++c) U += x[c * HW + i] * prm.wb[c] / prm.hl_ratio[c];
+-        U *= 1.0f / 3.0f;
+-        for (int c = 0; c < 3; ++c) x[c * HW + i] += mm * (U * prm.hl_ratio[c] / prm.wb[c] - x[c * HW + i]);
+-      }
+-    }
+-  }
++  // Iris C trial: restore RawLens 2.3.94 highlight rule only.
++  // Neutralise only pixels with no remaining unsaturated colour channel.
++  // One-channel clipping is common in sunsets: the other channels still
++  // contain valid colour. Do not expand this mask into coloured neighbours.
+   if (prm.highlight_desat) {
+-    static const bool hl_old = std::getenv("IRIS26985C_LKRL_HL_OLD") != nullptr;
+-    const float lo = (hl_old ? 0.92f : 0.85f) * prm.clip, hi = prm.clip;
+-    // HDR (prm.clip > 1, reference units): the output white is the HDR clip, not 1, so white is capped
+-    // there; a cap at 1 dragged every highlight above the 0 EV frame's clip down (synthetic bracket 1.5-3x
+-    // clip read 0.88 of the reachable level). Normal merges (clip <= 1) are unchanged.
+-    const float wmin = std::min(prm.wb[0], std::min(prm.wb[1], prm.wb[2])) * std::max(1.0f, prm.clip);
++    const float lo = 0.92f * prm.clip, hi = prm.clip;
+     for (size_t i = 0; i < HW; ++i) {
+-      // With reconstruction: white only where every channel clipped (min channel); else the old rules.
+-      float d[3] = {x[i], x[HW + i], x[2 * HW + i]};
+-      if (hl_rec && std::max(d[0], std::max(d[1], d[2])) > 0.85f * prm.clip)
+-        for (int c = 0; c < 3; ++c) d[c] = std::max(d[c], xd[c * HW + i]);
+-      const float v = (hl_old || hl_rec) ? std::min(d[0], std::min(d[1], d[2]))
+-                                         : std::max(x[i], std::max(x[HW + i], x[2 * HW + i]));
+-      float m = std::clamp((v - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f);
+-      if (!hl_old) m = m * m * (3.0f - 2.0f * m);
++      const float mn = std::min(x[i], std::min(x[HW + i], x[2 * HW + i]));
++      const float m = std::clamp((mn - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f);
+       if (m <= 0.0f) continue;
+-      float L = q[0] * x[i] + q[1] * x[HW + i] + q[2] * x[2 * HW + i];   // wb-space luma
+-      // The output is stored clamped to [0, 1] per camera channel (16-bit DNG): a neutral brighter than
+-      // min(wb) would get its least-gained channel (G) cut back and turn pink again, so white is capped there.
+-      if (!hl_old && !hl_rec) L = std::min(L, wmin);
+-      if (hl_rec) {
+-        // Every channel clipped: the scene is at least as bright as the most-gained channel implies
+-        // (max over c of v_c wb_c / col_c), the level the reconstructed surroundings reach; at the clip
+-        // level it read as dark specks inside cloud cores. Rim colour, as the reconstruction.
+-        float U = 0.0f;
+-        for (int c = 0; c < 3; ++c) U = std::max(U, d[c] * prm.wb[c] / prm.hl_ratio[c]);
+-        for (int c = 0; c < 3; ++c) x[c * HW + i] += m * (U * prm.hl_ratio[c] / prm.wb[c] - x[c * HW + i]);
+-        continue;
+-      }
++      const float L = q[0] * x[i] + q[1] * x[HW + i] + q[2] * x[2 * HW + i];   // wb-space luma
+       for (int c = 0; c < 3; ++c) {
+         const float neutral = L / prm.wb[c];
+         x[c * HW + i] += m * (neutral - x[c * HW + i]);
+diff --git b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp
+index 504973adf09822b1d49c37938f00b34a22af5680..23a1d8c4296bde8c7b15524a026671bca7edc78e 100644
+--- b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp
++++ a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp
+@@ -243,8 +243,6 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+   // the robust threshold too lenient and smeared a moving car).
+   // Runs beside the coarse alignment below, which does not use it.
+   double t = now_ms();
+-  float hl_ratio[3] = {1.0f, 1.0f, 1.0f};
+-  size_t hl_cells = 0;
+   std::thread noise_fit([&] {
+     const double tn = now_ms();
+     std::vector<float> c(size_t(g.w) * g.h);
+@@ -263,28 +261,6 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+     // every robust / temporal test reject all frames. Fall back to the
+     // level-independent MAD sigma as read noise.
+     if (S.a <= 0 && S.b < 0.25f * S.sigma * S.sigma) S.b = S.sigma * S.sigma;
+-    // Highlight reconstruction colour (SolveParams::hl_ratio): white-balanced rim colour (G = 1), summed over the reference's 2x2 cells in the soft-clip band (brightest channel in
+-    // [0.85 clip, clip), every channel unclipped) -- the unclipped rim of clipped areas, the same band
+-    // the reconstruction blends over. Sums = brightness-weighted, so the bright rim dominates.
+-    {
+-      const float clip = prm.solve.clip, lo = 0.85f * clip;
+-      double sc[3] = {0, 0, 0}, so[3] = {0, 0, 0};
+-      size_t nb = 0;
+-      for (int y = 0; y + 1 < g.h; y += 2)
+-        for (int x = 0; x + 1 < g.w; x += 2) {
+-          const float* r0 = c.data() + size_t(y) * g.w + x;
+-          const float v[3] = {r0[0], 0.5f * (r0[1] + r0[g.w]), r0[g.w + 1]};
+-          const float mx = std::max(v[0], std::max(r0[1], std::max(r0[g.w], v[2])));
+-          if (mx < lo || mx >= clip) continue;
+-          const float vw[3] = {v[0] * wb[0], v[1] * wb[1], v[2] * wb[2]};
+-          for (int k = 0; k < 3; ++k) { sc[k] += vw[k]; so[k] += 0.5 * (vw[(k + 1) % 3] + vw[(k + 2) % 3]); }
+-          ++nb;
+-        }
+-      // Rim colour normalised to green (wb space); a clipped channel is rebuilt from the unclipped ones.
+-      for (int k = 0; k < 3; ++k) hl_ratio[k] = (nb >= 64 && sc[1] > 0) ? float(std::clamp(sc[k] / sc[1], 0.25, 4.0)) : 1.0f;
+-      (void)so;
+-      hl_cells = nb;
+-    }
+     S.ms_noise = now_ms() - tn;
+   });
+ 
+@@ -419,10 +395,6 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+   sp.sigma_max = prm.smax_x * S.sigma;
+   sp.sigma_end = prm.end_x * S.sigma;
+   sp.wb = wb;
+-  for (int k = 0; k < 3; ++k) sp.hl_ratio[k] = hl_ratio[k];
+-  if (const char* v = std::getenv("IRIS26985C_LKRL_HL_LOG"))
+-    if (v[0] == '1') std::fprintf(stderr, "lkr-lite: highlight ratios R %.3f G %.3f B %.3f from %zu rim cells\n",
+-                                  hl_ratio[0], hl_ratio[1], hl_ratio[2], hl_cells);
+   if (prm.paper_parity) {
+     sp.prior_gain = 1.0f;
+     sp.grain = 0.0f;
+@@ -1072,21 +1044,8 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+       S.lfc_ms = float(now_ms() - tl); S.lfc_wu = ls.wu; S.lfc_wv = ls.wv;
+     }
+   }
+-  // Highlight reconstruction (FinishLook) can lift clipped channels above the output white (clouds whose
+-  // green clipped: rebuilt from red / blue). Report the reached level as the white, as an HDR merge does,
+-  // so writers scale instead of clamping one channel (a clamped green turns the cloud pink). 99.99th
+-  // percentile of the values above the white: a lone ringing overshoot does not darken the whole file.
+-  static const bool hl_rec_env_off = std::getenv("IRIS26985C_LKRL_HL_REC") && std::getenv("IRIS26985C_LKRL_HL_REC")[0] == '0';
+-  if (prm.solve.highlight_desat && hl_cells >= 64 && !hl_rec_env_off && !std::getenv("IRIS26985C_LKRL_HL_OLD")) {
+-    std::vector<float> over;
+-    for (size_t i = 0, n3 = size_t(*out_w) * *out_h * 3; i < n3; ++i)
+-      if (rgb_data[i] > S.hdr_white) over.push_back(rgb_data[i]);
+-    if (over.size() >= 16) {
+-      const size_t q = size_t(double(over.size() - 1) * 0.9999);
+-      std::nth_element(over.begin(), over.begin() + q, over.end());
+-      S.hdr_white = std::max(S.hdr_white, over[q]);
+-    }
+-  }
++  // C legacy highlight mode: retain the true bracket-derived hdr_white,
++  // not a synthetic headroom extension from opposed-inpaint rim colours.
+   S.ms_total = now_ms() - t0;
+   if (st) *st = S;
+   return true;
+diff --git b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
+index 9bce93e9c69118736a04e2c9982a70fccceb6ac5..c17e3bb4406243c6633b1baccfa8a005b98eb8e6 100644
+--- b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
++++ a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
+@@ -155,10 +155,7 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
+     else unsetenv("IRIS26985C_LKRL_SCHEDULE");
+     // Speed A/B (2026-11-20): debug.lkr.coarsethr = coarse alignment threads ("-" = default).
+     if (__system_property_get("debug.iris26985c.coarsethr", v) > 0 && v[0] && v[0] != '-') setenv("IRIS26985C_LKRL_COARSE_THR", v, 1);
+-    // Blown-highlight neutralise A/B: debug.lkr.hlold=1 = the old all-channels-clipped rule (pink / yellow).
+-    if (__system_property_get("debug.iris26985c.hlold", v) > 0 && v[0] == '1') setenv("IRIS26985C_LKRL_HL_OLD", "1", 0);
+-    // Highlight reconstruction A/B: debug.lkr.hlrec = 0 off (read once per process).
+-    if (__system_property_get("debug.iris26985c.hlrec", v) > 0 && v[0]) setenv("IRIS26985C_LKRL_HL_REC", v, 0);
++    // C trial highlight policy is fixed locally, never set a process-global highlight switch.
+     // A/B of the DCT look: debug.lkr.fb = 0 no DCT pass; debug.lkr.prior = 1 / 0 forces shadow-luma denoise on / off.
+     if (__system_property_get("debug.iris26985c.fb", v) > 0 && v[0]) setenv("IRIS26985C_LKRL_FB", v, 0);
+     // A/B of the coarse LK iteration cap: debug.lkr.coarseit = 40 restores the old cap.
+@@ -295,6 +292,7 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
+   if (st.hdr_white > 1.0f) LKR_LOG("hdr: white %.3f (output level of the clip)", st.hdr_white);
+   if (!st.gpu_profile.empty())
+     LKR_LOG("gpu profile (sum of %d workers, ms): %s", st.workers, st.gpu_profile.c_str());
++  LKR_LOG("highlight: 2.3.94 all-channels rule; opposed inpaint off; bracket HDR preserved");
+   LKR_LOG("mode: %s", dct ? "DCT x-step" : "no prior");
+   LKR_LOG("look: prior %.2f grain %.2f (sigma %.5f)", st.prior_gain, st.grain, st.sigma);
+   LKR_LOG("merge %dx%d s=%d K=%d tiles %d: noise %.0f coarse %.0f tiles %.0f (gpu %.0f prior %.0f) total %.0f ms",
+diff --git b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp
+index 5923b8ef074b548ebba1e8df4871e1d6a6ff0ca0..5df4300c7657da9759b3d979adebff2cb43e7169 100644
+--- b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp
++++ a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp
+@@ -1603,9 +1603,9 @@ bool LiteSolver::finish(const float* z, std::vector<float>* x, int H, int W, con
+   struct FinPush { int32_t H, W, mode, pl, sm, has_ns, notch, desat; float wbr, wbg, wbb, clip, grain, eqs, p0, p1;
+                    float hr, hg, hb, hrec; };
+   static_assert(sizeof(FinPush) == 80, "fin push");
+-  FinPush f{H, W, 0, 0, 0, hns ? 1 : 0, fa.notch ? 1 : 0, fa.desat ? (std::getenv("IRIS26985C_LKRL_HL_OLD") ? 2 : 1) : 0, fa.wb[0], fa.wb[1], fa.wb[2],
++  FinPush f{H, W, 0, 0, 0, hns ? 1 : 0, fa.notch ? 1 : 0, fa.desat ? 2 : 0 /* donor legacy all-channels rule */, fa.wb[0], fa.wb[1], fa.wb[2],
+             fa.clip, fa.grain, fa.eq_strength, float(fa.hl_radius), 0.0f, fa.hl_ratio[0], fa.hl_ratio[1], fa.hl_ratio[2],
+-            fa.hl_rec ? 1.0f : 0.0f};
++            0.0f /* no opposed inpaint */};
+   gpu_->resetSets();
+   VkDescriptorSet st = gpu_->set(fin_, {&bx, &bz, &bns, &bp, &bt, &bm, &bk});
+   const uint32_t gx = div_up(uint32_t(W), 16), gy = div_up(uint32_t(H), 16);
+@@ -1622,7 +1622,7 @@ bool LiteSolver::finish(const float* z, std::vector<float>* x, int H, int W, con
+   }
+   if (fa.grain > 0.0f || fa.notch) run(5);
+   if (fa.grain > 0.0f && fa.notch) notch(0);
+-  if (fa.desat && fa.hl_rec) run(7);   // highlight reconstruction: dilated per-channel clip (P1..P3)
++  // C legacy highlight mode: never dispatch opposed-inpaint clipping dilation.
+   run(6);
+   if (!gpu_->submit()) return fail("fin submit");
+   x->assign(bx.as<float>(), bx.as<float>() + 3 * HW);
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java
+index 7e142919d95cc4b88bf43c1cb9b90c1fea0e59f5..c791717d9c95660717515420de4eb8be3c1a0899 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java
+@@ -127,7 +127,7 @@ public final class GlesIris26983COnLkrBridge {
+         if(bracketEvs.length!=k || bracketEvs[referenceIndex]!=0f) throw new IllegalArgumentException("26985 invalid zero EV reference");
+         final Integer[] zero=Arrays.stream(chronology).filter(i->bracketEvs[i]==0f).toArray(Integer[]::new);
+         final Integer[] bracket=Arrays.stream(chronology).filter(i->bracketEvs[i]!=0f).toArray(Integer[]::new);
+-        if(zero.length<2 || bracket.length!=0) throw new IllegalArgumentException("26989 C LK-R HDR OFF rejects bracketed input");
++        if(zero.length<2 || bracket.length>3) throw new IllegalArgumentException("26985 invalid HDR plan");
+         final int candidates=Math.min(3,zero.length);
+         final int first=(zero.length-candidates+1)/2;
+         int lkrReference=zero[first+candidates-1];
+@@ -208,10 +208,19 @@ public final class GlesIris26983COnLkrBridge {
+             if(!cacheDir.isDirectory() && !cacheDir.mkdirs() && !cacheDir.isDirectory())throw new IllegalStateException("26985 C cache unavailable");
+             Iris26985CLkrNative.nativeSetCacheDir(cacheDir.getAbsolutePath());
+             Iris26985CLkrNative.nativeSetPrior(false);
+-            // C-only 26989 diagnostic: no mixed-exposure native reconstruction.
+-            // Null explicitly clears any previous native HDR exposure state.
+-            Iris26985CLkrNative.nativeSetExposures(null);
+-            Log.i(TAG,"IRIS_26989_C_LKR_HDR_OFF reference="+times[chosen]+" bracketFrames=0 actualExposureEnergy="+exposures[chosen]);
++            // RawLens: equal-exposure captures retain the exact legacy branch. For a
++            // bracket, pass actual Camera2 seconds*ISO, reference first, not requested EVs.
++            float[] hdrExposures=bracket.length==0?null:new float[count];
++            if(hdrExposures!=null) {
++                boolean distinct=false;
++                for(int i=0;i<count;++i){
++                    hdrExposures[i]=output.actualExposure(times[order[i]]);
++                    if(i>0 && Math.abs(Math.log(hdrExposures[i]/hdrExposures[0]))>Math.log(2.0)/6.0)distinct=true;
++                }
++                if(!distinct)hdrExposures=null;
++            }
++            Iris26985CLkrNative.nativeSetExposures(hdrExposures);
++            Log.i(TAG,"IRIS_26986_C_HDR_ACTUAL exposures="+Arrays.toString(hdrExposures));
+             Iris26985CLkrNative.nativeSetNoiseModel(null,0f); // No trained C-specific donor store yet; burst fit only.
+             final float[] stats=new float[STATS];
+             final float[] reconstructionWb=output.referenceWb(times[chosen]);
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CCamera2ShutterSession.kt a/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CCamera2ShutterSession.kt
+index 10ffb6c7258903b6687c0fb4f3222c689c66636f..4192dd96c58f8a09a4a7daefa949c497465716e6 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CCamera2ShutterSession.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CCamera2ShutterSession.kt
+@@ -90,10 +90,6 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
+     private val exactGroup = com.particlesdevs.photoncamera.processing.experimentc.Iris26980CExactExposureGroup(frameCount)
+     private val pendingRawLimit = max(1, rawReader.maxImages - 3)
+     private val icc: ByteArray
+-    private val rawByteBudget: Long
+-    private val rawMemoryBudget: Long
+-    private var sequenceReady = night // preserve the independent Night completion policy
+-    private var readyListener: Runnable? = null
+     private var nextStart = 0
+     private var nextResult = 0
+     private var nextTotalAttempt = 0
+@@ -125,18 +121,9 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
+         // delete files still in use by an earlier cancelled GPU worker.
+         reclaimPreviousProcessWorkspace(privateRoot)
+         val required = frameCount.toLong() * rawReader.width * rawReader.height * 2L
+-        require(required in 1024L..MAX_PRIVATE_BYTES)
+-        rawByteBudget = required
+-        rawMemoryBudget = if (night) 0L else {
+-            val manager = checkNotNull(applicationContext.getSystemService(android.app.ActivityManager::class.java))
+-            val info = android.app.ActivityManager.MemoryInfo(); manager.getMemoryInfo(info)
+-            val budget = minOf(MAX_PRIVATE_BYTES, (info.availMem - info.threshold - 256L * 1024L * 1024L).coerceAtLeast(0L))
+-            require(!info.lowMemory && required <= budget) { "$component insufficient available native RAW memory" }
+-            budget
+-        }
+-        require(applicationContext.cacheDir.usableSpace >=
+-            (if (night) required else 0L) + FREE_SPACE_RESERVE) {
+-            "$component insufficient output scratch; cancel before exposure"
++        require(required in 1024L..MAX_PRIVATE_BYTES &&
++            applicationContext.cacheDir.usableSpace >= required + FREE_SPACE_RESERVE) {
++            "$component cannot guarantee entire RAW burst storage; cancel before exposure"
+         }
+         require(privateDirectory.mkdir() && privateDirectory.isDirectory &&
+             privateDirectory.canWrite()) { "$component no writable isolated private spool" }
+@@ -181,7 +168,7 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
+                 check(onTotal(index, total)) // physical metadata and lens IDs checked by spool
+                 check(isCollecting()) { "$component pre-shutter result refused" }
+                 consumed = index + 1
+-                onRaw(image)          // one owned RAW16 copy + Image.close()
++                onRaw(image)          // checksum + private copy + Image.close()
+                 check(isCollecting()) { "$component pre-shutter RAW refused" }
+             }
+             if (consumed > 0) Log.i(traceTag,
+@@ -254,8 +241,7 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
+             if (exactGroup.accepted() == 1) {
+                 shutter = Iris26972CContract.freeze(physicalId, frameCount, night, ts)
+                 spool = Iris26972CPhysicalRawSpool.create(manager, logicalId, physicalId,
+-                    checkNotNull(shutter), privateDirectory, desiredExposureProduct, shutterMillis,
+-                    if (night) MAX_PRIVATE_BYTES else rawByteBudget, rawMemoryBudget)
++                    checkNotNull(shutter), privateDirectory, desiredExposureProduct, shutterMillis)
+             }
+             checkNotNull(spool).offerTotal(total)
+             acceptedTimestamps.add(ts)
+@@ -321,7 +307,7 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
+             Log.i(traceTag, "IRIS_26976_C_PROVEN_RAW_STAGED timestamp=" + sourceTimestamp)
+             maybeProcess()
+         } catch (error: Throwable) {
+-            fail("RAW_SENSOR Image delivery/ownership: ${error.message}")
++            fail("RAW_SENSOR Image delivery/storage: ${error.message}")
+         }
+     }
+ 
+@@ -338,20 +324,6 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
+     @Synchronized
+     fun isCollecting(): Boolean = state == State.COLLECTING
+ 
+-    @Synchronized
+-    fun setReadyListener(listener: Runnable) {
+-        check(!activated && readyListener == null)
+-        readyListener = listener
+-    }
+-
+-    @Synchronized
+-    fun onSequenceReady() {
+-        if (state != State.COLLECTING) return
+-        check(!sequenceReady)
+-        sequenceReady = true
+-        maybeProcess()
+-    }
+-
+     @Synchronized
+     fun activate() {
+         check(!activated && state != State.FINISHED) { "C owner activated twice or after failure" }
+@@ -361,15 +333,11 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
+ 
+     @Synchronized
+     private fun maybeProcess() {
+-        if (!activated || !sequenceReady || state != State.COLLECTING) return
++        if (!activated || state != State.COLLECTING) return
+         val active = spool ?: return
+         if (nextResult != frameCount ||
+             !active.hasCompletePhysicalBurst()) return
+         closeRawTickets()
+-        try { if (!night) checkNotNull(readyListener).run() } catch (failure: Throwable) {
+-            fail("C complete-burst callback: ${failure.message}")
+-            return
+-        }
+         state = State.PROCESSING
+         Log.i(traceTag, "IRIS_26974_C_FULL_BURST_PROCESSING_START frames=" + frameCount)
+         val processingWatchdog = Thread({
+@@ -501,7 +469,7 @@ class Iris26972CCamera2ShutterSession @JvmOverloads constructor(
+ 
+     @Synchronized
+     override fun close() {
+-        // Do not close the RAW owner while a GPU worker owns its memory or mapped files.
++        // Do not close the RAW spool while a GPU worker owns its mapped files.
+         // Instead fence publication and let that worker release every resource.
+         cancelled = true
+         fail("camera/session closed before complete C image")
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CPhysicalRawSpool.kt a/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CPhysicalRawSpool.kt
+index c577d1844220ae77e0ece422a938ede1cbde3431..8393f00be455e3c99a3aed6bbdfc7a1a66dc8d1e 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CPhysicalRawSpool.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/Iris26972CPhysicalRawSpool.kt
+@@ -15,13 +15,14 @@ import java.security.MessageDigest
+ import kotlin.math.max
+ 
+ /**
+- * C-only bounded Camera2 RAW_SENSOR rendezvous. Motion copies directly into an
+- * explicitly owned native RAW16 buffer; Night retains its existing disk lease. Images close in the callback; the matching
++ * C-only bounded Camera2 RAW_SENSOR rendezvous. Each Image is copied into a
++ * private RAW16 file and CLOSED within the availability callback; the matching
+  * TotalCaptureResult can arrive before OR after the Image. The complete
+  * reference-first immutable burst is validated before allocating any GL work.
+  *
+- * Neither ownership route changes the sensor samples or the donor processing.
+- * No ImageReader buffer survives its callback. Device memory pressure remains a device test.
++ * This code does not modify A/B readers and is source-wired to an isolated Camera2
++ * listener; actual Android hardware execution is not yet proven. Large memory maps are virtual reservations, NOT copied Java heap;
++ * real 50MP device storage, I/O timing and page-cache use remain unverified.
+  */
+ internal class Iris26972CPhysicalRawSpool private constructor(
+     private val cameraManager: CameraManager,
+@@ -30,15 +31,13 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+     private val shutter: Iris26972CContract.Plan,
+     private val scratch: File,
+     private val maxBytes: Long,
+-    private val memoryReservation: Long,
+     private val frozenDesiredExposureProduct: Double,
+     private val shutterTimeMillis: Long,
+ ) : AutoCloseable {
+-    private val name = "26989 C private RAW16 Camera2 rendezvous"
++    private val name = "26972 C private RAW16 Camera2 rendezvous"
+     private data class Raw(
+         val timestamp: Long,
+-        val path: File?,
+-        val memory: Iris26989CRawMemory?,
++        val path: File,
+         val width: Int,
+         val height: Int,
+         // The file stores a tightly packed crop. Preserve its original sensor
+@@ -49,7 +48,7 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+         val sensorCropLeft: Int,
+         val sensorCropTop: Int,
+         val byteLength: Long,
+-        val sha256: ByteArray?,
++        val sha256: ByteArray,
+     )
+     private data class Completed(
+         val metadata: Iris26972CPhysicalRawMetadata.Frozen,
+@@ -75,7 +74,6 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+      */
+     @Synchronized
+     internal fun offerRaw(image: Image) {
+-        var pendingMemory: Iris26989CRawMemory? = null
+         var partial: File? = null
+         var finished: File? = null
+         var primary: Throwable? = null
+@@ -107,20 +105,9 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+             val byteCount = width.toLong() * height * 2L
+             require(byteCount in 512L..Int.MAX_VALUE.toLong() &&
+                 byteCount <= maxBytes - usedBytes &&
+-                (!shutter.night || scratch.usableSpace > byteCount + MIN_FREE_BYTES)) {
+-                "$name insufficient bounded RAW ownership capacity"
++                scratch.usableSpace > byteCount + MIN_FREE_BYTES) {
++                "$name insufficient private storage for frozen RAW"
+             }
+-            if (!shutter.night) {
+-                val allocation = com.hinnka.mycamera.processor.experimentc.original129.utils.DirectBufferAllocator
+-                pendingMemory = Iris26989CRawMemory.copy(src.buffer, src.rowStride,
+-                    crop.left, crop.top, width, height, allocation::allocateNative, allocation::freeNative)
+-                raws[image.timestamp] = Raw(image.timestamp, null, pendingMemory, width, height,
+-                    image.width, image.height, crop.left, crop.top, byteCount, null)
+-                pendingMemory = null // sole ownership transferred to this shutter
+-                usedBytes += byteCount
+-                return
+-            }
+-            // Preserve the separate C Night disk-backed route exactly.
+             partial = File.createTempFile(".iris26972c_raw_", ".part", scratch)
+             val digest = MessageDigest.getInstance("SHA-256")
+             val staging = ByteArray(minOf(width*2,256*1024))
+@@ -149,7 +136,7 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+                 "$name failed atomic RAW staging"
+             }
+             partial = null
+-            raws[image.timestamp] = Raw(image.timestamp,finished,null,width,height,
++            raws[image.timestamp] = Raw(image.timestamp,finished,width,height,
+                 image.width,image.height,crop.left,crop.top,
+                 byteCount,digest.digest())
+             finished = null
+@@ -165,10 +152,8 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+                 poisoned = true
+                 if (primary != null) primary.addSuppressed(failure) else throw failure
+             } finally {
+-                try { pendingMemory?.close() } finally {
+-                    partial?.delete()
+-                    finished?.delete()
+-                }
++                partial?.delete()
++                finished?.delete()
+             }
+         }
+     }
+@@ -257,7 +242,22 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+                 raw.sensorCropTop == referenceRaw.sensorCropTop) {
+                 "$name physical RAW sensor crop moved across shutter burst"
+             }
+-            val mapping = ownedSource(raw)
++            val digest = MessageDigest.getInstance("SHA-256")
++            val staging = ByteArray(256*1024)
++            FileInputStream(raw.path).use { input ->
++                while (true) {
++                    val n = input.read(staging)
++                    if (n < 0) break
++                    if (n > 0) digest.update(staging,0,n)
++                }
++            }
++            require(raw.path.length()==raw.byteLength &&
++                raw.sha256.contentEquals(digest.digest())) {
++                "$name RAW source changed after Camera2 HAL was released"
++            }
++            val mapping=FileInputStream(raw.path).channel.use { channel ->
++                channel.map(FileChannel.MapMode.READ_ONLY,0L,raw.byteLength)
++            }
+             planes += Iris26972CDonorSabreGpuRawIngress.Plane(mapping,
+                 raw.width,raw.height,raw.width*2,2,0,0,raw.width,raw.height)
+         }
+@@ -327,7 +327,24 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+                 raw.sensorCropTop == firstRaw.sensorCropTop) {
+                 "$name donor raw geometry changed after shutter"
+             }
+-            val source = ownedSource(raw)
++            // No donor frame may be constructed from an unchecked mmap, and
++            // no Camera2 Image survives acquisition. Re-read source SHA here.
++            val digest = MessageDigest.getInstance("SHA-256")
++            val buf = ByteArray(256 * 1024)
++            FileInputStream(raw.path).use { input ->
++                while (true) {
++                    val count = input.read(buf)
++                    if (count < 0) break
++                    if (count > 0) digest.update(buf, 0, count)
++                }
++            }
++            require(raw.path.length() == raw.byteLength &&
++                raw.sha256.contentEquals(digest.digest())) {
++                "$name donor raw16 SHA changed after acquisition"
++            }
++            val source = FileInputStream(raw.path).channel.use { channel ->
++                channel.map(FileChannel.MapMode.READ_ONLY, 0L, raw.byteLength)
++            }
+             com.hinnka.mycamera.processor.experimentc.Iris26975COriginalRawBurst.Frame(
+                 metadata = capture.metadata,
+                 totalCaptureResult = capture.total,
+@@ -350,41 +367,13 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+         return block(burst)
+     }
+ 
+-    /** The owner stays live until the synchronous donor transaction returns. */
+-    private fun ownedSource(raw: Raw): ByteBuffer {
+-        raw.memory?.let { lease ->
+-            check(!shutter.night && raw.path == null && raw.sha256 == null)
+-            return lease.readOnly().also { require(it.remaining().toLong() == raw.byteLength) }
+-        }
+-        check(shutter.night)
+-        val path = checkNotNull(raw.path)
+-        val digest = MessageDigest.getInstance("SHA-256")
+-        val staging = ByteArray(256 * 1024)
+-        FileInputStream(path).use { input ->
+-            while (true) {
+-                val n = input.read(staging)
+-                if (n < 0) break
+-                if (n > 0) digest.update(staging, 0, n)
+-            }
+-        }
+-        require(path.length() == raw.byteLength && checkNotNull(raw.sha256).contentEquals(digest.digest())) {
+-            "$name Night RAW source changed after acquisition"
+-        }
+-        return FileInputStream(path).channel.use { channel ->
+-            channel.map(FileChannel.MapMode.READ_ONLY, 0L, raw.byteLength)
+-        }
+-    }
+-
+     @Synchronized
+     override fun close() {
+         if(closed) return
+         closed=true
+         var cause:Throwable?=null
+         for(raw in raws.values) {
+-            try {
+-                if (raw.memory != null) raw.memory.close()
+-                else check(checkNotNull(raw.path).delete()) { "$name failed secure private-file deletion" }
+-            }
++            try { check(raw.path.delete()) { "$name failed secure private-file deletion" } }
+             catch(failure:Throwable) {
+                 if(cause==null) cause=failure else cause.addSuppressed(failure)
+             }
+@@ -392,12 +381,6 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+         raws.clear()
+         results.clear()
+         frameNumbers.clear()
+-        if (memoryReservation > 0L) {
+-            try { Iris26989CRawMemory.release(memoryReservation) }
+-            catch (failure: Throwable) {
+-                if (cause == null) cause = failure else cause.addSuppressed(failure)
+-            }
+-        }
+         if(cause!=null)throw cause
+     }
+ 
+@@ -408,8 +391,7 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+             physicalCameraId:String,shutter:Iris26972CContract.Plan,
+             scratchDirectory:File,desiredExposureProduct:Double,
+             shutterTimeMillis:Long,
+-            diskLimitBytes:Long=MAX_BURST_BYTES,
+-            memoryBudgetBytes:Long=0L):
++            diskLimitBytes:Long=MAX_BURST_BYTES):
+                 Iris26972CPhysicalRawSpool {
+             require(logicalCameraId.isNotBlank() && physicalCameraId.isNotBlank() &&
+                 shutter.physicalLensId==physicalCameraId &&
+@@ -420,16 +402,9 @@ internal class Iris26972CPhysicalRawSpool private constructor(
+                 diskLimitBytes in 1024L..MAX_BURST_BYTES) {
+                 "26972 C invalid frozen shutter, camera or scratch directory"
+             }
+-            val reservation = if (shutter.night) 0L else diskLimitBytes
+-            if (reservation > 0L) Iris26989CRawMemory.reserve(reservation, memoryBudgetBytes)
+-            try {
+-                return Iris26972CPhysicalRawSpool(manager,logicalCameraId,
+-                    physicalCameraId,shutter,scratchDirectory,diskLimitBytes,reservation,
+-                    desiredExposureProduct,shutterTimeMillis)
+-            } catch (failure: Throwable) {
+-                if (reservation > 0L) Iris26989CRawMemory.release(reservation)
+-                throw failure
+-            }
++            return Iris26972CPhysicalRawSpool(manager,logicalCameraId,
++                physicalCameraId,shutter,scratchDirectory,diskLimitBytes,
++                desiredExposureProduct,shutterTimeMillis)
+         }
+     }
+ }
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/Iris26989CRawMemory.kt a/app/src/main/java/com/hinnka/mycamera/processor/Iris26989CRawMemory.kt
+deleted file mode 100644
+index ec6dedc863cc9c238a1bbaf168767bf7b95eafba..0000000000000000000000000000000000000000
+--- b/app/src/main/java/com/hinnka/mycamera/processor/Iris26989CRawMemory.kt
++++ /dev/null
+@@ -1,59 +0,0 @@
+-package com.hinnka.mycamera.processor
+-
+-import java.nio.ByteBuffer
+-import java.nio.ByteOrder
+-
+-/** C Motion-only native allocation lease; no HAL Image, file or mutable buffer escapes. */
+-internal class Iris26989CRawMemory private constructor(
+-    private var owner: ByteBuffer?, private val free: (ByteBuffer) -> Unit,
+-) : AutoCloseable {
+-    @Synchronized fun readOnly(): ByteBuffer = checkNotNull(owner) { "released C RAW" }
+-        .asReadOnlyBuffer().order(ByteOrder.nativeOrder())
+-    @Synchronized override fun close() {
+-        val b = owner ?: return
+-        owner = null
+-        free(b)
+-    }
+-    companion object {
+-        private var reserved = 0L
+-        /** Account for overlapping cancelled workers; never silently shorten the requested burst. */
+-        @Synchronized fun reserve(bytes: Long, budget: Long) {
+-            require(bytes > 0 && budget >= bytes && reserved <= budget - bytes) { "C RAW memory budget exhausted" }
+-            reserved += bytes
+-        }
+-        @Synchronized fun release(bytes: Long) {
+-            check(bytes > 0 && bytes <= reserved) { "C RAW memory reservation mismatch" }
+-            reserved -= bytes
+-        }
+-        fun copy(src: ByteBuffer, rowStride: Int, left: Int, top: Int, width: Int, height: Int,
+-                 allocate: (Long) -> ByteBuffer?, free: (ByteBuffer) -> Unit): Iris26989CRawMemory {
+-            require(src.isDirect && width > 0 && height > 0 && left >= 0 && top >= 0 &&
+-                width % 2 == 0 && height % 2 == 0 && left % 2 == 0 && top % 2 == 0)
+-            val row = Math.multiplyExact(width, 2)
+-            require(rowStride >= (left.toLong() + width) * 2L && rowStride % 2 == 0)
+-            val start = src.position().toLong() + top.toLong() * rowStride + left.toLong() * 2
+-            val end = start + (height.toLong() - 1L) * rowStride + row
+-            val bytes = Math.multiplyExact(row, height)
+-            require(start >= 0 && end >= start && end <= src.limit().toLong()) { "C RAW crop exceeds source" }
+-            val b = checkNotNull(allocate(bytes.toLong())) { "C RAW native allocation failed" }
+-            try {
+-                require(b.isDirect && !b.isReadOnly && b.capacity() == bytes)
+-                b.clear(); b.order(ByteOrder.nativeOrder())
+-                val input = src.duplicate().order(ByteOrder.nativeOrder())
+-                if (rowStride == row) {
+-                    input.position(start.toInt()); input.limit(end.toInt()); b.put(input)
+-                } else {
+-                    for (y in 0 until height) {
+-                        val pos = (start + y.toLong() * rowStride).toInt()
+-                        input.limit(pos + row); input.position(pos); b.put(input)
+-                    }
+-                }
+-                check(b.position() == bytes); b.flip()
+-                return Iris26989CRawMemory(b, free)
+-            } catch (failure: Throwable) {
+-                try { free(b) } catch (cleanup: Throwable) { failure.addSuppressed(cleanup) }
+-                throw failure
+-            }
+-        }
+-    }
+-}
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 93856911fda795cb4616922b39692401c458e434..18b32a7cd6af7a9cf1189812ffab477819402515 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -467,9 +467,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+                         !java.util.Objects.equals(physical.get(CaptureResult.SCALER_CROP_REGION),
+                         newestPhysical.get(CaptureResult.SCALER_CROP_REGION));
+             }
+-            // Result callbacks can arrive after a newer paired Image. Keep the
+-            // bounded provisional leases below until their own result or eviction.
+-            if (invalid) {
++            // An old unpaired notification must not crowd out proved recent RAWs.
++            if (invalid || (total==null && newestTs>0L && ts<newestTs)) {
+                 it.remove(); image.close(); mIris26975CZslResultMap.remove(ts);
+             }
+         }
+@@ -828,7 +827,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     }
+     /* IRIS_26974_C_RAW_CALLBACK_IO_ISOLATION: physically independent RAW ImageReader handler.
+      * The original Camera2 capture handler remains free to deliver callback/sequence/timeout
+-     * events while each C RAW16 image is transferred to its bounded owner. */
++     * events while each C RAW16 image is checksum-spooled and fd.synced. */
+     private volatile android.os.HandlerThread mIris26974CRawCallbackThread;
+     private final java.util.LinkedHashSet<Long> mIris26972CRetiredSensorTimestamps =
+             new java.util.LinkedHashSet<>();
+@@ -13045,7 +13044,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     }
+ 
+     private void iris26972CStartIndependentCamera2(boolean night) {
+-        final long shutterAdmissionNs = android.os.SystemClock.elapsedRealtimeNanos();
+         final long generation;
+         synchronized(mZslBufferLock) {
+             if(mIris26976CCaptureAdmission) {
+@@ -13085,7 +13083,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final ImageReader reader=mImageReaderRaw;
+         final String lens=physicalID;
+         if(handler==null || session==null || reader==null || mIris26972CShutterSession!=null) {
+-            try { iris26976CStartIndependentCamera2Owned(night, previewTicket, shutterAdmissionNs); }
++            try { iris26976CStartIndependentCamera2Owned(night, previewTicket); }
+             finally { if (!previewTicket.isTransferred()) previewTicket.close(); iris26976CEndAdmission(generation); }
+             return;
+         }
+@@ -13120,7 +13118,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     // At timeout, a proved AE result can still produce a fresh manual burst;
+                     // no incompatible AE ring frame is transferred.
+                     synchronized(mZslBufferLock) { mIris26980CWaitingForLock=false; }
+-                    iris26976CStartIndependentCamera2Owned(night, previewTicket, shutterAdmissionNs);
++                    iris26976CStartIndependentCamera2Owned(night, previewTicket);
+                 } finally { if(!defer) {
+                     if (!previewTicket.isTransferred()) previewTicket.close();
+                     iris26976CEndAdmission(generation);
+@@ -13135,8 +13133,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     }
+ 
+     private void iris26976CStartIndependentCamera2Owned(boolean night,
+-            com.particlesdevs.photoncamera.processing.experimentc.Iris26977CPreviewTicket previewTicket,
+-            long shutterAdmissionNs) {
++            com.particlesdevs.photoncamera.processing.experimentc.Iris26977CPreviewTicket previewTicket) {
+         Log.i(TAG, "IRIS_26974_C_SHUTTER_ENTRY night=" + night + " camera=" + physicalID +
+                 " sessionReady=" + (mCaptureSession != null));
+         if (!com.particlesdevs.photoncamera.processing.experimentc.Iris26972CContract.CONTROLLED_DEVICE_TRIAL_ENABLED) {
+@@ -13420,9 +13417,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final java.util.ArrayList<Image> cPreShutterImages = new java.util.ArrayList<>();
+         final java.util.ArrayList<TotalCaptureResult> cPreShutterTotals =
+                 new java.util.ArrayList<>();
+-        final int[] cZslRejections = new int[6]; // unpaired/owner, HAL policy, physical, geometry, exposure, ring size
+         synchronized (mZslBufferLock) {
+-            cZslRejections[5] = mIris26975CZslRingBuffer.size();
+             // Iris Night is a fresh post-shutter RAW acquisition. A C-selected
+             // Night session must never borrow the Motion/ZSL pre-shutter ring.
+             // Keep the normal C ZSL behavior unchanged.
+@@ -13430,11 +13425,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             final java.util.ArrayList<Image> eligible = new java.util.ArrayList<>();
+             final java.util.HashMap<Long, TotalCaptureResult> paired = new java.util.HashMap<>();
+             for (Image image : mIris26975CZslRingBuffer) {
+-                if (image == null || image.getTimestamp() <= 0) { cZslRejections[0]++; continue; }
++                if (image == null || image.getTimestamp() <= 0) continue;
+                 final TotalCaptureResult total = mIris26975CZslResultMap.get(image.getTimestamp());
+                 if (total == null || total.getRequest() != mIris26975CProvenRawPreviewRequest ||
+                         !java.util.Objects.equals(total.get(CaptureResult.SENSOR_TIMESTAMP),
+-                                image.getTimestamp())) { cZslRejections[0]++; continue; }
++                                image.getTimestamp())) continue;
+                 // Do not inherit A/B preview HAL processing into Experiment C.
+                 // Unlike fresh C RAW requests, a historical ZSL frame may have
+                 // been submitted before C asserted NR/EDGE OFF. Require the
+@@ -13446,13 +13441,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 final Integer cZslEdge = total.getRequest().get(CaptureRequest.EDGE_MODE);
+                 if (!com.particlesdevs.photoncamera.processing.experimentc
+                         .Iris26975COffModePolicy.acceptZslRequest(
+-                                cZslNr, cZslEdge)) { cZslRejections[1]++; continue; }
++                                cZslNr, cZslEdge)) continue;
+                 final CaptureResult exactPhysical = physicalID.equals(mCameraDevice.getId())
+                         ? total : total.getPhysicalCameraResults().get(physicalID);
+                 if (exactPhysical == null ||
+                         !java.util.Objects.equals(
+                                 exactPhysical.get(CaptureResult.SENSOR_TIMESTAMP),image.getTimestamp()))
+-                    { cZslRejections[2]++; continue; }
++                    continue;
+                 // A real pre-shutter RAW cannot be fused across a physical
+                 // lens zoom/crop or focus change. Exposure alone is insufficient:
+                 // otherwise a zoom gesture just before shutter mixes different
+@@ -13462,7 +13457,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 final android.graphics.Rect samplePhysicalCrop = exactPhysical.get(
+                         CaptureResult.SCALER_CROP_REGION);
+                 if (shutterPhysicalCrop != null &&
+-                        !shutterPhysicalCrop.equals(samplePhysicalCrop)) { cZslRejections[3]++; continue; }
++                        !shutterPhysicalCrop.equals(samplePhysicalCrop)) continue;
+                 if (android.os.Build.VERSION.SDK_INT >= 30 && cPhysicalPreview != null) {
+                     final Float shutterPhysicalZoom = cPhysicalPreview.get(
+                             CaptureResult.CONTROL_ZOOM_RATIO);
+@@ -13472,7 +13467,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                             shutterPhysicalZoom > 0f && (samplePhysicalZoom == null ||
+                             !Float.isFinite(samplePhysicalZoom) ||
+                             Math.abs(samplePhysicalZoom - shutterPhysicalZoom) >
+-                                    .005f * shutterPhysicalZoom)) { cZslRejections[3]++; continue; }
++                                    .005f * shutterPhysicalZoom)) continue;
+                 }
+                 if (cPhysicalPreview != null) {
+                     final Float shutterFocus = cPhysicalPreview.get(
+@@ -13483,18 +13478,18 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                             shutterFocus >= 0f && (sampleFocus == null ||
+                             !Float.isFinite(sampleFocus) ||
+                             Math.abs(shutterFocus - sampleFocus) >
+-                                    Math.max(.02f, .03f * shutterFocus))) { cZslRejections[3]++; continue; }
++                                    Math.max(.02f, .03f * shutterFocus))) continue;
+                 }
+                 final Long normalExposure = exactPhysical.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+                 final Integer normalIso = exactPhysical.get(CaptureResult.SENSOR_SENSITIVITY);
+                 if (normalExposure == null || normalIso == null ||
+-                        normalExposure <= 0 || normalIso <= 0) { cZslRejections[4]++; continue; }
++                        normalExposure <= 0 || normalIso <= 0) continue;
+                 // A matching EV product is NOT enough for a pre-shutter C
+                 // frame: 1/50s ISO800 and 1/100s ISO1600 have different
+                 // motion blur and noise. Freeze Iris's actual chosen SS and
+                 // ISO as independent sensor values, never just their product.
+                 if (normalExposure.longValue() != exposure.longValue() ||
+-                        normalIso.intValue() != iso.intValue()) { cZslRejections[4]++; continue; }
++                        normalIso.intValue() != iso.intValue()) continue;
+                 eligible.add(image);
+                 paired.put(image.getTimestamp(), total);
+             }
+@@ -13525,9 +13520,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         Log.i(TAG, "IRIS_26975_C_ZSL_FROZEN mode=" + (night ? "NIGHT_FRESH" : "NORMAL_ZSL") +
+                 " pre=" + cPreShutterImages.size() +
+                 " post=" + (frames - cPreShutterImages.size()) + " target=" + frames);
+-        if (!night) Log.i(TAG,"IRIS_26989_C_ZSL_ADMISSION locked="+cLockedGroup+" explicit="+cUserManualExposure+
+-                " ring="+cZslRejections[5]+" unpairedOrOwner="+cZslRejections[0]+" halPolicy="+cZslRejections[1]+
+-                " physical="+cZslRejections[2]+" geometry="+cZslRejections[3]+" exposure="+cZslRejections[4]);
+         /* IRIS_26975_C_SHUTTER_FROZEN_PHYSICAL_ZOOM
+          * Camera2's scaler crop uses active-array sensor coordinates, not
+          * JPEG/UI crop coordinates. Map it once to the RAW reader grid.
+@@ -13617,17 +13609,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             return;
+         }
+         ownerHolder[0] = owner;
+-        if (!night) owner.setReadyListener(() -> {
+-            final long readyNs=android.os.SystemClock.elapsedRealtimeNanos();
+-            if (!captureHandler.post(() -> {
+-                if (mIris26972CShutterSession!=owner || cSequenceFence.isTerminalDelivered()) return;
+-                cCompleteUiSequence.run();
+-                Log.i(TAG,"IRIS_26989_C_ALL_RAW_READY frames="+frames+" shutterEntryToReadyMs="+
+-                        ((readyNs-shutterAdmissionNs)/1000000L)+" uiDispatchMs="+
+-                        ((android.os.SystemClock.elapsedRealtimeNanos()-readyNs)/1000000L));
+-                cameraEventsListener.onProcessingStarted("Experiment C complete RAW burst processing");
+-            })) throw new IllegalStateException("C complete RAW UI handler closed");
+-        });
+         // These tags prove per-request ownership even if another Camera2 client
+         // emits TotalCaptureResults on the same background Handler.
+         final java.util.ArrayList<CaptureRequest> requests = new java.util.ArrayList<>(frames);
+@@ -13782,10 +13763,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                             " lastFrame=" + frameNumber);
+                     if (!cSequenceFence.isTerminalDelivered()) {
+                         iris26974CResumePreviewOnly(captureSession, cReader);
+-                        if (night) {
+-                            cCompleteUiSequence.run();
+-                            cameraEventsListener.onProcessingStarted("Experiment C RAW acquisition/processing");
+-                        } else owner.onSequenceReady(); // processing callback requires every owned RAW + result
++                        cCompleteUiSequence.run();
++                        cameraEventsListener.onProcessingStarted(
++                                "Experiment C RAW acquisition/processing");
+                     }
+                     cReleaseAfterSequence.run();
+                 }
+@@ -13808,11 +13788,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 // Mark the never-submitted sequence, so the terminal callback
+                 // releases the C owner without waiting for a nonexistent HAL job.
+                 cSequenceFence.markNeverSubmitted();
++                cCompleteUiSequence.run();
+                 iris26974CResumePreviewOnly(captureSession, cReader);
+-                if (night) {
+-                    cCompleteUiSequence.run();
+-                    cameraEventsListener.onProcessingStarted("Experiment C complete pre-shutter RAW burst processing");
+-                } else owner.onSequenceReady();
++                cameraEventsListener.onProcessingStarted(
++                        "Experiment C complete pre-shutter RAW burst processing");
+                 owner.activate();
+                 Log.i(TAG, "IRIS_26975_V4_C_ALL_PRE_SHUTTER frames=" + frames);
+                 return;
+@@ -13822,7 +13801,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             cActiveSequence[0]=sequenceId;
+             Log.i(TAG, "IRIS_26974_C_BURST_SUBMITTED sequence=" + sequenceId +
+                     " frames=" + frames + " exposureNs=" + exposure + " iso=" + iso);
+-            // The RAW callback's ownership transfer no longer shares Camera2's
++            // The RAW callback's checksum/fsync work no longer shares Camera2's
+             // Handler, but the deadline itself must also stay off that Handler.
+             // A blocked owner lock may stall the watchdog thread, never the UI.
+             final long ms = Math.min(90_000L, Math.max(20_000L,
+@@ -14165,8 +14144,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final Motion26505LongTicket iris26505LongTicket = new Motion26505LongTicket(
+                 iris26486ShortTicket.slot.shadowAuxSlot);
+         mMotion26505CaptureLongTicket = iris26505LongTicket;
+-        final float[] iris26985CBracketEvs = new float[0]; // 26989 C LK-R HDR OFF
+-        if (iris26983COnAtPress) Log.i(TAG, "IRIS_26989_C_ON_HDR_OFF total=" + iris26593TotalTarget + " bracketFrames=0");
++        final float[] iris26985CBracketEvs = iris26983COnAtPress
++                ? iris26985PlanCOnHdrAuto(iris26598PreShutterNormals, iris26713NormalTargetExp,
++                    iris26713NormalTargetIso, iris26593TotalTarget, physicalID)
++                : new float[0];
+         final boolean iris26593LongBudgetAllows = iris26593TotalTarget >= 2 && !iris26905BOffAllNormal && !iris26983COnAtPress;
+         final boolean iris26505LongRequested = iris26593LongBudgetAllows
+                 && applyMotion26505ExplicitLongCaptureIfUseful(
+@@ -15264,10 +15245,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+          */
+         if (actualCount > 0) {
+             double[] iris26360Energies = new double[actualCount];
+-            // C LK-R selects its actual reference later by native sharpness.
+-            // This capture summary describes the frozen normal group, not that later selection.
+-            Double iris26360RefObj = iris26593Plan.iris26983COnOutput != null
+-                    ? Double.valueOf(irisV13NormalEnergy) : mExposures.get(selected.get(actualCount - 1).timestamp);
++            Double iris26360RefObj =
++                    mExposures.get(selected.get(actualCount - 1).timestamp);
+             double iris26360ReferenceEnergy =
+                     iris26360RefObj == null ? 0.0 : iris26360RefObj;
+             double iris26360Sum = 0.0;
+@@ -15351,8 +15330,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                             + " stdEnergy=" + iris26360Std
+                             + " coefficientOfVariation=" + iris26360Cv
+                             + " referenceEnergy="
+-                            + iris26360ReferenceEnergy
+-                            + (iris26593Plan.iris26983COnOutput != null ? " referenceKind=frozenNormalGroup actualLkrReferenceLoggedAtMerge=true" : ""));
++                            + iris26360ReferenceEnergy);
+         }
+ 
+         final int capturedCount = actualCount;
+diff --git b/app/version.properties a/app/version.properties
+index 9c0d3609a818e5a8dd1bf87ef78c46dc5ef0a693..861ce2a161f7a857a1526db2d9c6f9af2ad32292 100644
+--- b/app/version.properties
++++ a/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726989
+-VERSION_BUILD=26989
++VERSION_NAME=0.9726988
++VERSION_BUILD=26988
