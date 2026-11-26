@@ -1,0 +1,709 @@
+diff --git a/app/src/main/assets/shaders/preview/main_fs.glsl b/app/src/main/assets/shaders/preview/main_fs.glsl
+index b40285586a46c231753c8297ee25f8872554f4a2..807eb2ad4a6df3918a2aab6ccaf2e7c4583524ff 100644
+--- a/app/src/main/assets/shaders/preview/main_fs.glsl
++++ b/app/src/main/assets/shaders/preview/main_fs.glsl
+@@ -43,8 +43,11 @@ void main() {
+      * 26661 full linear multiplier. The map is monotone, maps display white to display white, and
+      * rescales RGB uniformly, so it cannot create the blown preview highlights seen in 26661.
+      */
+-    float iris26662Gain = max(iris26662ReferencePreviewGain, 1.0);
+-    if (iris26662Gain > 1.0001) {
++    // 26988 C OFF may also attenuate a brighter manual ISP frame. Every old
++    // caller still supplies gain >= 1, retaining the exact existing branch.
++    float iris26662Gain = iris26662ReferencePreviewGain > 0.0
++            ? max(iris26662ReferencePreviewGain, 0.25) : 1.0;
++    if (iris26662Gain > 1.0001 || iris26662Gain < 0.9999) {
+         vec3 encoded = clamp(color.rgb, vec3(0.0), vec3(1.0));
+         vec3 lowLinear = encoded / 12.92;
+         vec3 highLinear = pow((encoded + 0.055) / 1.055, vec3(2.4));
+diff --git a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp
+index 280e221384ad5bdb83751b914b2a26f120d44fcc..75fe45a96f37032357b62c79aed4428fbe0bd6ea 100644
+--- a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp
++++ b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_adapter.cpp
+@@ -226,7 +226,7 @@ bool Solver::solveEnd(PendingPtr* pend, std::vector<float>* x_out, SolveStats* s
+   if (!fin_cpu && prm.fallback_chroma <= 0.0f) {
+     LiteSolver::FinishArgs fa{{prm.wb[0], prm.wb[1], prm.wb[2]}, prm.clip, prm.grain, prm.equalize_strength,
+                               prm.notch, prm.highlight_desat, {prm.hl_ratio[0], prm.hl_ratio[1], prm.hl_ratio[2]},
+-                              !(std::getenv("IRIS26985C_LKRL_HL_REC") && std::getenv("IRIS26985C_LKRL_HL_REC")[0] == '0'), 2 * prm.s};
++                              false, 0 /* C: 2.3.94 highlight rule; no rim reconstruction */};
+     std::string ferr;
+     fin_done = lite_.finish(z.data(), x_out, H, W, fa, T.nscale.empty() ? nullptr : &T.nscale, &ferr);
+     if (!fin_done) std::fprintf(stderr, "lkr-lite: gpu finish failed (%s), CPU path\n", ferr.c_str());
+diff --git a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp
+index 0c0937fb47fb1e670b8664a23a2b8b137cb0856d..6c37b60450598330a233dfe9b3de6c4002c30339 100644
+--- a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp
++++ b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_finish.cpp
+@@ -241,101 +241,17 @@ void FinishLook(const float* z, float* x, int H, int W, const SolveParams& prm,
+       }
+     }
+   }
+-  // Blown highlights go white (user 2026-11-19). Once ANY channel clips, its true value is unknown
+-  // (>= clip), so the remaining channels' ratio is false colour: a sun glow with only green clipped
+-  // turned pink after white balance (IMG_20260928_185731_891), and a merge of frames clipping in
+-  // different channels turned yellow. Strength follows the brightest raw channel (smoothstep from
+-  // 0.85 clip to clip: a soft edge, the sensor clip level is not noise), target = neutral at the pixel's
+-  // wb-space luma, so brightness is kept. (Before: only pixels with ALL channels near clip;
+-  // LKRL_HL_OLD=1 restores that.)
+-  // Highlight reconstruction (2026-11-20, inpaint opposed; user: Samsung hdrplus clouds came out flat
+-  // white although only green was clipped -- red kept the whole cloud texture). Each channel near its
+-  // clip (same soft edge as below) moves towards max(itself, ratio_c x mean of the other two in wb space),
+-  // so the cloud keeps the shape the unclipped channels recorded and the colour of its unclipped edge.
+-  // Output can exceed the clip; the white rule below then only acts where ALL channels clip.
+-  static const bool hl_rec_off = std::getenv("IRIS26985C_LKRL_HL_REC") && std::getenv("IRIS26985C_LKRL_HL_REC")[0] == '0';
+-  const bool hl_rec = prm.highlight_desat && !hl_rec_off && !std::getenv("IRIS26985C_LKRL_HL_OLD");
+-  // Dilated per-channel clip (fin.comp mode 7): bright pixels count a channel clipped when it clips within
+-  // 2 s px (the merge leaves too-low values inside a channel's clipped area -> dark specks once rebuilt).
+-  std::vector<float> xd;
+-  if (hl_rec) {
+-    const float lo = 0.85f * prm.clip;
+-    const int r = 2 * prm.s;
+-    xd.assign(x, x + 3 * HW);
+-    for (int Y = 0; Y < H; ++Y)
+-      for (int X = 0; X < W; ++X) {
+-        const size_t i = size_t(Y) * W + X;
+-        if (std::max(x[i], std::max(x[HW + i], x[2 * HW + i])) <= lo) continue;
+-        for (int dy = -r; dy <= r; ++dy)
+-          for (int dx = -r; dx <= r; ++dx) {
+-            const size_t j = size_t(std::clamp(Y + dy, 0, H - 1)) * W + size_t(std::clamp(X + dx, 0, W - 1));
+-            for (int c = 0; c < 3; ++c) xd[c * HW + i] = std::max(xd[c * HW + i], x[c * HW + j]);
+-          }
+-      }
+-  }
+-  if (hl_rec) {
+-    const float lo = 0.85f * prm.clip, hi = prm.clip;
+-    for (size_t i = 0; i < HW; ++i) {
+-      const float v[3] = {x[i], x[HW + i], x[2 * HW + i]};
+-      if (std::max(v[0], std::max(v[1], v[2])) <= lo) continue;
+-      float m[3], u[3];   // clipped share; scene level each channel implies (wb space / rim colour)
+-      for (int c = 0; c < 3; ++c) {
+-        const float t = std::clamp((xd[c * HW + i] - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f);
+-        m[c] = t * t * (3.0f - 2.0f * t);
+-        u[c] = v[c] * prm.wb[c] / prm.hl_ratio[c];
+-      }
+-      for (int c = 0; c < 3; ++c) {
+-        if (m[c] <= 0.0f) continue;
+-        // From the other channels, each weighted by how unclipped it is (a clipped one reads low).
+-        const int a = (c + 1) % 3, b = (c + 2) % 3;
+-        const float wa = 1.0f - m[a], wbb = 1.0f - m[b];
+-        if (wa + wbb <= 1e-3f) continue;   // all clipped: the white rule below
+-        const float rec = prm.hl_ratio[c] * (wa * u[a] + wbb * u[b]) / (wa + wbb) / prm.wb[c];
+-        x[c * HW + i] = v[c] + m[c] * (std::max(v[c], rec) - v[c]);
+-      }
+-      // Colour from the rim, brightness from the reconstruction: where neighbouring pixels clip in
+-      // different channels (perforated metal near Nyquist, 133623) each was rebuilt from another
+-      // channel -> colour speckle. Keep the rebuilt level U (mean implied level), rim colour, by the
+-      // largest clipped share.
+-      const float mm = std::max(m[0], std::max(m[1], m[2]));
+-      if (mm > 0.0f) {
+-        float U = 0.0f;
+-        for (int c = 0; c < 3; ++c) U += x[c * HW + i] * prm.wb[c] / prm.hl_ratio[c];
+-        U *= 1.0f / 3.0f;
+-        for (int c = 0; c < 3; ++c) x[c * HW + i] += mm * (U * prm.hl_ratio[c] / prm.wb[c] - x[c * HW + i]);
+-      }
+-    }
+-  }
++  // Iris C trial: restore RawLens 2.3.94 highlight rule only.
++  // Neutralise only pixels with no remaining unsaturated colour channel.
++  // One-channel clipping is common in sunsets: the other channels still
++  // contain valid colour. Do not expand this mask into coloured neighbours.
+   if (prm.highlight_desat) {
+-    static const bool hl_old = std::getenv("IRIS26985C_LKRL_HL_OLD") != nullptr;
+-    const float lo = (hl_old ? 0.92f : 0.85f) * prm.clip, hi = prm.clip;
+-    // HDR (prm.clip > 1, reference units): the output white is the HDR clip, not 1, so white is capped
+-    // there; a cap at 1 dragged every highlight above the 0 EV frame's clip down (synthetic bracket 1.5-3x
+-    // clip read 0.88 of the reachable level). Normal merges (clip <= 1) are unchanged.
+-    const float wmin = std::min(prm.wb[0], std::min(prm.wb[1], prm.wb[2])) * std::max(1.0f, prm.clip);
++    const float lo = 0.92f * prm.clip, hi = prm.clip;
+     for (size_t i = 0; i < HW; ++i) {
+-      // With reconstruction: white only where every channel clipped (min channel); else the old rules.
+-      float d[3] = {x[i], x[HW + i], x[2 * HW + i]};
+-      if (hl_rec && std::max(d[0], std::max(d[1], d[2])) > 0.85f * prm.clip)
+-        for (int c = 0; c < 3; ++c) d[c] = std::max(d[c], xd[c * HW + i]);
+-      const float v = (hl_old || hl_rec) ? std::min(d[0], std::min(d[1], d[2]))
+-                                         : std::max(x[i], std::max(x[HW + i], x[2 * HW + i]));
+-      float m = std::clamp((v - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f);
+-      if (!hl_old) m = m * m * (3.0f - 2.0f * m);
++      const float mn = std::min(x[i], std::min(x[HW + i], x[2 * HW + i]));
++      const float m = std::clamp((mn - lo) / std::max(hi - lo, 1e-6f), 0.0f, 1.0f);
+       if (m <= 0.0f) continue;
+-      float L = q[0] * x[i] + q[1] * x[HW + i] + q[2] * x[2 * HW + i];   // wb-space luma
+-      // The output is stored clamped to [0, 1] per camera channel (16-bit DNG): a neutral brighter than
+-      // min(wb) would get its least-gained channel (G) cut back and turn pink again, so white is capped there.
+-      if (!hl_old && !hl_rec) L = std::min(L, wmin);
+-      if (hl_rec) {
+-        // Every channel clipped: the scene is at least as bright as the most-gained channel implies
+-        // (max over c of v_c wb_c / col_c), the level the reconstructed surroundings reach; at the clip
+-        // level it read as dark specks inside cloud cores. Rim colour, as the reconstruction.
+-        float U = 0.0f;
+-        for (int c = 0; c < 3; ++c) U = std::max(U, d[c] * prm.wb[c] / prm.hl_ratio[c]);
+-        for (int c = 0; c < 3; ++c) x[c * HW + i] += m * (U * prm.hl_ratio[c] / prm.wb[c] - x[c * HW + i]);
+-        continue;
+-      }
++      const float L = q[0] * x[i] + q[1] * x[HW + i] + q[2] * x[2 * HW + i];   // wb-space luma
+       for (int c = 0; c < 3; ++c) {
+         const float neutral = L / prm.wb[c];
+         x[c * HW + i] += m * (neutral - x[c * HW + i]);
+diff --git a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp
+index 504973adf09822b1d49c37938f00b34a22af5680..23a1d8c4296bde8c7b15524a026671bca7edc78e 100644
+--- a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp
++++ b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_full.cpp
+@@ -243,8 +243,6 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+   // the robust threshold too lenient and smeared a moving car).
+   // Runs beside the coarse alignment below, which does not use it.
+   double t = now_ms();
+-  float hl_ratio[3] = {1.0f, 1.0f, 1.0f};
+-  size_t hl_cells = 0;
+   std::thread noise_fit([&] {
+     const double tn = now_ms();
+     std::vector<float> c(size_t(g.w) * g.h);
+@@ -263,28 +261,6 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+     // every robust / temporal test reject all frames. Fall back to the
+     // level-independent MAD sigma as read noise.
+     if (S.a <= 0 && S.b < 0.25f * S.sigma * S.sigma) S.b = S.sigma * S.sigma;
+-    // Highlight reconstruction colour (SolveParams::hl_ratio): white-balanced rim colour (G = 1), summed over the reference's 2x2 cells in the soft-clip band (brightest channel in
+-    // [0.85 clip, clip), every channel unclipped) -- the unclipped rim of clipped areas, the same band
+-    // the reconstruction blends over. Sums = brightness-weighted, so the bright rim dominates.
+-    {
+-      const float clip = prm.solve.clip, lo = 0.85f * clip;
+-      double sc[3] = {0, 0, 0}, so[3] = {0, 0, 0};
+-      size_t nb = 0;
+-      for (int y = 0; y + 1 < g.h; y += 2)
+-        for (int x = 0; x + 1 < g.w; x += 2) {
+-          const float* r0 = c.data() + size_t(y) * g.w + x;
+-          const float v[3] = {r0[0], 0.5f * (r0[1] + r0[g.w]), r0[g.w + 1]};
+-          const float mx = std::max(v[0], std::max(r0[1], std::max(r0[g.w], v[2])));
+-          if (mx < lo || mx >= clip) continue;
+-          const float vw[3] = {v[0] * wb[0], v[1] * wb[1], v[2] * wb[2]};
+-          for (int k = 0; k < 3; ++k) { sc[k] += vw[k]; so[k] += 0.5 * (vw[(k + 1) % 3] + vw[(k + 2) % 3]); }
+-          ++nb;
+-        }
+-      // Rim colour normalised to green (wb space); a clipped channel is rebuilt from the unclipped ones.
+-      for (int k = 0; k < 3; ++k) hl_ratio[k] = (nb >= 64 && sc[1] > 0) ? float(std::clamp(sc[k] / sc[1], 0.25, 4.0)) : 1.0f;
+-      (void)so;
+-      hl_cells = nb;
+-    }
+     S.ms_noise = now_ms() - tn;
+   });
+ 
+@@ -419,10 +395,6 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+   sp.sigma_max = prm.smax_x * S.sigma;
+   sp.sigma_end = prm.end_x * S.sigma;
+   sp.wb = wb;
+-  for (int k = 0; k < 3; ++k) sp.hl_ratio[k] = hl_ratio[k];
+-  if (const char* v = std::getenv("IRIS26985C_LKRL_HL_LOG"))
+-    if (v[0] == '1') std::fprintf(stderr, "lkr-lite: highlight ratios R %.3f G %.3f B %.3f from %zu rim cells\n",
+-                                  hl_ratio[0], hl_ratio[1], hl_ratio[2], hl_cells);
+   if (prm.paper_parity) {
+     sp.prior_gain = 1.0f;
+     sp.grain = 0.0f;
+@@ -1072,21 +1044,8 @@ bool MergeFull(Gpu* gpu, const std::vector<RawFrame>& frames_in, int W, int H, c
+       S.lfc_ms = float(now_ms() - tl); S.lfc_wu = ls.wu; S.lfc_wv = ls.wv;
+     }
+   }
+-  // Highlight reconstruction (FinishLook) can lift clipped channels above the output white (clouds whose
+-  // green clipped: rebuilt from red / blue). Report the reached level as the white, as an HDR merge does,
+-  // so writers scale instead of clamping one channel (a clamped green turns the cloud pink). 99.99th
+-  // percentile of the values above the white: a lone ringing overshoot does not darken the whole file.
+-  static const bool hl_rec_env_off = std::getenv("IRIS26985C_LKRL_HL_REC") && std::getenv("IRIS26985C_LKRL_HL_REC")[0] == '0';
+-  if (prm.solve.highlight_desat && hl_cells >= 64 && !hl_rec_env_off && !std::getenv("IRIS26985C_LKRL_HL_OLD")) {
+-    std::vector<float> over;
+-    for (size_t i = 0, n3 = size_t(*out_w) * *out_h * 3; i < n3; ++i)
+-      if (rgb_data[i] > S.hdr_white) over.push_back(rgb_data[i]);
+-    if (over.size() >= 16) {
+-      const size_t q = size_t(double(over.size() - 1) * 0.9999);
+-      std::nth_element(over.begin(), over.begin() + q, over.end());
+-      S.hdr_white = std::max(S.hdr_white, over[q]);
+-    }
+-  }
++  // C legacy highlight mode: retain the true bracket-derived hdr_white,
++  // not a synthetic headroom extension from opposed-inpaint rim colours.
+   S.ms_total = now_ms() - t0;
+   if (st) *st = S;
+   return true;
+diff --git a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
+index 9bce93e9c69118736a04e2c9982a70fccceb6ac5..c17e3bb4406243c6633b1baccfa8a005b98eb8e6 100644
+--- a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
++++ b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
+@@ -155,10 +155,7 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
+     else unsetenv("IRIS26985C_LKRL_SCHEDULE");
+     // Speed A/B (2026-11-20): debug.lkr.coarsethr = coarse alignment threads ("-" = default).
+     if (__system_property_get("debug.iris26985c.coarsethr", v) > 0 && v[0] && v[0] != '-') setenv("IRIS26985C_LKRL_COARSE_THR", v, 1);
+-    // Blown-highlight neutralise A/B: debug.lkr.hlold=1 = the old all-channels-clipped rule (pink / yellow).
+-    if (__system_property_get("debug.iris26985c.hlold", v) > 0 && v[0] == '1') setenv("IRIS26985C_LKRL_HL_OLD", "1", 0);
+-    // Highlight reconstruction A/B: debug.lkr.hlrec = 0 off (read once per process).
+-    if (__system_property_get("debug.iris26985c.hlrec", v) > 0 && v[0]) setenv("IRIS26985C_LKRL_HL_REC", v, 0);
++    // C trial highlight policy is fixed locally, never set a process-global highlight switch.
+     // A/B of the DCT look: debug.lkr.fb = 0 no DCT pass; debug.lkr.prior = 1 / 0 forces shadow-luma denoise on / off.
+     if (__system_property_get("debug.iris26985c.fb", v) > 0 && v[0]) setenv("IRIS26985C_LKRL_FB", v, 0);
+     // A/B of the coarse LK iteration cap: debug.lkr.coarseit = 40 restores the old cap.
+@@ -295,6 +292,7 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
+   if (st.hdr_white > 1.0f) LKR_LOG("hdr: white %.3f (output level of the clip)", st.hdr_white);
+   if (!st.gpu_profile.empty())
+     LKR_LOG("gpu profile (sum of %d workers, ms): %s", st.workers, st.gpu_profile.c_str());
++  LKR_LOG("highlight: 2.3.94 all-channels rule; opposed inpaint off; bracket HDR preserved");
+   LKR_LOG("mode: %s", dct ? "DCT x-step" : "no prior");
+   LKR_LOG("look: prior %.2f grain %.2f (sigma %.5f)", st.prior_gain, st.grain, st.sigma);
+   LKR_LOG("merge %dx%d s=%d K=%d tiles %d: noise %.0f coarse %.0f tiles %.0f (gpu %.0f prior %.0f) total %.0f ms",
+diff --git a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp
+index 5923b8ef074b548ebba1e8df4871e1d6a6ff0ca0..5df4300c7657da9759b3d979adebff2cb43e7169 100644
+--- a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp
++++ b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_solver.cpp
+@@ -1603,9 +1603,9 @@ bool LiteSolver::finish(const float* z, std::vector<float>* x, int H, int W, con
+   struct FinPush { int32_t H, W, mode, pl, sm, has_ns, notch, desat; float wbr, wbg, wbb, clip, grain, eqs, p0, p1;
+                    float hr, hg, hb, hrec; };
+   static_assert(sizeof(FinPush) == 80, "fin push");
+-  FinPush f{H, W, 0, 0, 0, hns ? 1 : 0, fa.notch ? 1 : 0, fa.desat ? (std::getenv("IRIS26985C_LKRL_HL_OLD") ? 2 : 1) : 0, fa.wb[0], fa.wb[1], fa.wb[2],
++  FinPush f{H, W, 0, 0, 0, hns ? 1 : 0, fa.notch ? 1 : 0, fa.desat ? 2 : 0 /* donor legacy all-channels rule */, fa.wb[0], fa.wb[1], fa.wb[2],
+             fa.clip, fa.grain, fa.eq_strength, float(fa.hl_radius), 0.0f, fa.hl_ratio[0], fa.hl_ratio[1], fa.hl_ratio[2],
+-            fa.hl_rec ? 1.0f : 0.0f};
++            0.0f /* no opposed inpaint */};
+   gpu_->resetSets();
+   VkDescriptorSet st = gpu_->set(fin_, {&bx, &bz, &bns, &bp, &bt, &bm, &bk});
+   const uint32_t gx = div_up(uint32_t(W), 16), gy = div_up(uint32_t(H), 16);
+@@ -1622,7 +1622,7 @@ bool LiteSolver::finish(const float* z, std::vector<float>* x, int H, int W, con
+   }
+   if (fa.grain > 0.0f || fa.notch) run(5);
+   if (fa.grain > 0.0f && fa.notch) notch(0);
+-  if (fa.desat && fa.hl_rec) run(7);   // highlight reconstruction: dilated per-channel clip (P1..P3)
++  // C legacy highlight mode: never dispatch opposed-inpaint clipping dilation.
+   run(6);
+   if (!gpu_->submit()) return fail("fin submit");
+   x->assign(bx.as<float>(), bx.as<float>() + 3 * HW);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 1e17075bb89996af16b0a946c1681fcc3e3a04f7..18b32a7cd6af7a9cf1189812ffab477819402515 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -322,6 +322,24 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+     private CaptureRequest mIris26980CReferenceRequest;
+     private long mIris26980CReferenceTs, mIris26980CReferenceLastProof;
+     private float mIris26980CReferenceMean;
++    // 26988: display continuity has its own synchronized state, never the B owner.
++    private final com.particlesdevs.photoncamera.processing.experimentc.Iris26988CPreviewContinuity
++            mIris26988CPreview = new com.particlesdevs.photoncamera.processing.experimentc.Iris26988CPreviewContinuity();
++    private boolean mIris26988CKeepTapAnchor; // only during the exact accepted protection request
++    public CaptureRequest iris26988CDisplaySampleOwner(long timestampNs) {
++        final CaptureRequest owner=mIris26975CProvenRawPreviewRequest;
++        return mIris26975CZslPreviewSelected && iris26975CSelectedForMotion() &&
++                mIris26988CPreview.wantsSample(owner,timestampNs)?owner:null;
++    }
++    public void iris26988CDisplaySample(CaptureRequest owner,long timestampNs,float level) {
++        if(owner==mIris26975CProvenRawPreviewRequest && mIris26975CZslPreviewSelected && iris26975CSelectedForMotion())
++            mIris26988CPreview.sample(owner,timestampNs,level);
++    }
++    /** NaN means not C OFF auto. The renderer must retain its original A/B owner. */
++    public float iris26988CDisplayGain(long timestampNs) {
++        if(!mIris26975CZslPreviewSelected || !iris26975CSelectedForMotion()) return Float.NaN;
++        return mIris26988CPreview.gain(mIris26975CProvenRawPreviewRequest,timestampNs);
++    }
+     // All epoch reference operations are serialized by mZslBufferLock.
+     private void iris26980CClearReferenceLocked() {
+         if(mIris26980CReference!=null) mIris26980CReference.close();
+@@ -335,6 +353,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+         synchronized (mZslBufferLock) {
+             mIris26980CTouchRegion=region==null?null:region.clone();
+             mIris26980CTouchLens=region==null?null:physicalID;
++            mIris26988CPreview.reset(); // each genuine tap/reset starts a new brightness anchor
+             iris26980CClearReferenceLocked();
+             mIris26979CTracking.clearProtection();
+         }
+@@ -387,7 +406,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+                 mIris26975CProvenRawPreviewSession = session;
+                 mIris26975CProvenRawPreviewReader = mImageReaderRaw;
+                 mIris26975CProvenRawPreviewRequest = request;
+-            }
++                if(java.util.Objects.equals(request.get(CaptureRequest.CONTROL_AE_MODE),CaptureRequest.CONTROL_AE_MODE_ON))
++                    mIris26988CPreview.beginAuto(request,mIris26988CKeepTapAnchor);
++                else if(!mIris26988CPreview.owns(request)) mIris26988CPreview.reset();
++            } else mIris26988CPreview.reset();
+         }
+     }
+     private Integer mIris26975COriginalAntibanding = null;
+@@ -546,6 +568,13 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+                     mIris26979CTracking.clearProtection();
+                     iris26980CClearReferenceLocked();
+                 }
++                final boolean touch=mIris26980CTouchRegion!=null;
++                if(!locked && !mIris26988CPreview.owns(paired.getRequest()))
++                    mIris26988CPreview.beginAuto(paired.getRequest(),false); // proved settled request, never stale touch
++                final boolean displayReady=!locked && mIris26988CPreview.observe(paired.getRequest(),ts,ss,iso,meter.mean);
++                // A new tap must acquire its own body-brightness anchor, not the old global AE.
++                // Bounded wait: unsupported preview sampling must not stall the RAW ring.
++                if(!locked && touch && !displayReady) return;
+                 final boolean biasChanged=!locked && compRange!=null && mIris26979CTracking.observeProtection(
+                         meter.protectionEv,meter.highlightSignal,meter.clippedFraction,appliedEv,step,baseComp,compRange.getLower(),compRange.getUpper());
+                 if(sceneChanged||biasChanged) {
+@@ -553,10 +582,14 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+                     // HAL retains its antibanding authority and the existing touch region.
+                     final int nextComp=compRange==null?baseComp:mIris26979CTracking.compensation(userComp,compRange.getLower(),compRange.getUpper(),step);
+                     Log.i(TAG,"IRIS_26981_C_ABSOLUTE_TARGET scene="+sceneChanged+" touch="+(mIris26980CTouchRegion!=null)+" baseComp="+baseComp+" protection="+mIris26979CTracking.protectionEv()+" comp="+nextComp);
+-                    rebuildPreviewBuilder(true);
++                    mIris26988CKeepTapAnchor=biasChanged && !sceneChanged && touch && mIris26988CPreview.anchorReady();
++                    if(sceneChanged) mIris26988CPreview.reset();
++                    try { rebuildPreviewBuilder(true); }
++                    finally { mIris26988CKeepTapAnchor=false; }
+                     return;
+                 }
+                 if(locked) {
++                    mIris26988CPreview.observe(paired.getRequest(),ts,ss,iso,meter.mean);
+                     if(mIris26980CReferenceRequest==paired.getRequest()) {
+                         double ratio=(meter.mean+.002)/(mIris26980CReferenceMean+.002);
+                         if(ratio<.85 || ratio>1.18 || appliedEv>.03f || meter.clippedFraction>.0005f)
+@@ -568,9 +601,15 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+                 // The unprotected low-light preview is the brightness reference, not a
+                 // later HAL-to-manual display shift. Never use a stale reference in a
+                 // protected bright scene (preserves the observed 090157 behavior).
++                if(!displayReady) return;
+                 final boolean darkReference=appliedEv<=.03f && meter.protectionEv<=.03f &&
+                         meter.mean<=.08f && meter.highlightSignal<=.65f && meter.clippedFraction<=.0005f;
+-                if(darkReference && mTextureView!=null) {
++                final boolean safeReserveReference=appliedEv<=.03f && meter.protectionEv<=.03f &&
++                        meter.mean<=.08f && meter.peakSignal<=.70f && meter.clippedFraction==0f &&
++                        mIris26988CPreview.anchorReady();
++                // The original HDRNet thumbnail continues to set intended rendering brightness.
++                // Only a proven, unclipped low-gain reserve can use it to collect extra photons.
++                if((darkReference||safeReserveReference) && mTextureView!=null) {
+                     if(mIris26980CReferenceRequest!=paired.getRequest()) {
+                         iris26980CClearReferenceLocked();
+                         try {
+@@ -604,12 +643,19 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+                         ? 36f*focal/sensorSize.getWidth():Float.NaN;
+                 if(active!=null && physicalCrop!=null && physicalCrop.width()>0 && active.contains(physicalCrop))
+                     equivalentMm*=Math.max(1f,(float)active.width()/physicalCrop.width());
+-                final com.particlesdevs.photoncamera.processing.experimentc.Iris26981CManualExposure.Pair chosen=
+-                        com.particlesdevs.photoncamera.processing.experimentc.Iris26981CManualExposure.plan(
++                final boolean appearanceReady=mIris26988CPreview.anchorReady() &&
++                        mIris26980CReferenceRequest==paired.getRequest() && mIris26980CReference!=null &&
++                        mIris26980CReference.isReady();
++                final com.particlesdevs.photoncamera.processing.experimentc.Iris26988CExposurePlan.Pair chosen=
++                        com.particlesdevs.photoncamera.processing.experimentc.Iris26988CExposurePlan.plan(
+                             ss,iso,range.getLower(),range.getUpper(),gain.getLower(),gain.getUpper(),
+                             frameLimit==null?0L:frameLimit,gyro,equivalentMm,
+                             physical.get(CaptureResult.STATISTICS_SCENE_FLICKER),meter.mean,meter.highlightSignal,
+-                            meter.clippedFraction,appliedEv);
++                            meter.peakSignal,meter.clippedFraction,appliedEv,meter.protectionEv,appearanceReady);
++                Log.i(TAG,"IRIS_26988_C_EXPOSURE touch="+touch+" anchor="+mIris26988CPreview.anchorReady()+
++                        " appearanceReady="+appearanceReady+" peak="+meter.peakSignal+
++                        " clipped="+meter.clippedFraction+" residualDemand="+meter.protectionEv+
++                        " rawExposureRatio="+chosen.exposureRatio+" protection="+appliedEv);
+                 Log.i(TAG,"IRIS_26981_C_ADAPTIVE_PAIR base="+ss+"/"+iso+" chosen="+chosen.shutterNs+"/"+chosen.iso+" gyro="+gyro+" equivalentMm="+equivalentMm+" protection="+appliedEv);
+                 builder.set(CaptureRequest.CONTROL_AE_MODE,CaptureRequest.CONTROL_AE_MODE_OFF);
+                 builder.set(CaptureRequest.CONTROL_AE_LOCK,false);
+@@ -634,6 +680,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+                         mIris26980CReference!=null && mIris26980CReference.isReady()?mIris26980CReference:null;
+                 if(ref!=null) mIris26980CReference=null;
+                 final float refMean=mIris26980CReferenceMean;
++                mIris26988CPreview.beginManual(paired.getRequest(),next,ts);
+                 mPreviewInputRequest=next;
+                 iris26975CRecordPreviewRequest(session,builder,next);
+                 mIris26976CLockedPreviewRequest=next;
+@@ -2124,6 +2171,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 mIris26980CWaitingForLock=false;
+                 mIris26976CLockedPreviewRequest=null;
+                 mIris26979CTouchUpdate=false;
++                mIris26988CPreview.reset();
+                 mIris26980CTouchRegion=null;
+                 iris26980CClearReferenceLocked();
+                 mIris26979CTracking.reset();
+@@ -7235,6 +7283,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             synchronized (mZslBufferLock) {
+                 if (mIris26975CZslPreviewSelected) iris26975CClearOwnZslLocked();
+                 mIris26979CTracking.reset();
++                mIris26988CPreview.reset();
+                 iris26980CClearReferenceLocked();
+                 mIris26980CTouchRegion=null;
+                 mIris26975CZslPreviewSelected = false;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26975CRawHighlightMeter.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26975CRawHighlightMeter.java
+index aa5f4b1ce0611a08d2c5786fcdd8dcc329e29113..dc2acb007044bf968aed96e8042bcce106d57388 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26975CRawHighlightMeter.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26975CRawHighlightMeter.java
+@@ -14,10 +14,11 @@ public final class Iris26975CRawHighlightMeter {
+     private Iris26975CRawHighlightMeter() {}
+ 
+     public static final class Measurement {
+-        public final float protectionEv, mean, clippedFraction, highlightSignal;
+-        private Measurement(float protectionEv, float mean, float clippedFraction, float highlightSignal) {
++        public final float protectionEv, mean, clippedFraction, highlightSignal, peakSignal;
++        private Measurement(float protectionEv, float mean, float clippedFraction, float highlightSignal, float peakSignal) {
+             this.protectionEv = protectionEv; this.mean = mean; this.clippedFraction = clippedFraction;
+             this.highlightSignal = highlightSignal;
++            this.peakSignal = peakSignal;
+         }
+     }
+     public static float protectionEv(ByteBuffer raw, int rowStride, int pixelStride,
+@@ -41,7 +42,7 @@ public final class Iris26975CRawHighlightMeter {
+         int broadVotes = 0, mixedVotes = 0, compactVotes = 0, coherentCells = 0;
+         long clipped = 0, count = 0;
+         double signalSum = 0.0;
+-        float p995Max = 0f, coherentPeak = 0f;
++        float p995Max = 0f, coherentPeak = 0f, sensorPeak = 0f;
+         for (int phase = 0; phase < 9; phase++) {
+             int ditherX = (phase % 3) * Math.max(1, stepX / 3);
+             int ditherY = (phase / 3) * Math.max(1, stepY / 3);
+@@ -62,6 +63,7 @@ public final class Iris26975CRawHighlightMeter {
+                         histogram[Math.min(BINS - 1, Math.max(0, (int)(signal * BINS)))]++;
+                         samples++;
+                         signalSum += signal;
++                        sensorPeak = Math.max(sensorPeak, signal);
+                         if (signal <= .040f) shadows++;
+                         if (signal >= first) { second = first; first = signal; }
+                         else if (signal > second) second = signal;
+@@ -90,7 +92,7 @@ public final class Iris26975CRawHighlightMeter {
+         float fraction = clipped / (float)count;
+         return new Measurement(clipDecision(p995Max, fraction, broadVotes > 0 || mixedVotes > 0,
+                 coherentCells > 0, compactVotes), (float)(signalSum/count), fraction,
+-                Math.max(p995Max, coherentPeak));
++                Math.max(p995Max, coherentPeak), sensorPeak);
+     }
+ 
+     /** Exact 26871 B negative-only decision constants, independently owned by C.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26988CExposurePlan.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26988CExposurePlan.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..0590538a6fa383e31a5a457f3543a84f63c8100a
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26988CExposurePlan.java
+@@ -0,0 +1,66 @@
++package com.particlesdevs.photoncamera.processing.experimentc;
++
++/** C OFF automatic-only exposure allocator. Keep 26981's proven high-ISO path,
++ * extend the same-product strategy to lower gain, and permit strictly bounded
++ * extra integration at minimum gain ONLY with an independently measured HAL
++ * appearance reference. No guess at a clipped photosite's original value. */
++public final class Iris26988CExposurePlan {
++    private Iris26988CExposurePlan() {}
++    private static final double LOG2 = Math.log(2.0);
++    public static final class Pair {
++        public final long shutterNs;
++        public final int iso;
++        public final double exposureRatio;
++        Pair(long shutterNs,int iso,long ss,int baseIso) {
++            this.shutterNs=shutterNs; this.iso=iso;
++            this.exposureRatio=((double)shutterNs*iso)/((double)ss*baseIso);
++        }
++    }
++    private static double clamp(double x,double lo,double hi){return Math.max(lo,Math.min(hi,x));}
++    public static Pair plan(long ss,int iso,long minSs,long maxSs,int minIso,int maxIso,long maxFrame,
++            int gyro,float equivalentMm,Integer flicker,float mean,float high,float peak,float clipped,
++            float protection,float residualDemand,boolean appearanceReady) {
++        Iris26981CManualExposure.Pair legacy=Iris26981CManualExposure.plan(ss,iso,minSs,maxSs,minIso,maxIso,
++                maxFrame,gyro,equivalentMm,flicker,mean,high,clipped,protection);
++        long limit=maxFrame>0?Math.min(maxSs,maxFrame):maxSs;
++        long base=Math.max(minSs,Math.min(limit,ss));
++        int gain=Math.max(minIso,Math.min(maxIso,iso));
++        Pair unchanged=new Pair(base,gain,ss,iso);
++        // Never spend headroom for unmeasured, already clipped or physically unsafe data.
++        if(gyro<0||gyro>35||!Float.isFinite(equivalentMm)||equivalentMm<=0f||flicker==null||
++                !Float.isFinite(mean)||mean<0f||mean>.12f||!Float.isFinite(high)||high<0f||high>=.85f||
++                !Float.isFinite(peak)||peak<high-.008f||peak<0f||peak>=.90f||
++                !Float.isFinite(clipped)||clipped!=0f||!Float.isFinite(protection)||protection<0f||
++                !Float.isFinite(residualDemand)||residualDemand<0f||residualDemand>.03f) return unchanged;
++        final double energy=(double)ss*iso;
++        // No assumption that the HAL's output sensitivity is identical to the sensor's full well.
++        // Bound shutter by measured ALL-channel peak even when reducing analog gain.
++        final long headroomCap=peak>0f?(long)Math.floor(ss*.90/peak):limit;
++        if(gain>=400 && legacy.shutterNs<=headroomCap && legacy.shutterNs>base)
++            return new Pair(legacy.shutterNs,legacy.iso,ss,iso);
++        double steady=clamp(1.0-gyro/36.0,0,1),focal=clamp(28.0/equivalentMm,.20,1);
++        double dark=clamp((.12-mean)/.11,0,1);
++        long cap=Math.min(limit,Math.min(headroomCap,1_000_000_000L/15L));
++        cap=Math.min(cap,Math.round((1_000_000_000.0/15.0)*(.45+.55*steady)*focal));
++        // At base ISO there is no gain left to trade. Only spend reserve if the
++        // RAW is demonstrably unclipped, unprotected and a visual reference exists.
++        final boolean extra=gain==minIso && iso==minIso && appearanceReady && protection<=.03f &&
++                peak<=.70f && mean<=.08f && flicker==0;
++        final double extraEv=extra?(.33*dark*(.35+.65*steady)*Math.sqrt(focal)):0.0;
++        cap=Math.min(cap,(long)Math.floor(energy/minIso*Math.pow(2.0,extraEv)));
++        final double need=clamp(Math.log(Math.max(1.0,gain/(double)minIso))/(3*LOG2),0,1);
++        final double ev=extra?extraEv:(.15+.65*dark*need)*(.35+.65*steady)*Math.sqrt(focal);
++        long preferred=Math.min(cap,(long)Math.floor(base*Math.pow(2.0,ev)));
++        if(flicker!=0){
++            double period=flicker==1?10_000_000.0:flicker==2?1_000_000_000.0/120.0:0;
++            if(period==0||Math.abs(base-Math.rint(base/period)*period)>period*.015)return unchanged;
++            preferred=Math.round(Math.floor(preferred/period)*period);
++        }
++        if(preferred>cap||preferred<base*Math.pow(2.0,.12))return unchanged;
++        int newIso=extra?minIso:(int)Math.max(minIso,Math.min(maxIso,Math.floor(energy/preferred)));
++        if(!extra&&(newIso>=gain||(double)preferred*newIso>energy))return unchanged;
++        Pair result=new Pair(preferred,newIso,ss,iso);
++        if(!Double.isFinite(result.exposureRatio)||result.exposureRatio<.98||result.exposureRatio>Math.pow(2.0,extraEv)+1e-9)return unchanged;
++        return result;
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26988CPreviewContinuity.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26988CPreviewContinuity.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4d6160a883b5ca8ef957fe62c96f457ab602981
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/experimentc/Iris26988CPreviewContinuity.java
+@@ -0,0 +1,96 @@
++package com.particlesdevs.photoncamera.processing.experimentc;
++
++import java.nio.ByteBuffer;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++
++/** C-private display-only matching of the last settled HAL body brightness to
++ * the new protected/manual ISP frame. Every comparison requires an exact sensor
++ * timestamp AND the current immutable request. No synthetic exposure evidence,
++ * no Camera2 writes, and no use of the displayed (already compensated) image. */
++public final class Iris26988CPreviewContinuity {
++    private static final long WAIT_NS=280_000_000L, PROBE_NS=1_000_000_000L;
++    private static final int MAX=32;
++    private Object owner;
++    private boolean manual;
++    private long firstEvidence,firstApplied,lastEvidence,lastSample,transitionTs;
++    private int matches;
++    private float anchor=Float.NaN, anchorMean=Float.NaN, gain=1f;
++    private double anchorEnergy;
++    private final LinkedHashMap<Long,Float> samples=new LinkedHashMap<>();
++    private final LinkedHashMap<Long,Evidence> evidence=new LinkedHashMap<>();
++    private static final class Evidence {
++        final float mean;final double energy;
++        Evidence(float m,double e){mean=m;energy=e;}
++    }
++    public synchronized void reset(){owner=null;manual=false;anchor=anchorMean=Float.NaN;anchorEnergy=0;transitionTs=0;clearSamples();}
++    private void clearSamples(){firstEvidence=firstApplied=lastEvidence=lastSample=0;matches=0;gain=1f;samples.clear();evidence.clear();}
++    public synchronized boolean owns(Object request){return request!=null&&request==owner;}
++    public synchronized void beginAuto(Object request,boolean keepAnchor){
++        if(!keepAnchor)reset();else clearSamples();
++        owner=request;manual=false;transitionTs=0;
++    }
++    public synchronized void beginManual(Object oldRequest,Object newRequest,long ts){
++        if(!owns(oldRequest))reset();else clearSamples();
++        owner=newRequest;manual=true;transitionTs=ts;
++    }
++    public synchronized boolean anchorReady(){return Float.isFinite(anchor)&&anchor>0f;}
++    public synchronized boolean observe(Object request,long ts,long shutter,int iso,float rawMean){
++        if(!owns(request)||ts<=lastEvidence||ts<=0||shutter<=0||iso<=0||!Float.isFinite(rawMean)||rawMean<0f)return false;
++        lastEvidence=ts;if(firstEvidence==0)firstEvidence=ts;
++        evidence.put(ts,new Evidence(rawMean,(double)shutter*iso));trim(evidence);
++        match(ts);
++        return anchorReady() && matches>=1 || ts-firstEvidence>=WAIT_NS;
++    }
++    public synchronized boolean wantsSample(Object request,long ts){
++        if(!owns(request)||ts<=0||ts<=lastSample)return false;
++        if(manual)return anchorReady()&&matches<2&&transitionTs>0&&ts>=transitionTs&&ts-transitionTs<=PROBE_NS;
++        if(matches>=2)return false;
++        return firstEvidence==0||ts-firstEvidence<=PROBE_NS;
++    }
++    public synchronized void sample(Object request,long ts,float level){
++        if(!wantsSample(request,ts))return;
++        lastSample=ts;
++        if(!Float.isFinite(level)||level<=.0002f||level>=.85f)return;
++        samples.put(ts,level);trim(samples);match(ts);
++    }
++    private static void trim(LinkedHashMap<?,?> m){while(m.size()>MAX)m.remove(m.keySet().iterator().next());}
++    private void match(long ts){
++        Evidence e=evidence.get(ts);Float y=samples.get(ts);
++        if(e==null||y==null)return;
++        evidence.remove(ts);samples.remove(ts);
++        if(!anchorReady()){
++            if(manual)return;
++            anchor=y;anchorMean=e.mean;anchorEnergy=e.energy;matches=1;return;
++        }
++        double predicted=anchorMean*e.energy/anchorEnergy;
++        // A true scene transition cannot be relabelled an ISP exposure change.
++        double ratio=(e.mean+.002)/(predicted+.002);
++        if(!Double.isFinite(ratio)||ratio<.67||ratio>1.50){gain=1f;firstApplied=0;return;}
++        float next=matchGain(anchor,y);
++        if(matches==0||firstApplied==0){gain=next;firstApplied=ts;}
++        else gain=(float)Math.sqrt(gain*next);
++        matches++;
++    }
++    public synchronized float gain(Object request,long ts){return !owns(request)?Float.NaN:firstApplied>0&&ts>=firstApplied?gain:1f;}
++    public static float matchGain(float target,float actual){
++        if(!Float.isFinite(target)||!Float.isFinite(actual)||target<=0f||target>=1f||actual<=0f||actual>=1f)return 1f;
++        return (float)Math.max(.25,Math.min(8.0,(double)target*(1-actual)/(actual*(1-target))));
++    }
++    public static float whiteAnchored(float x,float g){return g*x/(1f+(g-1f)*x);}
++    // The existing preview shader uses max(linear RGB) as the white-anchored guide.
++    // Use the SAME guide in its original, uncompensated 12x96 OES sample.
++    public static float medianGuide(ByteBuffer rgba){
++        if(rgba==null)return Float.NaN;
++        ByteBuffer b=rgba.duplicate();b.rewind();int n=b.remaining()/4;
++        if(n!=12*96||b.remaining()!=4*n)return Float.NaN;
++        float[] a=new float[n];int k=0;
++        for(int i=0;i<n;i++){
++            int peak=Math.max(b.get()&255,Math.max(b.get()&255,b.get()&255));b.get();
++            float e=peak/255f;if(e>=.90f)continue;
++            float y=e<=.04045f?e/12.92f:(float)Math.pow((e+.055f)/1.055f,2.4);
++            if(y>.0002f)a[k++]=y;
++        }
++        if(k<n/4)return Float.NaN;Arrays.sort(a,0,k);return a[k/2];
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+index a99ec085e7f260b58bc1f553e6bb3646dec3effc..f7f9beaf5b908b0bf2326f9216f27ee4a02224db 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+@@ -96,6 +96,8 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+     private boolean mIris26936AsyncReady;
+     private boolean mIris26936AsyncUnsupported;
+     private boolean mIris26936AsyncThisFrame;
++    private boolean mIris26988CProbeFailed;
++    private float mIris26988CLastLoggedGain=Float.NaN;
+     private int mIris26936Submitted;
+     private int mIris26936Completed;
+     private int mIris26936Backpressure;
+@@ -229,6 +231,27 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+                         + " exactTimestampOwnership=true noSensorAEChange=true");
+             }
+         }
++        // Reuse only the tiny original-ISP probe; never feed C into B's
++        // continuity/stripe state or sample an already brightness-corrected image.
++        final android.hardware.camera2.CaptureRequest cProbeOwner=iris26872Eligible || iris26872Controller==null || iris26553FrameTimestamp<=0L
++                || mIris26988CProbeFailed || mIris26872ProbeDisabled || mIris26872ProbeProgram==0 || mIris26872ProbeFbo==0
++                ?null:iris26872Controller.iris26988CDisplaySampleOwner(iris26553FrameTimestamp);
++        if(cProbeOwner!=null) {
++            iris26872ProbeDraw();
++            mIris26872ProbeReadback.rewind();
++            GLES20.glReadPixels(0,0,Iris26872PreviewStripe.WIDTH,Iris26872PreviewStripe.HEIGHT,
++                    GLES20.GL_RGBA,GLES20.GL_UNSIGNED_BYTE,mIris26872ProbeReadback);
++            int error=GLES20.glGetError();
++            iris26872ProbeRestore();
++            if(error==GLES20.GL_NO_ERROR) {
++                float level=com.particlesdevs.photoncamera.processing.experimentc.Iris26988CPreviewContinuity
++                        .medianGuide(mIris26872ProbeReadback);
++                iris26872Controller.iris26988CDisplaySample(cProbeOwner,iris26553FrameTimestamp,level);
++            } else {
++                mIris26988CProbeFailed=true; // do not disable the protected B path
++                Log.w("MainRenderer","IRIS_26988_C_PREVIEW_PROBE_FAILED glError=0x"+Integer.toHexString(error));
++            }
++        }
+         float[] iris26872Stripe = mIris26872Stripe.params();
+         /* A missed GPU probe cannot apply prior-frame stripe phase to the
+          * new frame: neutral strength, not stale anti-stripe/exposure evidence. */
+@@ -275,6 +298,15 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+         }
+         float iris26667PreviewGain = (float) Math.pow(2.0,
+                 Math.max(0.0f, mIris26663LastConfirmedProtectionEv));
++        final float cDisplayGain=iris26663Controller==null?Float.NaN:
++                iris26663Controller.iris26988CDisplayGain(mSTexture.getTimestamp());
++        if(Float.isFinite(cDisplayGain)) {
++            iris26667PreviewGain=cDisplayGain;
++            if(!Float.isFinite(mIris26988CLastLoggedGain)||Math.abs(cDisplayGain-mIris26988CLastLoggedGain)>.025f) {
++                Log.i("MainRenderer","IRIS_26988_C_DISPLAY_GAIN="+cDisplayGain+" timestamp="+mSTexture.getTimestamp());
++                mIris26988CLastLoggedGain=cDisplayGain;
++            }
++        } else mIris26988CLastLoggedGain=Float.NaN;
+         GLES20.glUniform1f(iris26662ReferencePreviewGain, iris26667PreviewGain);
+         mIris26678PreviewFlicker[0] = 0.0f;
+         mIris26678PreviewFlicker[1] = 0.0f;
+@@ -584,6 +616,8 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+     }
+     @Override
+     public void onSurfaceCreated(GL10 gl, EGLConfig config) {
++        mIris26988CProbeFailed=false;
++        mIris26988CLastLoggedGain=Float.NaN;
+         Arrays.fill(mIris26936Pbo, 0);
+         Arrays.fill(mIris26936Fence, 0L);
+         Arrays.fill(mIris26936PendingTimestamp, 0L);
+diff --git a/app/version.properties b/app/version.properties
+index 0d705c535564f7fd1dc45eb7431aee8b92d20f22..861ce2a161f7a857a1526db2d9c6f9af2ad32292 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726987
+-VERSION_BUILD=26987
++VERSION_NAME=0.9726988
++VERSION_BUILD=26988

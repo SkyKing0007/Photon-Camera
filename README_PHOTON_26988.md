@@ -1,0 +1,3 @@
+# Photon 26988 V2
+Latest successful 26987 artifact only. Stage 1 repository root files; Stage 2 workflow; Stage 3 trigger. Commit each stage in order. Never upload APK or raw app source directly.
+Preserve original 26988 C OFF exposure and preview continuity, with additional C-private native 2.3.94 highlight rule only (no opposed inpaint or synthetic rim white extension). True exposure-bracket HDR headroom, 3x2 solve, 2.4.20 shaders and all other processing remain unchanged. Highlight recovery quality may regress; test both JPG and Linear DNG. Real SDK, NDK, shader, Kotlin/Java and APK gates remain mandatory in Actions.
