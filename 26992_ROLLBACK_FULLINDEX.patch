@@ -1,0 +1,143 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/GpuReferenceGainmapProducer.kt b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/GpuReferenceGainmapProducer.kt
+index 74e8691c3853e6bb583a165ccd146dfcb453f438..f76eb3ef43e258358544cdb1b15f25f21518cd2b 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/GpuReferenceGainmapProducer.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/GpuReferenceGainmapProducer.kt
+@@ -95,7 +95,7 @@ class GpuReferenceGainmapProducer : GainmapProducer {
+                 PLog.e(TAG, "GPU gainmap failed for ${source.sourceKind}", it)
+             }.getOrNull()
+         }
+-        PLog.d(TAG, "GPU gainmap build took ${elapsed}ms, source=${source.sourceKind}, lutTransfer=full_reference, gainPolicy=C26992_highlight_only, success=${result != null}")
++        PLog.d(TAG, "GPU gainmap build took ${elapsed}ms, source=${source.sourceKind}, lutTransfer=full_reference, success=${result != null}")
+         result
+     }
+ 
+@@ -507,8 +507,7 @@ class GpuReferenceGainmapProducer : GainmapProducer {
+          * Transfer the LUT's luminance ratio onto the complete linear-sRGB HDR reference.
+          * With sidecar = (SDR_after + offset) / (SDR_before + offset), the encoded gain is
+          * (HDR_before + offset) / (SDR_before + offset). LUT rendering changes the playback
+-         * base. The C-private highlight-only policy then limits the added headroom
+-         * with continuous knees and a positive, bounded luminance gain.
++         * base without introducing a second HDR contrast curve at absolute white.
+          */
+         private val RAW_LUMA_RESIDUAL_FRAGMENT_SHADER = """
+             #version 300 es
+@@ -552,18 +551,18 @@ class GpuReferenceGainmapProducer : GainmapProducer {
+                     (hdrLuma + uOffset) * lutLumaGain - uOffset,
+                     0.0
+                 );
+-                // Only genuine linear HDR headroom above reference white.
+-                // Continuous SDR and HDR knees keep shadows/midtones at unity
+-                // and avoid a hard gain boundary across gradual illumination.
+-                float excess = max(targetHdrLuma - 1.0, 0.0);
+-                float highlightWeight = smoothstep(0.40, 0.80, sdrLuma);
+-                float headroomWeight = smoothstep(0.0, 0.50, excess);
++                float candidateRatio = clamp(
++                    (targetHdrLuma + uOffset) / (sdrLuma + uOffset),
++                    uMinGainRatio,
++                    uMaxGainRatio
++                );
++
+                 float normalizedStrength = clamp(uStrength, 0.25, 2.0);
+-                float capacity = uMaxGainRatio - 1.0;
+-                float weightedExcess = excess / (sdrLuma + uOffset) * normalizedStrength;
+-                float boundedBoost = capacity * weightedExcess /
+-                    (capacity * (1.0 + normalizedStrength) + weightedExcess);
+-                float strengthRatio = 1.0 + highlightWeight * headroomWeight * boundedBoost;
++                float strengthRatio = clamp(
++                    1.0 + (candidateRatio - 1.0) * normalizedStrength,
++                    uMinGainRatio,
++                    uMaxGainRatio
++                );
+                 float gainEv = log2(strengthRatio);
+                 float minGainEv = log2(uMinGainRatio);
+                 float maxGainEv = log2(uMaxGainRatio);
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/RawGainmapMath.kt b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/RawGainmapMath.kt
+index c9b1944c4c8991c77ad7654defc88ae8f97e352f..b3c31f10bd432be0f508478a0a8d608ea40d9e9b 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/RawGainmapMath.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/hdr/RawGainmapMath.kt
+@@ -6,8 +6,8 @@ import kotlin.math.abs
+ 
+ internal object RawGainmapMath {
+     const val DOWNSAMPLE = 2
+-    const val MIN_GAIN_RATIO = 1.0f
+-    const val MAX_GAIN_RATIO = 2.0f
++    const val MIN_GAIN_RATIO = 0.25f
++    const val MAX_GAIN_RATIO = 4.0f
+     const val OFFSET = 1e-4f
+ 
+     private const val LUMA_R = 0.2126f
+@@ -33,7 +33,14 @@ internal object RawGainmapMath {
+         offset: Float = OFFSET,
+     ): Float {
+         val sdrLinear = srgbToLinear(sdrEncoded)
+-        val strengthRatio = highlightGainRatio(sdrLinear, hdrLinear, strength, maxGainRatio, offset)
++        val ratio = ((hdrLinear.coerceAtLeast(0f) + offset) / (sdrLinear + offset))
++            .coerceIn(minGainRatio, maxGainRatio)
++        val strengthRatio = HdrGainmapStrength.applyToRatio(
++            ratio = ratio,
++            minGainRatio = minGainRatio,
++            maxGainRatio = maxGainRatio,
++            strength = strength,
++        )
+         return ((ln(strengthRatio) - ln(minGainRatio)) / (ln(maxGainRatio) - ln(minGainRatio)))
+             .coerceIn(0f, 1f)
+     }
+@@ -63,39 +70,18 @@ internal object RawGainmapMath {
+         val targetHdrLuma = lutLuminanceGain?.let { gain ->
+             applyLutLuminanceGain(gain, hdrLuma, offset)
+         } ?: hdrLuma
+-        val strengthRatio = highlightGainRatio(sdrLuma, targetHdrLuma, strength, maxGainRatio, offset)
++        val candidateRatio = ((targetHdrLuma + offset) / (sdrLuma + offset))
++            .coerceIn(minGainRatio, maxGainRatio)
++        val strengthRatio = HdrGainmapStrength.applyToRatio(
++            ratio = candidateRatio,
++            minGainRatio = minGainRatio,
++            maxGainRatio = maxGainRatio,
++            strength = strength,
++        )
+         return ((ln(strengthRatio) - ln(minGainRatio)) /
+             (ln(maxGainRatio) - ln(minGainRatio))).coerceIn(0f, 1f)
+     }
+ 
+-    // C OFF only: preserve the encoded SDR base, and consume only genuine
+-    // linear HDR headroom above reference white. Match the GPU shader exactly.
+-    private fun smoothStep(low: Float, high: Float, value: Float): Float {
+-        val t = ((value - low) / (high - low)).coerceIn(0f, 1f)
+-        return t * t * (3f - 2f * t)
+-    }
+-
+-    internal fun highlightGainRatio(
+-        sdrLuma: Float,
+-        targetHdrLuma: Float,
+-        strength: Float,
+-        maxGainRatio: Float = MAX_GAIN_RATIO,
+-        offset: Float = OFFSET,
+-    ): Float {
+-        val safeSdr = sdrLuma.coerceAtLeast(0f)
+-        val excess = (targetHdrLuma - 1f).coerceAtLeast(0f)
+-        val highlightWeight = smoothStep(0.40f, 0.80f, safeSdr)
+-        val headroomWeight = smoothStep(0f, 0.50f, excess)
+-        val normalizedStrength = HdrGainmapStrength.coerce(strength)
+-        val capacity = maxGainRatio - 1f
+-        val weightedExcess = excess / (safeSdr + offset) * normalizedStrength
+-        // A rational soft ceiling, not a hard threshold/plateau. The boost
+-        // never exceeds either the measured excess or the advertised capacity.
+-        val boundedBoost = capacity * weightedExcess /
+-            (capacity * (1f + normalizedStrength) + weightedExcess)
+-        return 1f + highlightWeight * headroomWeight * boundedBoost
+-    }
+-
+     fun linearLuma(r: Float, g: Float, b: Float): Float =
+         LUMA_R * r + LUMA_G * g + LUMA_B * b
+ 
+diff --git a/app/version.properties b/app/version.properties
+index 1ed5ec0b0a54cfb09ab7a19a77058b109db75ec8..6fa3a6a3b8269cfc21cbe0783143380ef8299895 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726992
+-VERSION_BUILD=26992
++VERSION_NAME=0.9726991
++VERSION_BUILD=26991
