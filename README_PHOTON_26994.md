@@ -1,0 +1,11 @@
+# Photon 26994 — adaptive C OFF watermark only
+
+Use the existing experimental-clean-photon-rebuild branch in vscode.dev. Upload Stage 1 contents into repository root, commit; Stage 2 contents into root (including .github/workflows), commit; Stage 3 trigger last, commit. Preserve every prior handoff, source, workflow and payload. No APK upload or dev changes.
+
+Runtime: freeze the existing global watermark preference exclusively in C OFF JPEG capture. Retain the exact 26993 RAW, processing, SDR, HDR and gain-map generation pipeline whether enabled or disabled. Composite the original Iris white/dark PNG using C ON's five samples, encoded luminance threshold 0.55, width 11.5% and margin 2.5% of the shorter side. Only nontransparent SDR spans are written after final rendering and original gain-map generation, before the existing single JPEG/R encode. Neutralize HDR gain at the logo's local interpolation footprint; no full rectangle or global gain change. JPEG compression can affect neighboring blocks; actual Android HDR display and output appearance require device tests. DNG-only, A/B, C ON and Spektra are untouched.
+
+Exact successful 26993 authority and hashes: see 26994_AUTHORITY_AND_SCOPE.json. 2660 original files, 4 modified (three Kotlin plumbing + version), one added compositor, 2656 protected, no deletions. No original native, vendor, asset or infrastructure file changed. New versioned workflow and checks only. Preserve real pinned GLSL/SPIR-V, NDK, Kotlin, Java and one assembleDebug; original historical regression suite preserved and isolated on exact historical inputs. The new live host suite runs once; source and sealed receipts checked again before/after compilation, rather than repeating identical host executions. No previous APK rebuild.
+
+Host compositor tests use actual production Kotlin and original assets with host-only Android API models. Full Android compilation and actual on-device watermark/Ultra HDR are NOT RUN locally. The complete historical repository suite remains mandatory in Actions; local environment is not a full checkout. Do not claim build success until the new successful Actions run and published artifact exist.
+
+Commit: 26994: Restore adaptive C Super Res OFF watermark without altering image processing
