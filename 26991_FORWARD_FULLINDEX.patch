@@ -1,0 +1,355 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnGpuMerge.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnGpuMerge.kt
+index 06d473c01beeb479174aa9fa651fe5339cbc5ccd..745e202e250642acc20292e5c91bbb18791b0736 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnGpuMerge.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnGpuMerge.kt
+@@ -118,23 +118,34 @@ internal class GlesIris26983COnGpuMerge(
+             var nativeRgb=0
+             var nativeClip=0
+             GlesIris26983COnFrozenRawIngress.borrowNormals(frames,width,height,referenceBlack.copyOf(),sensorWhite,linearOutput).use { frozen ->
+-                GlesIris26983COnLkrBridge.run(app,frozen,snapshot.amazeWhiteBalance,cfaPattern,refIndex,
++                // Identical reference arbitration to the proven B path, using only
++                // C-private motion, sharpness, and clipping helpers and frozen RAWs.
++                val motion = runCatching { GlesIris26983COnSceneMotion.classify(frozen,cfaPattern,refIndex) }.getOrNull()
++                val stable = motion?.staticTrusted == true
++                val sharp = GlesIris26983COnGpuSharpest.select(frozen,cfaPattern,refIndex,
++                    if(stable) null else motion?.shutterAdjacent ?: setOf(refIndex))
++                val highlight = if(alternativeHighlight) GlesIris26983COnHighlightReference.select(
++                    frozen.buffers,frozen.stridesBytes,frozen.exposures,
++                    frozen.blackByFrameByPhase,frozen.sensorWhiteByFrame,width,height,
++                    sharp,refIndex,previewP995,stable) else sharp
++                PLog.i("Iris26983COnGpu","IRIS_26991_C_HIGHLIGHT_REFERENCE shutter=$refIndex sharp=$sharp highlight=$highlight static=$stable enabled=$alternativeHighlight previewP995=$previewP995")
++                GlesIris26983COnLkrBridge.run(app,frozen,snapshot.amazeWhiteBalance,cfaPattern,highlight,
+                     GlesIris26983COnLkrBridge.JpegTransport { rgb,w,h,wb,hdrWhite ->
+                         nativeRgb=createTexture(w,h,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+                         nativeClip=createTexture(w,h,GLES30.GL_R16F,GLES30.GL_NEAREST)
+-                        renderRawLens2420Cleanup(rgb,nativeRgb,w,h,wb,hdrWhite)
++                        check(hdrWhite==1f && wb.size==3)
++                        GlesIris26983COnLkrBridge.nativePublishRgba16f(rgb,nativeRgb,w,h)
+                         intArrayOf(nativeRgb,nativeClip)
+                     },linearOutput)
+             }
+             GlesGpuScheduler.memoryBarrier()
+             checkGlError("26983 C ON native LKR 50MP RGB + sensor clip")
+-            // The latest donor median/defringe already ran in the striped RGB32F callback.
+-            // The independent proven RAWR Lab and post-Lab neutral veto were not superseded.
+-            // Native RGB has been freed and the DNG is already published: JPEG-only correction.
++            // Native RGB has been freed and the DNG is already published.
++            // C-private legacy median/smooth white operates after physical LSC/WB, before Lab.
+             val jpegColor=linearOutput.refreshJpegColor(parameters)
+             val correctionStart=System.nanoTime()
+             val sensorRgb=renderCOnPostLkr(nativeRgb,nativeClip,jpegColor,outputW,outputH)
+-            PLog.i("Iris26983COnGpu","IRIS_26987_C_ON_RESTORE_PROTECTIONS donorMedian=2.4.20 purpleDefringe=1.0 rawrLab=true smoothWhite=true clipGuide=true repeatedMedian=false dngUnchanged=true ms=${(System.nanoTime()-correctionStart)/1_000_000L}")
++            PLog.i("Iris26983COnGpu","IRIS_26991_C_ON_PROTECTIONS donorMedian=2.3.94 purpleDefringe=0.0 rawrLab=true smoothWhite=true clipGuide=true repeatedMedian=false plainPhysicalLsc=true ms=${(System.nanoTime()-correctionStart)/1_000_000L}")
+             val guideRgb=createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+             val guideClip=createTexture(width,height,GLES30.GL_R16F,GLES30.GL_NEAREST)
+             val p=linkProgram(iris26876DerivedGuideShader,"iris_26983_con_2x_derived_1x_guide")
+@@ -182,58 +193,14 @@ internal class GlesIris26983COnGpuMerge(
+         }
+     }
+ 
+-    /** Exact donor chroma_cleanup and HDR-scaled sensor-white tail, before Iris color matrix.
+-     * Two halo rows on each side; no extra full-frame RGB32F texture or Java heap copy.
+-     * DNG publication precedes this callback and never consumes the JPEG cleanup.
+-     */
+-    private fun renderRawLens2420Cleanup(rgb:ByteBuffer,target:Int,w:Int,h:Int,wb:FloatArray,hdrWhite:Float) {
+-        require(wb.size==3 && wb.all{it.isFinite()&&it>0f})
+-        require(rgb.isDirect && rgb.capacity().toLong()>=w.toLong()*h*12)
+-        val neutral=FloatArray(3){1f/wb[it]}
+-        val maxNeutral=neutral.maxOrNull()!!
+-        for(i in neutral.indices)neutral[i]/=maxNeutral
+-        val rows=128
+-        val upload=createTexture(w,minOf(h,rows+4),GLES30.GL_RGB32F,GLES30.GL_NEAREST)
+-        try {
+-            val source=app.assets.open("shaders/iris26983/con_26986_rawlens_cleanup.frag").bufferedReader().use{it.readText()}
+-            val program=linkProgram(source,"iris26986_rawlens2420_cleanup")
+-            GLES30.glUseProgram(program)
+-            bindTexture(program,"u_rgb",0,upload)
+-            uniform2i(program,"u_outsize",w,h)
+-            uniform1i(program,"u_fc_median",1)
+-            GLES30.glUniform1f(uniformLocation(program,"u_defringe"),1f)
+-            GLES30.glUniform1f(uniformLocation(program,"u_white_scale"),hdrWhite)
+-            GLES30.glUniform3f(uniformLocation(program,"u_camera_white_normalized"),neutral[0],neutral[1],neutral[2])
+-            GLES30.glBindBuffer(GLES30.GL_PIXEL_UNPACK_BUFFER,0)
+-            GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT,4)
+-            bindRenderTargets(intArrayOf(target),"26986 donor chroma cleanup")
+-            for(y in 0 until h step rows) {
+-                val end=minOf(h,y+rows);val first=maxOf(0,y-2);val last=minOf(h,end+2)
+-                val band=rgb.duplicate().order(ByteOrder.nativeOrder())
+-                band.position(first*w*12);band.limit(last*w*12)
+-                GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D,0,0,0,w,last-first,GLES30.GL_RGB,GLES30.GL_FLOAT,band.slice().order(ByteOrder.nativeOrder()))
+-                uniform1i(program,"u_row_start",first)
+-                GLES30.glViewport(0,y,w,end-y)
+-                GLES30.glDrawArrays(GLES30.GL_TRIANGLES,0,3)
+-                checkGlError("26986 donor cleanup stripe $y")
+-            }
+-            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,0)
+-            GlesGpuScheduler.memoryBarrier()
+-            checkGlError("26986 donor cleanup complete")
+-        } finally {
+-            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,0)
+-            releaseOwnedTexture(upload,"26986 bounded donor RGB32F stripe")
+-        }
+-    }
+-
+-    /** Preserve the proven independent Lab + post-Lab veto in reference-linear units.
+-     * Input has the latest donor median, purple defringe and HDR-scaled white window.
+-     * Lab uses matched HAL WB and CCM; inverse WB restores the original sensor basis.
+-     * No second median, no LSC, no unit-white clamp, no DNG mutation. */
++    /** Exactly one C-private legacy two-radius median and smooth-white stage after
++     * temporary WB, then the independent RAWR Lab and post-Lab neutral veto.
++     * Physical LSC was applied to native RGB before publication; never repeat it.
++     * DNG never consumes JPEG cleanup. */
+     private fun renderCOnPostLkr(input: Int, nativeClip: Int, snapshot: GlesIris26983COnColorContract.Snapshot,
+                                  w: Int,h: Int): Int {
+         check(input in textures && nativeClip in textures && w==width*2 && h==height*2)
+-        var temporary=0; var lab=0
++        var temporary=0; var median=0; var lab=0
+         try {
+             val applyProgram=linkProgram(GlesIris26983COnColorContract.applyAmazeWbForLabFcc,
+                 "iris_26983_con_temporary_wb_no_extra_noise")
+@@ -246,13 +213,16 @@ internal class GlesIris26983COnGpuMerge(
+             draw(applyProgram,w,h,intArrayOf(temporary))
+             GlesGpuScheduler.memoryBarrier()
+             checkGlError("26983 C ON temporary WB for Lab")
+-            lab=renderRawrLabDefringe26856(temporary,snapshot.postWbCameraToSrgb,1f,w,h)
++            median=renderIris26932LkrMedian(temporary,w,h,nativeClip,gains)
++            // The temporary pre-median RGB is no longer borrowed.
++            releaseOwnedTexture(temporary,"26991 consumed temporary WB"); temporary=0
++            lab=renderRawrLabDefringe26856(median,snapshot.postWbCameraToSrgb,1f,w,h)
+             val program=linkProgram(GlesIris26983COnSmoothWhite.shader,"iris_26983_con_post_lab_neutral_reconciliation")
+             // Reuse the now-unread original target. Both samples are separate live textures.
+-            check(input!=temporary && input!=lab && temporary!=lab)
++            check(input!=median && input!=lab && median!=lab)
+             GLES30.glUseProgram(program)
+             bindTexture(program,"uWbRgb",0,lab)
+-            bindTexture(program,"uPreLabWbRgb",1,temporary)
++            bindTexture(program,"uPreLabWbRgb",1,median)
+             uniform2i(program,"uSize",w,h)
+             val inverse=snapshot.inverseWhiteBalance
+             GLES30.glUniform3f(GLES30.glGetUniformLocation(program,"uInverseAmazeWb"),inverse[0],inverse[1],inverse[2])
+@@ -262,6 +232,7 @@ internal class GlesIris26983COnGpuMerge(
+             return input
+         } finally {
+             if(temporary!=0) releaseOwnedTexture(temporary,"26983 temporary WB")
++            if(median!=0) releaseOwnedTexture(median,"26991 C legacy median")
+             if(lab!=0) releaseOwnedTexture(lab,"26983 Lab")
+         }
+     }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java
+index 7e142919d95cc4b88bf43c1cb9b90c1fea0e59f5..9437b5c82756913ffe6d41642cfc3e3076b3b4c4 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java
+@@ -8,7 +8,7 @@ import java.nio.ByteBuffer;
+ import java.util.Arrays;
+ 
+ /**
+- * IRIS_26931_B_SUPER_RES_ON_ONLY — the original RawLens 2.4.20 LKR Vulkan
++ * IRIS_26991_C_SUPER_RES_ON_ONLY — the original RawLens 2.4.20 LKR Vulkan
+  * release owns ALL noise fit, coarse/tile/subtile LK, guide/temporal/robust
+  * rejection, 3x2 HQS solver, coverage-based noise handling and FinishLook.
+  * Iris owns only immutable RAW admission, linear RGB + physical clip GPU
+@@ -60,6 +60,9 @@ public final class GlesIris26983COnLkrBridge {
+     public interface JpegTransport {
+         int[] publish(ByteBuffer rgb, int w, int h, float[] wb, float hdrWhite);
+     }
++    private static native ByteBuffer[] nativePrepare(ByteBuffer[] originals,
++        int[] rowStrides, float[] phaseBlacks, float[] whites, int width, int height);
++    static native void nativePublishRgba16f(ByteBuffer rgb, int texture, int width, int height);
+     private static native void nativePublishClipR16f(ByteBuffer referenceRaw,
+         int referenceStrideBytes, float[] phaseBlacks, float white,
+         int destinationTexture, int rawWidth,int rawHeight);
+@@ -72,7 +75,7 @@ public final class GlesIris26983COnLkrBridge {
+            !(wb[0]>0f) || !(wb[1]>0f) || !(wb[2]>0f) ||
+            !Float.isFinite(wb[0]) || !Float.isFinite(wb[1]) || !Float.isFinite(wb[2]) ||
+            cfaRPhase<0 || cfaRPhase>3 || output==null) {
+-            throw new IllegalArgumentException("26931 invalid B ON LKR input/GL contract");
++            throw new IllegalArgumentException("26991 invalid C ON LKR input/GL contract");
+         }
+         frozen.assertUsable();
+         final int w=frozen.getWidth(),h=frozen.getHeight();
+@@ -162,35 +165,36 @@ public final class GlesIris26983COnLkrBridge {
+             orderedWhites[i]=white[src];
+             System.arraycopy(black,src*4,orderedBlacks,i*4,4);
+         }
+-        // RawLens mergeLive uses the chosen reference normalization for ALL unmodified RAW samples.
+-        // The frozen Iris planes are already owned; do not allocate a second burst merely to pack it.
+-        // Mixed row pitches need lossless tight staging (donor nativeStage); never rescale or quantize.
+-        boolean sameStride=true;
+-        for(int stride:orderedStrides) if(stride!=orderedStrides[0])sameStride=false;
++        // C-private equivalent of the proven B per-frame sensor normalization.
++        // Identical tight RAW16 metadata needs no second allocation. Otherwise
++        // normalize each physical phase to the common 16-bit domain using its
++        // own black and white. Original immutable RAW planes remain untouched.
++        boolean shareOriginal=true;
++        for(int i=0;i<count;++i){
++            if(orderedStrides[i]!=w*2 || orderedWhites[i]!=orderedWhites[0])shareOriginal=false;
++            for(int phase=0;phase<4;++phase)if(orderedBlacks[i*4+phase]!=orderedBlacks[phase])shareOriginal=false;
++        }
+         ByteBuffer[] stage=null;
+         ByteBuffer reconstructed=null;
+-        int packedBits=-1;
+         try {
+-            ByteBuffer[] input=orderedRaw;
+-            final float[] commonBlack=Arrays.copyOfRange(orderedBlacks,0,4);
+-            final float commonWhite=orderedWhites[0];
+-            final int stridePx=orderedStrides[0]/2;
+-            if(!sameStride) {
+-                final int bits=32-Integer.numberOfLeadingZeros((int)commonWhite);
+-                for(int attempt : bits<=12 ? new int[]{bits,16}:new int[]{16}) {
+-                    stage=new ByteBuffer[count];
+-                    int copied=0;
+-                    for(;copied<count;++copied) {
+-                        stage[copied]=Iris26985CLkrNative.nativeStage(orderedRaw[copied],w,h,orderedStrides[copied]/2,attempt);
+-                        if(stage[copied]==null)break;
+-                    }
+-                    if(copied==count){packedBits=attempt<16?attempt:0;input=stage;break;}
+-                    for(ByteBuffer b:stage)if(b!=null)Iris26985CLkrNative.nativeFree(b);
+-                    stage=null;
+-                }
+-                if(stage==null)throw new IllegalStateException("26986 lossless RAW row staging failed");
++            final ByteBuffer[] input;
++            final float[] commonBlack;
++            final float commonWhite;
++            final int stridePx=w;
++            if(shareOriginal){
++                input=orderedRaw;
++                commonBlack=Arrays.copyOfRange(orderedBlacks,0,4);
++                commonWhite=orderedWhites[0];
++            }else{
++                stage=nativePrepare(orderedRaw,orderedStrides,orderedBlacks,orderedWhites,w,h);
++                if(stage==null || stage.length!=count)throw new IllegalStateException("26991 incomplete C per-frame RAW normalization");
++                for(ByteBuffer buffer:stage)if(buffer==null || !buffer.isDirect() || buffer.capacity()<(long)w*h*2)
++                    throw new IllegalStateException("26991 invalid C normalized RAW buffer");
++                input=stage;
++                commonBlack=new float[]{0f,0f,0f,0f};
++                commonWhite=65535f;
+             }
+-            Log.i(TAG,"IRIS_26986_C_RAW_REFERENCE_NORM ref="+times[chosen]+" white="+commonWhite+" blacks="+Arrays.toString(commonBlack)+" packedBits="+packedBits);
++            Log.i(TAG,"IRIS_26991_C_RAW_NORM ref="+times[chosen]+" perFrame="+(!shareOriginal)+" white="+commonWhite+" blacks="+Arrays.toString(commonBlack));
+             final float[] tuning=new float[TUNING_COUNT];
+             Arrays.fill(tuning,Float.NaN);
+             tuning[0]=T;
+@@ -216,10 +220,7 @@ public final class GlesIris26983COnLkrBridge {
+             final float[] stats=new float[STATS];
+             final float[] reconstructionWb=output.referenceWb(times[chosen]);
+             try {
+-                reconstructed=packedBits>=0 ? Iris26985CLkrNative.nativeMergeStaged(input,w,h,packedBits,cfa,
+-                    commonBlack,commonWhite,reconstructionWb,OUTPUT_SCALE,TILE,OVERLAP,null,
+-                    false,stats,tuning,Math.multiplyExact(w,2),Math.multiplyExact(h,2)) :
+-                    Iris26985CLkrNative.nativeMerge(input,w,h,stridePx,cfa,
++                reconstructed=Iris26985CLkrNative.nativeMerge(input,w,h,stridePx,cfa,
+                     commonBlack,commonWhite,reconstructionWb,OUTPUT_SCALE,TILE,OVERLAP,null,
+                     false,stats,tuning,Math.multiplyExact(w,2),Math.multiplyExact(h,2));
+             } finally {
+@@ -237,17 +238,20 @@ public final class GlesIris26983COnLkrBridge {
+             if(stage!=null){for(ByteBuffer b:stage)if(b!=null)Iris26985CLkrNative.nativeFree(b);stage=null;}
+             // Native LKR returns direct RGB32F, already normalized and
+             // demosaiced, so do not synthesize a CFA or run AMaZE again.
+-            final float hdrWhite=Float.isFinite(stats[14]) && stats[14]>1f ? stats[14] : 1f;
++            if(stats[14]!=1f)throw new IllegalStateException("26991 HDR OFF native white invariant failed: "+stats[14]);
++            final float hdrWhite=stats[14];
+             output.consume(reconstructed,w*2,h*2,times[chosen],reconstructionWb,cfaRPhase,k,count,hdrWhite,stats);
+             if(jpeg) {
+             final int[] targets=jpegTargets.publish(reconstructed,w*2,h*2,reconstructionWb,hdrWhite);
+             if(targets==null || targets.length!=2 || targets[0]<=0 || targets[1]<=0 || targets[0]==targets[1])
+                 throw new IllegalStateException("26985 invalid late-allocated C GL targets");
+             final int rgbTwoXTexture=targets[0],originalClipTwoXTexture=targets[1];
+-            // Clip evidence is diagnostic/rendering input, not a second highlight reconstruction.
+-            nativePublishClipR16f(raw[chosen],strides[chosen],
+-                Arrays.copyOfRange(black,chosen*4,chosen*4+4),
+-                white[chosen],originalClipTwoXTexture,w,h);
++            // Independently selected physical highlight witness, distinct from
++            // the unchanged LK-R native reconstruction and color reference.
++            nativePublishClipR16f(raw[referenceIndex],strides[referenceIndex],
++                Arrays.copyOfRange(black,referenceIndex*4,referenceIndex*4+4),
++                white[referenceIndex],originalClipTwoXTexture,w,h);
++            Log.i(TAG,"IRIS_26991_C_CLIP_REFERENCE timestamp="+times[referenceIndex]+" nativeTimestamp="+times[chosen]);
+             GLES30.glFinish();
+             final int err=GLES30.glGetError();
+             if(err!=GLES30.GL_NO_ERROR)throw new IllegalStateException(
+@@ -258,7 +262,7 @@ public final class GlesIris26983COnLkrBridge {
+                 "frames="+count+" fullRes="+stats[11]+"x"+stats[12]+
+                 " tiles="+stats[0]+" sigma="+stats[1]+
+                 " a="+stats[2]+" b="+stats[3]+" totalMs="+stats[9]+
+-                " hdrFrames="+bracket.length+" hdrWhite="+hdrWhite+" packedBits="+packedBits+" timings="+Arrays.toString(stats)+" output=IrisLinearRGB");
++                " hdrFrames="+bracket.length+" hdrWhite="+hdrWhite+" perFrameNormalization="+(!shareOriginal)+" timings="+Arrays.toString(stats)+" output=IrisLinearRGB");
+         } finally {
+             if(reconstructed!=null)Iris26985CLkrNative.nativeFree(reconstructed);
+             if(stage!=null)for(ByteBuffer b:stage)if(b!=null)Iris26985CLkrNative.nativeFree(b);
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/Iris26985CLinearOutput.kt b/app/src/main/java/com/hinnka/mycamera/processor/Iris26985CLinearOutput.kt
+index 410ec401101ad8a578f2b9636d7da50354ce18c6..6f1067b5fe102c559bae7ea7274da740ec20506c 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/Iris26985CLinearOutput.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/Iris26985CLinearOutput.kt
+@@ -100,7 +100,9 @@ class Iris26985CLinearOutput internal constructor(
+             val gains=FloatArray(shading.gainFactorCount);shading.copyGainFactors(gains,0)
+             val model=LensShadingModel(shading.rowCount,shading.columnCount,gains,IntRectSnapshot(a.left,a.top,a.right,a.bottom),
+                 characteristics.get(CameraCharacteristics.SENSOR_INFO_LENS_SHADING_APPLIED)==true)
+-            LkrLensShading.applyShadingMapped(pixels,w,h,model,0,f.iris26985CRawCropY,.5f,.5f,wb,white)
++            // C uses its exact physical lens map once, without the donor's additional
++            // highlight whitening. The later C-private JPEG median owns smooth white.
++            LkrLensShading.applyShadingMapped(pixels,w,h,model,0,f.iris26985CRawCropY,.5f,.5f)
+         }
+         if(destination==null)return
+         try {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+index 7ed742452d089c409018f65afb6007634f6dc7a9..e65bd0f8e6f65ae2f203fd814f1df34b1ba428d2 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+@@ -336,7 +336,8 @@ public class SettingsActivity extends BaseActivity implements PreferenceFragment
+                     preference.setRuntimeMaxValue(2f);
+                 }
+                 preference.setEnabled(haveSelected);
+-                preference.setSummary((CharSequence) null);
++                preference.setSummary(band == 0 ? R.string.iris_c_mgc_band_0_summary
++                        : band == 1 ? R.string.iris_c_mgc_band_1_summary : R.string.iris_c_mgc_band_2_summary);
+                 preference.setVisible(visible);
+             }
+             iris26984BoundSelected = selected;
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 1468e6b3f25a1ec246e9a758d35b6bf5b9348c31..284474fd4f52338c2487fb193ea018878fb6f743 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -56,9 +56,12 @@
+     <string name="iris_alternative_highlight_recovery_summary">Per physical lens, default OFF. B Super Res OFF only; preview and original RAW highlight evidence can choose a less-clipped trusted pre-fusion reference. Unrecoverable highlights remain neutral white.</string>
+     <string name="iris_local_laplacian_tone">Local Laplacian Tone</string>
+     <string name="iris_local_laplacian_tone_summary">A/B test for Motion presentation. On = exact 26701 local tone. Off = bypass both Local-Laplacian pyramids and use the existing global tone path.</string>
+-    <string name="iris_c_mgc_band_0">MGC Sharpening Band 0</string>
+-    <string name="iris_c_mgc_band_1">MGC Sharpening Band 1</string>
+-    <string name="iris_c_mgc_band_2">MGC Sharpening Band 2</string>
++    <string name="iris_c_mgc_band_0">MGC Sharpening Band 0 — Fine Detail</string>
++    <string name="iris_c_mgc_band_0_summary">Controls microtexture such as fabric weave, hair, grass and fine foliage. Higher values may emphasize noise.</string>
++    <string name="iris_c_mgc_band_1">MGC Sharpening Band 1 — Medium Detail</string>
++    <string name="iris_c_mgc_band_1_summary">Controls defined textures, leaf edges, facial features and small object boundaries.</string>
++    <string name="iris_c_mgc_band_2">MGC Sharpening Band 2 — Coarse Detail</string>
++    <string name="iris_c_mgc_band_2_summary">Controls broader edges, local contrast and overall perceived clarity. Higher values may emphasize halos.</string>
+     <string name="iris_exposure">Exposure (EV)</string>
+     <string name="iris_shadows">Shadows</string>
+     <string name="iris_contrast">Contrast</string>
+diff --git a/app/src/main/res/xml/preferences.xml b/app/src/main/res/xml/preferences.xml
+index 36e045c0e7f44bea3160735d907f987989d2a16d..9838a0ee795eb3754f12aa61f3348b5273bb8842 100644
+--- a/app/src/main/res/xml/preferences.xml
++++ b/app/src/main/res/xml/preferences.xml
+@@ -37,9 +37,9 @@
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_chroma_denoise" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_chroma_denoise" ns0:summary="@string/iris_chroma_denoise_summary" ns0:defaultValue="@string/pref_iris_chroma_denoise_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_gradient_black_24dp" />
+         <!-- IRIS_26844_RETIRED_DIAGNOSTIC_UI: 11 historical A/B controls removed; runtime defaults fixed in IrisMotionSettings. -->
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_saturation" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_saturation" ns0:summary="@string/iris_saturation_summary" ns0:defaultValue="@string/pref_iris_saturation_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_26982_c_mgc_band_0" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_c_mgc_band_0" ns0:summary="" ns0:defaultValue="@string/pref_iris_saturation_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_26982_c_mgc_band_1" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_c_mgc_band_1" ns0:summary="" ns0:defaultValue="@string/pref_iris_saturation_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_26982_c_mgc_band_2" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_c_mgc_band_2" ns0:summary="" ns0:defaultValue="@string/pref_iris_saturation_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_26982_c_mgc_band_0" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_c_mgc_band_0" ns0:summary="@string/iris_c_mgc_band_0_summary" ns0:defaultValue="@string/pref_iris_saturation_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_26982_c_mgc_band_1" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_c_mgc_band_1" ns0:summary="@string/iris_c_mgc_band_1_summary" ns0:defaultValue="@string/pref_iris_saturation_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_26982_c_mgc_band_2" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_c_mgc_band_2" ns0:summary="@string/iris_c_mgc_band_2_summary" ns0:defaultValue="@string/pref_iris_saturation_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_exposure_ev" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_exposure" ns0:summary="" ns0:defaultValue="@string/pref_iris_exposure_default" ns1:maxValue="1.0" ns1:minValue="-1.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_shadows" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_shadows" ns0:summary="" ns0:defaultValue="@string/pref_iris_shadows_default" ns1:maxValue="1.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_compressor" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_contrast" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_contrast" ns0:summary="" ns0:defaultValue="@string/pref_iris_contrast_default" ns1:maxValue="1.0" ns1:minValue="-1.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+diff --git a/app/version.properties b/app/version.properties
+index 69297df1809efdf3eabddaa3113bbb9ec4dbe4dd..6fa3a6a3b8269cfc21cbe0783143380ef8299895 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726990
+-VERSION_BUILD=26990
++VERSION_NAME=0.9726991
++VERSION_BUILD=26991
