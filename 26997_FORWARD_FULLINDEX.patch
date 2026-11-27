@@ -1,0 +1,524 @@
+diff --git a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
+index 831e23add9695a868ec558be0118084f78dcc007..e4d413e96f6fc325081af035510b0e9d6d187a87 100644
+--- a/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
++++ b/app/src/main/cpp/iris26985c_lkr2420/tools/lkr-lite/src/main/cpp/lkrl_jni.cpp
+@@ -59,7 +59,12 @@ void LkrLog(const char* format, ...) {
+     std::vector<char> line(size_t(size) + 1);
+     std::vsnprintf(line.data(), line.size(), format, args);
+     LKR_PLATFORM_LOG(line.data());
+-    if (g_last_profile.size() + size_t(size) + 1 <= 64 * 1024) {
++    // Reserve the model decision even when the verbose profile is already full.
++    constexpr char noise_prefix[] = "IRIS_26997_C_LKR_NOISE_MODEL ";
++    if (std::strncmp(line.data(), noise_prefix, sizeof(noise_prefix)-1) == 0) {
++      g_last_profile.insert(0, std::string(line.data(), size_t(size)) + "\n");
++      if (g_last_profile.size() > 64 * 1024) g_last_profile.resize(64 * 1024);
++    } else if (g_last_profile.size() + size_t(size) + 1 <= 64 * 1024) {
+       g_last_profile.append(line.data(), size_t(size));
+       g_last_profile += '\n';
+     }
+@@ -75,6 +80,12 @@ struct NoiseModelRef {
+   float iso = 0;
+ };
+ thread_local NoiseModelRef g_noise_model;
++// Per-merge diagnostic, not shared with a later merge or a thread-local worker log.
++struct Iris26997NoiseTelemetry {
++  bool invoked = false, ready = false, accepted = false, global = false;
++  int samples = 0, isos = 0, bins = 0;
++  float fit_a = 0, fit_b = 0, refined_a = 0, refined_b = 0, weight = 0;
++};
+ // HDR bracket exposures for the NEXT merge on this thread (nativeSetExposures, consumed by Merge):
+ // one value per frame in frame order (frame 0 = reference), empty = normal merge.
+ thread_local std::vector<float> g_exposure;
+@@ -182,10 +193,19 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
+ #endif
+   const NoiseModelRef noise_model = g_noise_model;
+   g_noise_model = {};
++  Iris26997NoiseTelemetry noise_telemetry;
+   if (!noise_model.path.empty() && noise_model.iso > 0) {
+     // Same mix as HDR+ (RawNoiseModel.combineNoise): model prior, this burst's fit as evidence.
+-    prm.noise_refine = [noise_model](float* a, float* b, int bins) {
++    prm.noise_refine = [noise_model, &noise_telemetry](float* a, float* b, int bins) {
+       const auto model = rawlens_noise::fit(rawlens_noise::loadSamples(noise_model.path));
++      noise_telemetry.invoked = true;
++      noise_telemetry.ready = model.supports(noise_model.iso);
++      noise_telemetry.samples = model.samples;
++      noise_telemetry.isos = model.isos;
++      noise_telemetry.global = model.global;
++      noise_telemetry.bins = bins;
++      noise_telemetry.fit_a = noise_telemetry.refined_a = *a;
++      noise_telemetry.fit_b = noise_telemetry.refined_b = *b;
+       if (!model.supports(noise_model.iso)) {
+         LKR_LOG("noise: learned model untrained at ISO %.0f, burst fit a=%.3g b=%.3g", noise_model.iso, *a, *b);
+         return false;
+@@ -195,6 +215,10 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
+       if (!(std::isfinite(c.a) && std::isfinite(c.b) && c.a >= 0 && c.b >= 0)) return false;
+       LKR_LOG("noise: burst a=%.3g b=%.3g (%d bins) + learned (ISO %.0f, %d samples) -> a=%.3g b=%.3g w=%.2f",
+               *a, *b, bins, noise_model.iso, model.samples, c.a, c.b, c.w);
++      noise_telemetry.accepted = true;
++      noise_telemetry.refined_a = c.a;
++      noise_telemetry.refined_b = c.b;
++      noise_telemetry.weight = c.w;
+       *a = c.a;
+       *b = c.b;
+       return true;
+@@ -283,6 +307,16 @@ jobject Merge(JNIEnv* env, jobjectArray frames, jint w, jint h, jint row_stride_
+     std::free(direct);
+     return nullptr;
+   }
++  // MergeFull joins noise_fit before tile work; this is the calling JNI thread
++  // that owns g_last_profile. Keep the final solver coefficients distinct from
++  // the blend (a degenerate-fit MAD fallback can still adjust the final b).
++  LKR_LOG("IRIS_26997_C_LKR_NOISE_MODEL iso=%.0f invoked=%d ready=%d applied=%d accepted=%d samples=%d isos=%d global=%d bins=%d fitA=%.9g fitB=%.9g refinedA=%.9g refinedB=%.9g finalA=%.9g finalB=%.9g evidenceWeight=%.6g",
++          noise_model.iso, int(noise_telemetry.invoked), int(noise_telemetry.ready), int(st.noise_learned),
++          int(noise_telemetry.accepted), noise_telemetry.samples, noise_telemetry.isos, int(noise_telemetry.global),
++          noise_telemetry.bins, st.fit_a, st.fit_b,
++          noise_telemetry.invoked ? noise_telemetry.refined_a : st.fit_a,
++          noise_telemetry.invoked ? noise_telemetry.refined_b : st.fit_b,
++          st.a, st.b, noise_telemetry.weight);
+   // Zoom 1.5x: the x2 solve of the crop is larger than the requested output
+   // (sensor size): exact area-average down to it.
+   if (out_w_req > 0 && out_h_req > 0 && (out_w_req != ow || out_h_req != oh)) {
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java
+index d0ec3fc2b69088c49588df9c68fdce51e43a7259..b8e1d2c38614178e61357204cdf7515d857aa3a9 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26983COnLkrBridge.java
+@@ -229,7 +229,11 @@ public final class GlesIris26983COnLkrBridge {
+             } finally {
+                 // Explicitly clear even when JNI exits before consuming its thread-local prior.
+                 Iris26985CLkrNative.nativeSetNoiseModel(null,0f);
+-                Log.i(TAG,"IRIS_26986_C_NATIVE_PROFILE "+Iris26985CLkrNative.nativeLastProfile());
++                final String nativeProfile=Iris26985CLkrNative.nativeLastProfile();
++                if(nativeProfile!=null) for(String line:nativeProfile.split("\n")) {
++                    if(line.startsWith("IRIS_26997_C_LKR_NOISE_MODEL ")) Log.i(TAG,line);
++                }
++                Log.i(TAG,"IRIS_26986_C_NATIVE_PROFILE "+nativeProfile);
+             }
+             if(reconstructed==null || !reconstructed.isDirect() ||
+                 (int)stats[11]!=Math.multiplyExact(w,2) ||
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index d3d4bcfe7502ed6915157c05648befb6577f6c9f..2972c454874492d3f243cb01c5fe0f5548008781 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -357,6 +357,42 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+                 iris26996CPhysicalMeter(witness.total)==null) return null;
+         return witness.total;
+     }
++    private static final class Iris26997COnMeter {
++        final Iris26996CConfirmedMeter witness;
++        final long generation;
++        Iris26997COnMeter(Iris26996CConfirmedMeter witness,long generation) {
++            this.witness=witness; this.generation=generation;
++        }
++    }
++    private volatile Iris26997COnMeter mIris26997COnMeter;
++    private CaptureResult iris26997COnPhysicalMeter(TotalCaptureResult total) {
++        if(total==null || mCameraDevice==null || physicalID==null || total.getRequest()==null) return null;
++        // The already-proven C ON physical RAW owner accepts explicit active-physical
++        // metadata on logical devices, or the direct physical device's own result.
++        CaptureResult exact=iris26985PhysicalResult(total,physicalID);
++        Long ts=total.get(CaptureResult.SENSOR_TIMESTAMP);
++        if(exact==null || ts==null || ts<=0L) return null;
++        Long ns=exact.get(CaptureResult.SENSOR_EXPOSURE_TIME);
++        Integer iso=exact.get(CaptureResult.SENSOR_SENSITIVITY);
++        return ns!=null && ns>0L && iso!=null && iso>0 ? exact : null;
++    }
++    private TotalCaptureResult iris26997COnConfirmedAtShutter() {
++        final Iris26997COnMeter cached=mIris26997COnMeter;
++        final CaptureRequest current=mPreviewInputRequest;
++        if(cached==null || current==null || cached.generation!=mIris26548CameraHealthGeneration) return null;
++        final Iris26996CConfirmedMeter witness=cached.witness;
++        if(witness.session!=mCaptureSession || witness.reader!=mImageReaderRaw ||
++                !Objects.equals(witness.lens,physicalID) ||
++                !Iris26983COnCaptureSafety.usableWitnessAge(android.os.SystemClock.elapsedRealtime()-witness.observedMs) ||
++                !iris26996CSameRequestGeometry(witness.total.getRequest(),current) ||
++                iris26997COnPhysicalMeter(witness.total)==null) return null;
++        return witness.total;
++    }
++    private boolean iris26997COnCanTopUpWithoutRing() {
++        // A full RAW-capable live session is still mandatory; only the prebuffer
++        // readiness condition is optional. Preview-only recovery is never bypassed.
++        return iris26983COnSelected() && mImageReaderRaw!=null && !iris26555PreviewOnlyRecoveryActive();
++    }
+     private volatile CaptureRequest mIris26976CLockedPreviewRequest;
+     private volatile boolean mIris26976CCaptureAdmission;
+     private volatile boolean mIris26980CWaitingForLock;
+@@ -1404,6 +1440,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         public void onCaptureCompleted(@NonNull CameraCaptureSession session,
+                                        @NonNull CaptureRequest request,
+                                        @NonNull TotalCaptureResult result) {
++            // Record before the exposure observer can replace the repeating request.
++            if (session==mCaptureSession && request==mPreviewInputRequest && iris26983COnSelected() &&
++                    mImageReaderRaw!=null && iris26997COnPhysicalMeter(result)!=null) {
++                mIris26997COnMeter=new Iris26997COnMeter(new Iris26996CConfirmedMeter(session,
++                        mImageReaderRaw,physicalID,true,result),mIris26548CameraHealthGeneration);
++            }
+             Object exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+             Object iso = result.get(CaptureResult.SENSOR_SENSITIVITY);
+             Object focus = result.get(CaptureResult.LENS_FOCUS_DISTANCE);
+@@ -9209,7 +9251,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         + " generation=" + mIris26548CameraHealthGeneration);
+                 return;
+             }
+-            if (mIris26555RawStreamAvailable
++            if (mIris26555RawStreamAvailable && !iris26997COnCanTopUpWithoutRing()
+                     && (iris26555PreviewOnlyRecoveryActive() || !iris26555MotionZslReady())) {
+                 latchMotion26598DeferredShutter("RAW_BUFFER_PREPARING");
+                 scheduleMotion26598DeferredShutterReplay("raw_buffer_preparing");
+@@ -11946,6 +11988,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * deferred because the camera session/RAW ring is rebuilding may rebind to a newer health
+      * generation, and only while camera mode + physical route are unchanged. */
+     private volatile boolean mMotion26679DeferredReadinessOwner = false;
++    private volatile boolean mIris26997COnDeferredOwner = false;
+     private final ArrayDeque<Long> mMotion26598RetiredNormalTopUpTimestamps = new ArrayDeque<>();
+     private static final int MOTION_26598_RETIRED_TOPUP_TIMESTAMP_LIMIT = 64;
+     private static final long MOTION_26598_DEFERRED_RING_READY_WAIT_MS = 2000L;
+@@ -12012,7 +12055,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * missing NORMAL/SHORT/LONG requests.
+      */
+     private Motion26598PreShutterNormals freezeMotion26598PreShutterNormals(
+-            @NonNull TotalCaptureResult normalReferenceResult, int maxNormals) {
++            @NonNull TotalCaptureResult normalReferenceResult, int maxNormals,
++            boolean cOn, long targetNs, int targetIso, boolean confirmedFallback) {
+         synchronized (mZslBufferLock) {
+             final int ringCount = mZslRingBuffer.size();
+             Motion26598PreShutterNormals snapshot = new Motion26598PreShutterNormals(ringCount);
+@@ -12025,9 +12069,18 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 Object tag = result.getRequest().getTag();
+                 if (MOTION_26480_SHORT_TAG.equals(tag) || MOTION_26505_LONG_TAG.equals(tag)
+                         || tag instanceof Motion26598NormalTopUpTag) continue;
+-                if (!motionExposurePairMatches(result, normalReferenceResult)) continue;
+-                if (iris26983DispatchOwnsManualPreview() && !iris26983DispatchExactBManualFrame(result))
+-                    continue;  // 70ms HAL cannot masquerade as 100ms low-ISO B RAW
++                if (cOn) {
++                    Long resultTs=result.get(CaptureResult.SENSOR_TIMESTAMP);
++                    if(resultTs==null || resultTs!=image.getTimestamp() ||
++                            !iris26996CSameRequestGeometry(result.getRequest(),normalReferenceResult.getRequest()) ||
++                            !iris26985PhysicalPairMatches(result,physicalID,targetNs,targetIso)) continue;
++                    if(!confirmedFallback && iris26983DispatchOwnsManualPreview() &&
++                            !iris26983DispatchExactBManualFrame(result)) continue;
++                } else {
++                    if (!motionExposurePairMatches(result, normalReferenceResult)) continue;
++                    if (iris26983DispatchOwnsManualPreview() && !iris26983DispatchExactBManualFrame(result))
++                        continue;  // 70ms HAL cannot masquerade as 100ms low-ISO B RAW
++                }
+                 eligible.add(image);
+                 eligibleResults.put(image.getTimestamp(), result);
+             }
+@@ -12116,6 +12169,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mMotion26598DeferredRequestedMs = android.os.SystemClock.elapsedRealtime();
+             mMotion26679DeferredReadinessOwner = "CAMERA_SESSION_REBUILD".equals(busyReason)
+                     || "RAW_BUFFER_PREPARING".equals(busyReason);
++            mIris26997COnDeferredOwner = mMotion26679DeferredReadinessOwner && iris26983COnSelected();
+         }
+         Log.i(TAG, "IRIS_26598_DEFERRED_SHUTTER_LATCHED first=" + first
+                 + " collapsed=" + (!first)
+@@ -12157,7 +12211,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final boolean sameCamera = Objects.equals(mMotion26679DeferredCameraId, configuredCameraId);
+         final boolean sameMode = PhotonCamera.getSettings().selectedMode == CameraMode.MOTION;
+ 
+-        if (!sameMode || !sameCamera || !samePhysical || !mIris26555RawStreamAvailable) {
++        if (!sameMode || !sameCamera || !samePhysical || !mIris26555RawStreamAvailable ||
++                (mMotion26679DeferredReadinessOwner && mIris26997COnDeferredOwner!=iris26983COnSelected())) {
+             if (mMotion26598DeferredShutter.compareAndSet(true, false)) {
+                 mMotion26679DeferredReadinessOwner = false;
+                 Log.w(TAG, "IRIS_26679_DEFERRED_SHUTTER_CANCELED source=" + source
+@@ -12187,7 +12242,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             }
+         }
+ 
+-        final boolean sessionReady = iris26679MotionSessionReadyForShutter();
++        final boolean sessionReady = iris26679MotionSessionReadyForShutter() &&
++                (!mIris26997COnDeferredOwner || iris26997COnConfirmedAtShutter()!=null);
+         if (!sessionReady) {
+             if (mMotion26679DeferredReadinessOwner
+                     && waitedSincePress < MOTION_26679_DEFERRED_CAMERA_READY_WAIT_MS
+@@ -12204,7 +12260,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             return;
+         }
+ 
+-        if (iris26555PreviewOnlyRecoveryActive() || !iris26555MotionZslReady()) {
++        if (!iris26997COnCanTopUpWithoutRing() &&
++                (iris26555PreviewOnlyRecoveryActive() || !iris26555MotionZslReady())) {
+             final long maxWait = mMotion26679DeferredReadinessOwner
+                     ? MOTION_26679_DEFERRED_CAMERA_READY_WAIT_MS
+                     : MOTION_26598_DEFERRED_RING_READY_WAIT_MS;
+@@ -12602,7 +12659,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         boolean retried = false;
+         long now = android.os.SystemClock.elapsedRealtime();
+         for (Motion26598NormalTopUpTicket failed : plan.failedActiveTopUpTickets()) {
+-            if (failed.deterministicExposureFailure) continue;
++            if (failed.deterministicExposureFailure || (plan.iris26983COnOutput!=null &&
++                    !Iris26983COnCaptureSafety.retrySlot(failed.attempt))) continue;
+             if (failed.submittedElapsedMs > 0L
+                     && now - failed.submittedElapsedMs < MOTION_26724_RETRY_BACKOFF_MS) continue;
+             retried |= submitMotion26724ReplacementNormalAttempt(plan, failed);
+@@ -12837,6 +12895,32 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
++    private boolean iris26997COnPartialAllowed(Motion26593CapturePlan plan,int available) {
++        return plan.iris26983COnOutput!=null && "C".equals(plan.reconstructionExperiment26856) &&
++                Iris26983COnCaptureSafety.partialCountAllowed(plan.totalTargetFrames,plan.normalTargetFrames,
++                        available,plan.shortExpected,plan.longExpected,plan.iris26985CBracketEvs.length);
++    }
++    private boolean iris26997COnFinishAvailable(Motion26593CapturePlan plan,String reason) {
++        if(!iris26997COnPartialAllowed(plan,countMotion26593NormalFrames(plan))) return false;
++        // Retire only unpaired/missing attempts. Late callbacks cannot become
++        // members of this sealed batch, nor satisfy the next capture.
++        for(Motion26598NormalTopUpTicket ticket:plan.activeTopUpTickets()) {
++            if(ticket.isReady()) continue;
++            ticket.retire("C_ON_AVAILABLE_BATCH_"+reason);
++            rememberMotion26598RetiredNormalTopUpTimestamp(ticket.captureStartedTimestampNs);
++            rememberMotion26598RetiredNormalTopUpTimestamp(ticket.resultTimestampNs);
++        }
++        plan.closeStagedEarlyTopUpRaws();
++        // Do not hand an unfinished preview transaction to the processing lane.
++        if(!restoreMotion26670LivePreviewAfterCaptureLocalRequests(plan)) return false;
++        final int count=countMotion26593NormalFrames(plan);
++        if(!iris26997COnPartialAllowed(plan,count)) return false;
++        mMotionTopUpActive=false;
++        Log.i(TAG,"IRIS_26997_C_ON_AVAILABLE_BATCH reason="+reason+" requested="+plan.normalTargetFrames+
++                " paired="+count+" preShutter="+plan.normalFramesAtPress+" lateTicketsRetired=true deadlineReset=false");
++        finalizeMotionZslCapture(plan);
++        return true;
++    }
+     /* IRIS_26593_TOTAL_BATCH_COMPLETION_GATE */
+     private void pollMotion26593CapturePlan(Motion26593CapturePlan plan) {
+         if (plan == null || !mZslCapturing || mMotion26593CapturePlan != plan) return;
+@@ -12855,7 +12939,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+         Motion26598NormalTopUpTicket iris26725DeterministicExposureFailure =
+                 plan.deterministicExposureFailure();
+-        if (iris26725DeterministicExposureFailure != null) {
++        if (iris26725DeterministicExposureFailure != null && plan.iris26983COnOutput==null) {
+             com.particlesdevs.photoncamera.util.MotionTrace.state(
+                     mMotionDiagnosticShotId, "IRIS_26769_MANUAL_EXPOSURE_UNACHIEVABLE",
+                     "slot=" + iris26725DeterministicExposureFailure.ordinal
+@@ -12927,6 +13011,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+ 
+         if (elapsed >= plan.completionTimeoutMs) {
++            if (iris26997COnFinishAvailable(plan,"bounded_timeout")) return;
+             if (plan.shortExpected && !shortPresent && normalReadyCount >= plan.normalTargetFrames && longPresent) {
+                 plan.shortExpected = false; plan.shortTicket.sceneRequired = false; plan.shortTicket.closeStaged();
+                 clearMotion26490CaptureShortTicket(plan.shortTicket, "26708_short_timeout_normal_only");
+@@ -13959,15 +14044,17 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+         final Iris26983COnOutput iris26983FrozenOutput=iris26983COnAtPress?new Iris26983COnOutput():null;
+         final int iris26593TotalTarget = iris26556RequestedMotionFrames();
+-        final TotalCaptureResult iris26593NormalReference =
+-                mPreviewCaptureResult instanceof TotalCaptureResult
+-                        ? (TotalCaptureResult) mPreviewCaptureResult : null;
++        final TotalCaptureResult iris26593NormalReference = iris26983COnAtPress
++                ? iris26997COnConfirmedAtShutter() : (mPreviewCaptureResult instanceof TotalCaptureResult
++                        ? (TotalCaptureResult) mPreviewCaptureResult : null);
++        final CaptureResult iris26997Physical = iris26983COnAtPress
++                ? iris26997COnPhysicalMeter(iris26593NormalReference) : iris26593NormalReference;
+         Long iris26593ReferenceTs = iris26593NormalReference == null ? null
+                 : iris26593NormalReference.get(CaptureResult.SENSOR_TIMESTAMP);
+-        Long iris26593ReferenceExp = iris26593NormalReference == null ? null
+-                : iris26593NormalReference.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+-        Integer iris26593ReferenceIso = iris26593NormalReference == null ? null
+-                : iris26593NormalReference.get(CaptureResult.SENSOR_SENSITIVITY);
++        Long iris26593ReferenceExp = iris26997Physical == null ? null
++                : iris26997Physical.get(CaptureResult.SENSOR_EXPOSURE_TIME);
++        Integer iris26593ReferenceIso = iris26997Physical == null ? null
++                : iris26997Physical.get(CaptureResult.SENSOR_SENSITIVITY);
+         final long iris26983ActiveShutterNs=iris26983COnAtPress?mIris26983COn09ManualShutterNs:mIris26909ManualShutterNs;
+         final int iris26983ActiveIso=iris26983COnAtPress?mIris26983COn09ManualIso:mIris26909ManualIso;
+         final boolean iris26912ManualBAtPress = iris26910PreserveBManualExposure()
+@@ -13975,8 +14062,14 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final boolean iris26912ExactPreviewManualAtPress = iris26912ManualBAtPress
+                 && iris26593NormalReference != null
+                 && iris26983DispatchExactBManualFrame(iris26593NormalReference);
++        final boolean iris26997ConfirmedFallback = iris26983COnAtPress && iris26997Physical!=null &&
++                (iris26983COn09UserManualExposure() || !mMotion26709ReferenceSettled ||
++                        (iris26912ManualBAtPress && (!iris26912ExactPreviewManualAtPress ||
++                        !iris26985PhysicalPairMatches(iris26593NormalReference,physicalID,
++                                iris26983ActiveShutterNs,iris26983ActiveIso))) ||
++                        iris26593NormalReference.getRequest()!=mPreviewInputRequest);
+         final boolean iris26912MustAcquireExactNormals = iris26912ManualBAtPress
+-                && !iris26912ExactPreviewManualAtPress;
++                && !iris26912ExactPreviewManualAtPress && !iris26997ConfirmedFallback;
+         /* IRIS_26912_ALT_HIGHLIGHT_NO_GLOBAL_DARKENING
+          * B-only permanent highlight eligibility is frozen at shutter, for
+          * both reconstruction modes. No persisted OFF preference or extra
+@@ -14003,9 +14096,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 && iris26593ReferenceTs != null
+                 && iris26593ReferenceExp != null && iris26593ReferenceExp > 0L
+                 && iris26593ReferenceIso != null && iris26593ReferenceIso > 0;
+-        final long iris26912BaselineExposureNs = iris26912ManualBAtPress
++        final long iris26912BaselineExposureNs = iris26912ManualBAtPress && !iris26983COnAtPress
+                 ? iris26983ActiveShutterNs : (iris26593ReferenceExp == null ? 0L : iris26593ReferenceExp);
+-        final int iris26912BaselineIso = iris26912ManualBAtPress
++        final int iris26912BaselineIso = iris26912ManualBAtPress && !iris26983COnAtPress
+                 ? iris26983ActiveIso : (iris26593ReferenceIso == null ? 0 : iris26593ReferenceIso);
+         final double iris26713CurrentHalEnergy = iris26593SessionReady
+                 ? (double) iris26912BaselineExposureNs * (double) iris26912BaselineIso
+@@ -14013,7 +14106,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final boolean iris26713RecipeGenerationValid = mMotion26713RecipeReady
+                 && mMotion26713RecipeGeneration == mIris26548CameraHealthGeneration
+                 && Float.isFinite(mMotion26713RecipeOffsetEv);
+-        final boolean iris26713RecipeValidAtShutter = iris26713RecipeGenerationValid;
++        final boolean iris26713RecipeValidAtShutter = iris26713RecipeGenerationValid && !iris26997ConfirmedFallback;
++        if (iris26983COnAtPress) Log.i(TAG,"IRIS_26997_C_ON_SHUTTER_SENSOR confirmed="+(iris26997Physical!=null)+
++                " fallback="+iris26997ConfirmedFallback+" actualExposureNs="+iris26593ReferenceExp+
++                " actualIso="+iris26593ReferenceIso+" recipeEligible="+iris26713RecipeValidAtShutter+
++                " prebufferRequired=false");
+         long iris26714RebasedTargetExp = iris26912BaselineExposureNs;
+         int iris26714RebasedTargetIso = iris26912BaselineIso;
+         float iris26714RebasedOffsetEv = 0.0f;
+@@ -14143,7 +14240,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         catch (Exception uiError) { Log.e(TAG,"26484 immediate shutter ack failed",uiError); }
+ 
+         final Motion26598PreShutterNormals iris26598PreShutterNormals =
+-                freezeMotion26598PreShutterNormals(iris26593NormalReference, iris26593TotalTarget);
++                freezeMotion26598PreShutterNormals(iris26593NormalReference, iris26593TotalTarget,
++                        iris26983COnAtPress,iris26713NormalTargetExp,iris26713NormalTargetIso,iris26997ConfirmedFallback);
+         final boolean iris26713TargetMatchesHal = !iris26912MustAcquireExactNormals
+                 && iris26713NormalTargetExp > 0L
+                 && iris26713NormalTargetIso > 0
+@@ -14354,6 +14452,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         + " auxiliaryPreviewAuthority=false");
+         if (iris26593MissingNormals > 0
+                 && !submitMotion26593MissingNormals(iris26593Plan, iris26593MissingNormals)) {
++            if(iris26997COnFinishAvailable(iris26593Plan,"submit_unavailable")) return;
+             failMotion26593CapturePlan(iris26593Plan, "NORMAL_TOPUP_SUBMIT_FAILURE",
+                     "Motion frame capture unavailable");
+             return;
+@@ -14740,7 +14839,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+          * evidence with unrelated repeating-preview RAWs.
+          */
+         int validAtDrain = countMotion26593NormalFrames(iris26593Plan);
+-        List<Image> rawImages = validAtDrain >= mMotionTopUpMinimumFrames
++        List<Image> rawImages = (validAtDrain >= mMotionTopUpMinimumFrames ||
++                iris26997COnPartialAllowed(iris26593Plan,validAtDrain))
+                 ? iris26593Plan.takeOwnedNormalImages() : null;
+ 
+         if (rawImages == null) {
+@@ -15121,7 +15221,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             populateMotion26480FrameMetadata(frame, frameResult, false);
+             if(iris26593Plan.iris26983COnOutput!=null) {
+                 try { iris26985FreezePhysicalRadiometry(frame,frameResult,iris26593Plan.physicalCameraId); }
+-                catch(RuntimeException badMetadata) {frame.close();Log.e(TAG,"26985 rejected C physical RAW",badMetadata);continue;}
++                catch(RuntimeException badMetadata) {selectedResults.remove(frame.timestamp);frame.close();Log.e(TAG,"26985 rejected C physical RAW",badMetadata);continue;}
+             }
+             // 26920: freeze the per-physical-lens switch at actual NORMAL RAW
+             // admission, before processing can run on a different worker.
+@@ -15144,7 +15244,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+         int actualCount = selected.size();
+         /* IRIS_26486_WHOLE_GROUP_EXPOSURE_SPAN_PROOF */
+-        if (actualCount != iris26593Plan.normalTargetFrames) {
++        if ((iris26593Plan.iris26983COnOutput!=null && actualCount<2) ||
++                (actualCount != iris26593Plan.normalTargetFrames && !iris26997COnPartialAllowed(iris26593Plan,actualCount))) {
+             for (ImageFrame f : selected) if (f != null) f.close();
+             if (iris26480ShortFrame != null) iris26480ShortFrame.close();
+             if (irisV13ShadowAuxFrame != null) irisV13ShadowAuxFrame.close();
+@@ -15237,7 +15338,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final int iris26593AuxPresent = (iris26486ShortSlot.hasFrame() ? 1 : 0)
+                 + (iris26486ShortSlot.shadowAuxSlot.hasFrame() ? 1 : 0);
+         final int iris26593TotalPresent = actualCount + iris26593AuxPresent;
+-        if (iris26593TotalPresent != iris26593Plan.totalTargetFrames) {
++        if (iris26593TotalPresent != iris26593Plan.totalTargetFrames &&
++                !(iris26593AuxPresent==0 && iris26997COnPartialAllowed(iris26593Plan,actualCount))) {
+             for (ImageFrame f : selected) if (f != null) f.close();
+             failMotion26593CapturePlan(iris26593Plan, "TOTAL_COUNT_MISMATCH",
+                     "Motion frame capture incomplete");
+@@ -15249,7 +15351,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 + " short=" + (iris26486ShortSlot.hasFrame() ? 1 : 0)
+                 + " long=" + (iris26486ShortSlot.shadowAuxSlot.hasFrame() ? 1 : 0)
+                 + " total=" + iris26593TotalPresent
+-                + " exactTotal=true postShutterNormalAdmission="
++                + " exactTotal=" + (iris26593TotalPresent==iris26593Plan.totalTargetFrames) + " postShutterNormalAdmission="
+                 + (iris26593Plan.normalFramesAtPress < iris26593Plan.normalTargetFrames));
+ 
+         /* IRIS_26486_MOTIONBATCH_SOLE_PROCESSING_OWNER */
+@@ -15451,7 +15553,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         + " requestedSetting=" + PhotonCamera.getSettings().frameCount
+                         + " totalTarget=" + candidateCount
+                         + " normalTarget=" + mMotionTopUpTargetFrames
+-                        + " exactTotal=true generation=" + mMotionUnifiedGeneration);
++                        + " exactTotal="+(motionSelectedFrameCount==candidateCount)+" generation=" + mMotionUnifiedGeneration);
+ 
+         if (capturedCount == 0) {
+             Log.w(TAG, "ZSL ring buffer had no valid current-generation frames");
+@@ -15469,6 +15571,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+         final IrisMotionSettings.DngOptions.Snapshot iris26786DngOptions =
+                 IrisMotionSettings.DngOptions.current();
++        final int iris26997SealedBudget = iris26593Plan.iris26983COnOutput!=null ? actualCount : candidateCount;
++        if(iris26593Plan.iris26983COnOutput!=null) Log.i(TAG,"IRIS_26997_C_ON_PROCESSING_BUDGET requested="+
++                candidateCount+" sealed="+iris26997SealedBudget+" pairedMetadata=true");
+         final MotionBatch motionBatch = new MotionBatch(
+                 iris26480ProcessingFrames, new ArrayList<>(BurstShakiness), mExposures, selectedResults,
+                 selectedResults.isEmpty() ? iris26593Plan.normalReferenceResult
+@@ -15476,7 +15581,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                                 ? iris26678StructuralReferenceResult
+                                 : selectedResults.get(selected.get(selected.size() - 1).timestamp)),
+                 iris26593Plan.normalReferenceResult.getRequest(), CaptureController.RAW_FORMAT,
+-                cameraRotation, candidateCount,
++                cameraRotation, iris26997SealedBudget,
+                 iris26486ShortSlot, mMotion26575SuperResAtShutter, mMotion26636HeicAtShutter,
+                 mMotion26702LocalLaplacianAtShutter, iris26786DngOptions,
+                 iris26593Plan.iris26983COnOutput == null ? null : iris26593Plan.physicalCameraId);
+@@ -15506,7 +15611,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 + " longExpected=" + iris26593Plan.longExpected
+                 + " longPresent=" + iris26486ShortSlot.shadowAuxSlot.hasFrame()
+                 + " superResFrozen=" + mMotion26575SuperResAtShutter
+-                + " exactPhysicalBudget=" + iris26593Plan.totalTargetFrames
++                + " exactPhysicalBudget=" + iris26997SealedBudget
+                 + " noRepeatingRawSubstitution=true");
+         clearMotion26593CapturePlan(iris26593Plan, "immutable_batch_handoff");
+         final long iris26486ShotId = mMotionDiagnosticShotId;
+@@ -15564,7 +15669,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 if (iris26593Plan.iris26983COnOutput != null) {
+                     Iris26983COnOutput cfg=iris26593Plan.iris26983COnOutput;
+                     iris26486ImageSaver.runIris26983COnRaw(iris26486Characteristics,motionBatch,
+-                            cfg.rawSaver,iris26593Plan.normalTargetFrames,cfg.tone,cfg.clipYFloor,
++                            cfg.rawSaver,iris26997SealedBudget,cfg.tone,cfg.clipYFloor,
+                             cfg.highlightCompression,cfg.watermark,cfg.aspect169,cfg.energySaving,cfg.superResDenoise);
+                 } else iris26486ImageSaver.runMotionRaw(iris26486Characteristics, motionBatch);
+             } catch (Exception e) {
+@@ -15666,6 +15771,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             return;
+         }
+         if (iris26555Mode == CameraMode.MOTION && mIris26555RawStreamAvailable
++                && !iris26997COnCanTopUpWithoutRing()
+                 && (iris26555PreviewOnlyRecoveryActive() || !iris26555MotionZslReady())) {
+             Log.w(TAG, "IRIS_26555_MOTION_CAPTURE_NOT_READY_INTERNAL recoveryStage="
+                     + mIris26555PreviewRecoveryStage + " captureDeferred=true");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26983COnCaptureSafety.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26983COnCaptureSafety.java
+index 461d793c8aade44b6b6fb7dc85db431239835de0..c192b4ee31387408b04c90a5639d2a05e5820da0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26983COnCaptureSafety.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26983COnCaptureSafety.java
+@@ -7,6 +7,18 @@ package com.particlesdevs.photoncamera.capture;
+  */
+ public final class Iris26983COnCaptureSafety {
+     private Iris26983COnCaptureSafety() { }
++    public static boolean usableWitnessAge(long ageMs) { return ageMs>=0L && ageMs<=2000L; }
++
++    /** The existing C ON solver accepts 2..24 exact NORMALs. A partial
++     * acquisition cannot substitute auxiliary slots, expand the slider budget,
++     * or admit a single frame. Other experiments never call this policy. */
++    public static boolean partialCountAllowed(int total,int normals,int available,
++            boolean shortExpected,boolean longExpected,int brackets) {
++        return !shortExpected && !longExpected && brackets==0 && total==normals &&
++                normals>=2 && normals<=24 && available>=2 && available<normals;
++    }
++    public static boolean retrySlot(int completedAttempt) { return completedAttempt>=1 && completedAttempt<3; }
++
+     /** A recipe is relative to the HAL reference that existed when it was measured.
+      * Once B owns a manual shutter-first sensor pair, use the current physical
+      * exposure as the reference, retaining any deliberately negative highlight EV.
+diff --git a/app/version.properties b/app/version.properties
+index dafd87382aa0ee86b93f03895bedcc72a0b60627..45e333a6cb91acec27265ee65440b99b07b75da7 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726996
+-VERSION_BUILD=26996
++VERSION_NAME=0.9726997
++VERSION_BUILD=26997
