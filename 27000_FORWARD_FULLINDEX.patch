@@ -1,0 +1,824 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CPinnedDonorProEngine.kt b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CPinnedDonorProEngine.kt
+index 08762e7c19a09b2a0c9db0c26b5607c715740712..22bf06298506b93230fd5e49252753f295d7c849 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CPinnedDonorProEngine.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/Iris26975CPinnedDonorProEngine.kt
+@@ -250,6 +250,7 @@ internal object Iris26975CPinnedDonorProEngine : Iris26975COriginalDonorEngine.E
+                         statsBounds = Rect(shutterCrop),
+                         rawNoiseProfileId = noiseSelection.id,
+                         maxHdrRatio = RawSceneExposureMath.FAST_MOMENTS_MAX_HDR_RATIO,
++                        useLensSensitivity = photo1291,
+                     )
+                 },
+             )
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesMgcRawChromaReconstructionShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesMgcRawChromaReconstructionShaders.kt
+index ec1375e92bfa671bf9db03dd5d42b7c7c6f91dd1..93dfb21750a875872cf3ab460791a2b56086ceb8 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesMgcRawChromaReconstructionShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/GlesMgcRawChromaReconstructionShaders.kt
+@@ -108,6 +108,102 @@ internal object GlesMgcRawChromaReconstructionShaders {
+         }
+     """.trimIndent()
+ 
++    val sabreQuads = """
++        #version 310 es
++        precision highp float;
++        precision highp int;
++        uniform highp sampler2D uAccumulated;
++        uniform ivec2 uRawSize;
++        uniform ivec2 uRedSite;
++        uniform vec3 uSaturationThreshold;
++        layout(location = 0) out vec4 oQuadRgb;
++
++        vec3 rgbAt(ivec2 p) {
++            return texelFetch(uAccumulated, min(p, uRawSize - 1), 0).rgb;
++        }
++
++        void main() {
++            ivec2 p = 2 * ivec2(gl_FragCoord.xy) + uRedSite;
++            vec3 topLeft = rgbAt(p);
++            vec3 topRight = rgbAt(p + ivec2(1, 0));
++            vec3 bottomLeft = rgbAt(p + ivec2(0, 1));
++            vec3 bottomRight = rgbAt(p + 1);
++            vec3 peak = max(max(topLeft, topRight), max(bottomLeft, bottomRight));
++            bool unclipped = all(lessThan(peak, uSaturationThreshold));
++            // Using the same samples for every channel preserves neutral detail at any CFA phase.
++            vec3 mean = 0.25 * (topLeft + topRight + bottomLeft + bottomRight);
++            oQuadRgb = vec4(mean, unclipped ? 1.0 : 0.0);
++        }
++    """.trimIndent()
++
++    val sabreHorizontal = """
++        #version 310 es
++        precision highp float;
++        precision highp int;
++        uniform highp sampler2D uQuadRgb;
++        uniform ivec2 uRawSize;
++        layout(location = 0) out vec4 oAll;
++        layout(location = 1) out vec4 oValid;
++        layout(location = 2) out vec4 oSupport;
++
++        ${footprint.prependIndent("        ").trimStart()}
++
++        void main() {
++            ivec2 q = ivec2(gl_FragCoord.xy);
++            vec4 allSum = vec4(0.0);
++            vec4 validSum = vec4(0.0);
++            vec4 validWeight = vec4(0.0);
++            for (int k = 0; k < 7; ++k) {
++                int x = mirrorQuad(q.x + k - 3, uRawSize.x / 2);
++                vec4 quad = texelFetch(uQuadRgb, ivec2(x, q.y), 0);
++                vec4 weights = vec4(0.5 * (PHASE_WEIGHT[k].x + PHASE_WEIGHT[k].y));
++                vec4 signal = quad.rggb;
++                bool unclipped = quad.a > 0.5;
++                allSum += weights * signal;
++                if (unclipped) {
++                    validSum += weights * signal;
++                    validWeight += weights;
++                }
++            }
++            oAll = allSum;
++            oValid = validSum;
++            oSupport = validWeight;
++        }
++    """.trimIndent()
++
++    val sabreVertical = """
++        #version 310 es
++        precision highp float;
++        precision highp int;
++        uniform highp sampler2D uHorizontalAll;
++        uniform highp sampler2D uHorizontalValid;
++        uniform highp sampler2D uHorizontalSupport;
++        uniform ivec2 uQuadSize;
++        layout(location = 0) out vec4 oColor;
++
++        ${footprint.prependIndent("        ").trimStart()}
++
++        void main() {
++            ivec2 q = ivec2(gl_FragCoord.xy);
++            vec4 allSum = vec4(0.0);
++            vec4 validSum = vec4(0.0);
++            vec4 support = vec4(0.0);
++            for (int k = 0; k < 7; ++k) {
++                ivec2 p = ivec2(q.x, mirrorQuad(q.y + k - 3, uQuadSize.y));
++                vec4 weights = vec4(0.5 * (PHASE_WEIGHT[k].x + PHASE_WEIGHT[k].y));
++                allSum += weights * texelFetch(uHorizontalAll, p, 0);
++                validSum += weights * texelFetch(uHorizontalValid, p, 0);
++                support += weights * texelFetch(uHorizontalSupport, p, 0);
++            }
++            // When the unclipped neighbourhood is sparse, its colour estimate lacks
++            // support. Transition continuously to the estimate using the whole footprint.
++            vec4 validAmount = clamp((support - 0.25) / 0.4, 0.0, 1.0);
++            vec4 phase = mix(allSum, validSum / max(support, 1.0e-6), validAmount);
++            phase = max(phase, 0.0);
++            oColor = vec4(phase.r, 0.5 * (phase.g + phase.b), phase.a, 0.0);
++        }
++    """.trimIndent()
++
+     val classify = """
+         #version 310 es
+         precision highp float;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/Iris26998GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/Iris26998GlesMgcRawSpatialStacker.kt
+index b2af79aa9f02a0e7b731b54bc09949e171bc8431..0004def7dfb4004d5ef67efd5ec9907637ed2659 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/Iris26998GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/processor/Iris26998GlesMgcRawSpatialStacker.kt
+@@ -431,6 +431,9 @@ internal class Iris26998GlesMgcRawSpatialStacker(
+     private var sabreResolveGreenBalanceProgram = 0
+     private var sabreResolveGreenProgram = 0
+     private var sabreResolveOutputProgram = 0
++    private var sabreChromaQuadsProgram = 0
++    private var sabreChromaHorizontalProgram = 0
++    private var sabreChromaVerticalProgram = 0
+     private var sourceChromaHorizontalProgram = 0
+     private var sourceChromaVerticalProgram = 0
+     private var sourceChromaClassifyProgram = 0
+@@ -2884,11 +2887,7 @@ internal class Iris26998GlesMgcRawSpatialStacker(
+             demosaicQuantizationScale,
+         )
+         draw(sabreResolveConvertProgram, planeWidth, planeHeight, intArrayOf(converted))
+-        val saturationThreshold = IntArray(4) { phase ->
+-            round(demosaicQuantizationScale * calculationWhiteBalance[phase])
+-                .toInt().coerceIn(1, Short.MAX_VALUE.toInt())
+-        }
+-        renderSourceChroma(converted, saturationThreshold, sourceChroma)
++        renderSabreSourceChroma(accumulatedColor, redX, redY, sourceChroma)
+ 
+         // Entry 0x34A67F8: k = fcvtzs(clamp(retention * 65536, 0, 65535)).
+         val retentionFixed16 = (greenImbalanceRetention * 65536f).coerceIn(0f, 65535f).toInt()
+@@ -2941,15 +2940,11 @@ internal class Iris26998GlesMgcRawSpatialStacker(
+                 GlesMgcRawChromaReconstructionShaders.vertical,
+                 "mgc_source_chroma_vertical",
+             )
+-            sourceChromaClassifyProgram = linkProgram(
+-                GlesMgcRawChromaReconstructionShaders.classify,
+-                "mgc_source_chroma_classify",
+-            )
+         }
+         val quadWidth = width / 2
+         val quadHeight = height / 2
+ 
+-        var program = sourceChromaHorizontalProgram
++        val program = sourceChromaHorizontalProgram
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uConverted", 0, converted)
+         uniform2i(program, "uRawSize", width, height)
+@@ -2959,20 +2954,57 @@ internal class Iris26998GlesMgcRawSpatialStacker(
+         )
+         draw(program, quadWidth, quadHeight, intArrayOf(targets[0], targets[1], targets[2]))
+ 
+-        program = sourceChromaVerticalProgram
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uHorizontalAll", 0, targets[0])
+-        bindTexture(program, "uHorizontalValid", 1, targets[1])
+-        bindTexture(program, "uHorizontalSupport", 2, targets[2])
+-        uniform2i(program, "uQuadSize", quadWidth, quadHeight)
+-        draw(program, quadWidth, quadHeight, intArrayOf(targets[3]))
++        finishSourceChroma(sourceChromaVerticalProgram, targets)
++    }
+ 
+-        program = sourceChromaClassifyProgram
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uColor", 0, targets[3])
+-        uniform2i(program, "uQuadSize", quadWidth, quadHeight)
++    private fun renderSabreSourceChroma(accumulated: Int, redX: Int, redY: Int, targets: IntArray) {
++        val quadWidth = width / 2
++        val quadHeight = height / 2
++        val quads = sabreChromaQuadsProgram
++        GLES30.glUseProgram(quads)
++        bindTexture(quads, "uAccumulated", 0, accumulated)
++        uniform2i(quads, "uRawSize", width, height)
++        uniform2i(quads, "uRedSite", redX, redY)
++        // The merge normalizes white to the WB gain and stores its RGB in half-float.
++        uniform3f(
++            quads,
++            "uSaturationThreshold",
++            Half.toFloat(Half.toHalf(calculationWhiteBalance[0])),
++            Half.toFloat(Half.toHalf(calculationWhiteBalance[1])),
++            Half.toFloat(Half.toHalf(calculationWhiteBalance[3])),
++        )
++        draw(quads, quadWidth, quadHeight, intArrayOf(targets[3]))
++
++        val horizontal = sabreChromaHorizontalProgram
++        GLES30.glUseProgram(horizontal)
++        bindTexture(horizontal, "uQuadRgb", 0, targets[3])
++        uniform2i(horizontal, "uRawSize", width, height)
++        draw(horizontal, quadWidth, quadHeight, intArrayOf(targets[0], targets[1], targets[2]))
++        finishSourceChroma(sabreChromaVerticalProgram, targets)
++    }
++
++    private fun finishSourceChroma(vertical: Int, targets: IntArray) {
++        if (sourceChromaClassifyProgram == 0) {
++            sourceChromaClassifyProgram = linkProgram(
++                GlesMgcRawChromaReconstructionShaders.classify,
++                "mgc_source_chroma_classify",
++            )
++        }
++        val quadWidth = width / 2
++        val quadHeight = height / 2
++        GLES30.glUseProgram(vertical)
++        bindTexture(vertical, "uHorizontalAll", 0, targets[0])
++        bindTexture(vertical, "uHorizontalValid", 1, targets[1])
++        bindTexture(vertical, "uHorizontalSupport", 2, targets[2])
++        uniform2i(vertical, "uQuadSize", quadWidth, quadHeight)
++        draw(vertical, quadWidth, quadHeight, intArrayOf(targets[3]))
++
++        val classify = sourceChromaClassifyProgram
++        GLES30.glUseProgram(classify)
++        bindTexture(classify, "uColor", 0, targets[3])
++        uniform2i(classify, "uQuadSize", quadWidth, quadHeight)
+         // The horizontal values have been consumed. Reuse their first target for the guide.
+-        draw(program, quadWidth, quadHeight, intArrayOf(targets[0]))
++        draw(classify, quadWidth, quadHeight, intArrayOf(targets[0]))
+     }
+ 
+     private fun initSabrePrograms() {
+@@ -3052,6 +3084,18 @@ internal class Iris26998GlesMgcRawSpatialStacker(
+             Iris26998GlesMgcSabreResolveShaders.resolveOutput,
+             "mgc_sabre_resolve_output",
+         )
++        sabreChromaQuadsProgram = linkProgram(
++            GlesMgcRawChromaReconstructionShaders.sabreQuads,
++            "mgc_sabre_chroma_quads",
++        )
++        sabreChromaHorizontalProgram = linkProgram(
++            GlesMgcRawChromaReconstructionShaders.sabreHorizontal,
++            "mgc_sabre_chroma_horizontal",
++        )
++        sabreChromaVerticalProgram = linkProgram(
++            GlesMgcRawChromaReconstructionShaders.sabreVertical,
++            "mgc_sabre_chroma_vertical",
++        )
+         if (exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F
+         ) {
+             copyRgb16ToFloatProgram = linkComputeProgram(
+@@ -7915,6 +7959,9 @@ internal class Iris26998GlesMgcRawSpatialStacker(
+         ownsEglContext = false
+         supportsComputePrograms = false
+         supportsComputeReadback = false
++        sabreChromaQuadsProgram = 0
++        sabreChromaHorizontalProgram = 0
++        sabreChromaVerticalProgram = 0
+         sourceChromaHorizontalProgram = 0
+         sourceChromaVerticalProgram = 0
+         sourceChromaClassifyProgram = 0
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawCaptureProfileCoordinator.kt b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawCaptureProfileCoordinator.kt
+index d4f52edee006818ac9c76aaddee39cd7417eea61..f21874f29a9633e5596bc732ba78b422cdbb8d76 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawCaptureProfileCoordinator.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawCaptureProfileCoordinator.kt
+@@ -28,6 +28,7 @@ internal object RawCaptureProfileCoordinator {
+         rawBlackBorderCrop: RawBlackBorderCrop = RawBlackBorderCrop(),
+         rawNoiseProfileId: String = RawNoiseProfileManager.DEFAULT_PROFILE_ID,
+         maxHdrRatio: Float = RawSceneExposureMath.FAST_MOMENTS_MAX_HDR_RATIO,
++        useLensSensitivity: Boolean = false,
+     ): RawDngCaptureProfileResult? {
+         val photonRequest = if (mode.usesPhotonHdr) {
+             RawSceneExposureMatcher.createRequest(
+@@ -36,6 +37,7 @@ internal object RawCaptureProfileCoordinator {
+                 deviceLimits = input.sceneExposureDeviceLimits,
+                 portraitMask = capturePortraitMask,
+                 maxHdrRatio = maxHdrRatio,
++                useLensSensitivity = useLensSensitivity,
+             )
+         } else {
+             null
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawDemosaicProcessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawDemosaicProcessor.kt
+index 29a56600b5cf3fd2682519aa593a49c6512c2ec8..297d0b7f850d9aed836981d2cbd6d8353adaf719 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawDemosaicProcessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawDemosaicProcessor.kt
+@@ -7588,7 +7588,7 @@ class RawDemosaicProcessor {
+             }
+             val greenEvenGain = positiveGain(1, 1f)
+             val greenOddGain = positiveGain(2, greenEvenGain)
+-            val rgbGains = floatArrayOf(
++            val rawRgbGains = floatArrayOf(
+                 positiveGain(0, 1f),
+                 0.5f * (greenEvenGain + greenOddGain),
+                 positiveGain(3, 1f),
+@@ -7599,6 +7599,11 @@ class RawDemosaicProcessor {
+                         CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX &&
+                         matrix.size == 9 && matrix.all(Float::isFinite)
+                 }
++            val rgbGains = if (request.useLensSensitivity && camera2Transform == null) {
++                // bjzhou 6321fd81: avoid premature clipping in DNG matrix fallback.
++                val minGain = minOf(rawRgbGains[0], rawRgbGains[1], rawRgbGains[2])
++                floatArrayOf(rawRgbGains[0] / minGain, rawRgbGains[1] / minGain, rawRgbGains[2] / minGain)
++            } else rawRgbGains
+             val meteringRgbTransform = if (camera2Transform != null) {
+                 camera2Transform
+             } else {
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawSceneExposureEstimator.kt b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawSceneExposureEstimator.kt
+index ebf9e43380a6ec270bafef4da1a3bf33902fe1e3..6bf9ef1ce43b160aa607a81f60d486c3bb951cab 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawSceneExposureEstimator.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawSceneExposureEstimator.kt
+@@ -82,6 +82,7 @@ internal data class RawSceneBrightnessMeasurement(
+     val currentTetMs: Float,
+     val sensorSensitivity: Float,
+     val logSceneBrightness: Float,
++    val useLensSensitivity: Boolean = false,
+ )
+ 
+ internal enum class RawSceneExposureShotMaxSource {
+@@ -237,6 +238,7 @@ internal object RawSceneExposureMath {
+         sensitivityIso: Int,
+         referenceSensitivityIso: Int,
+         aperture: Float,
++        useLensSensitivity: Boolean = false,
+     ): RawSceneBrightnessMeasurement? {
+         val pixelCount = frame.width * frame.height
+         if (frame.width <= 0 || frame.height <= 0 || frame.rgb.size != pixelCount * 3) {
+@@ -275,7 +277,12 @@ internal object RawSceneExposureMath {
+         // Aperture and min ISO only participate in MGC's fallback path, which is not selected by
+         // this tuning. Using that fallback here shifted every table scene coordinate downward by
+         // ln((minIso / f^2) / 14.6), about 1.01 for the reference capture.
+-        val sensorSensitivity = MGC_V25_SENSOR_SENSITIVITY
++        val sensorSensitivity = if (useLensSensitivity) {
++            // bjzhou 6321fd81: physical sensor sensitivity = reference ISO / f-number squared.
++            val apertureSquared = aperture.toDouble() * aperture.toDouble()
++            referenceSensitivityIso.toDouble() / apertureSquared
++        } else MGC_V25_SENSOR_SENSITIVITY
++        if (!sensorSensitivity.isFinite() || sensorSensitivity <= 0.0) return null
+         val normalizedExposure =
+             (sensorSensitivity / SCENE_BRIGHTNESS_CALIBRATION) *
+                 (currentTetMs / MILLIS_PER_SECOND)
+@@ -293,6 +300,7 @@ internal object RawSceneExposureMath {
+             currentTetMs = currentTetMs.toFloat(),
+             sensorSensitivity = sensorSensitivity.toFloat(),
+             logSceneBrightness = logSceneBrightness.toFloat(),
++            useLensSensitivity = useLensSensitivity,
+         )
+     }
+ 
+@@ -664,6 +672,7 @@ internal object RawSceneExposureMath {
+         currentTetMs: Float,
+         shotRange: RawSceneExposureShotRange,
+         ideals: RawSceneExposureIdeals,
++        useLensSensitivity: Boolean = false,
+     ): RawSceneFastMomentsAeStats? {
+         if (!currentTetMs.isFinite() || currentTetMs <= 0f ||
+             !validTetRange(shotRange.minTetMs, shotRange.maxTetMs)
+@@ -688,6 +697,7 @@ internal object RawSceneExposureMath {
+             relativeTetGain = 1f,
+             collectSafeUnderexposure =
+                 anticipatedUnderexposure > 1f && hasSensorClippingContract,
++            useLensSensitivity = useLensSensitivity,
+         ) ?: return null
+         val safeUnderexposure = when {
+             anticipatedUnderexposure <= 1f -> 1f
+@@ -916,6 +926,7 @@ internal object RawSceneExposureMath {
+         metadata: RawMetadata,
+         relativeTetGain: Float,
+         collectSafeUnderexposure: Boolean,
++        useLensSensitivity: Boolean = false,
+     ): RawClippingMeasurement? {
+         val stats = frame.fastMomentsStats
+         val pixelCount = stats.width * stats.height
+@@ -937,7 +948,7 @@ internal object RawSceneExposureMath {
+             )
+             return null
+         }
+-        val whiteBalance = metadata.whiteBalanceGains.takeIf { gains ->
++        val rawWhiteBalance = metadata.whiteBalanceGains.takeIf { gains ->
+             gains.size >= 4 && gains.take(4).all { it.isFinite() && it > 0f }
+         } ?: run {
+             PLog.e(
+@@ -947,6 +958,12 @@ internal object RawSceneExposureMath {
+             return null
+         }
+ 
++        val whiteBalance = if (useLensSensitivity) {
++            val minWhiteBalanceGain = minOf(rawWhiteBalance[0], rawWhiteBalance[1], rawWhiteBalance[2], rawWhiteBalance[3])
++            floatArrayOf(rawWhiteBalance[0] / minWhiteBalanceGain, rawWhiteBalance[1] / minWhiteBalanceGain,
++                rawWhiteBalance[2] / minWhiteBalanceGain, rawWhiteBalance[3] / minWhiteBalanceGain)
++        } else rawWhiteBalance
++
+         var clippedPixels = 0
+         // MGC ComputeSafeUnderexposure initializes this reduction with FLT_MAX. No clipped RAW
+         // samples therefore leaves underexposure unrestricted; ProcessAeStats can lower shot-min
+@@ -1274,6 +1291,7 @@ internal object RawSceneExposureEstimator {
+         deviceLimits: RawSceneExposureDeviceLimits?,
+         faceMask: FloatArray? = null,
+         configuredMaxHdrRatio: Float = RawSceneExposureMath.FAST_MOMENTS_MAX_HDR_RATIO,
++        useLensSensitivity: Boolean = false,
+     ): RawSceneExposureEstimate? {
+         val estimateStartedNs = SystemClock.elapsedRealtimeNanos()
+         val resolvedDeviceLimits = deviceLimits?.takeIf(RawSceneExposureDeviceLimits::isValid)
+@@ -1285,6 +1303,7 @@ internal object RawSceneExposureEstimator {
+             sensitivityIso = metadata.iso,
+             referenceSensitivityIso = referenceSensitivityIso,
+             aperture = metadata.aperture,
++            useLensSensitivity = useLensSensitivity,
+         ) ?: run {
+             PLog.e(
+                 TAG,
+@@ -1386,6 +1405,7 @@ internal object RawSceneExposureEstimator {
+                     currentTetMs = measurement.currentTetMs,
+                     shotRange = shotRange,
+                     ideals = ideals,
++                    useLensSensitivity = useLensSensitivity,
+                 ) ?: run {
+                     PLog.e(TAG, "Fast Moments process-AE-stats returned invalid values")
+                     return@synchronized null
+@@ -1545,7 +1565,7 @@ internal object RawSceneExposureEstimator {
+                         "maxPostCaptureGain=${RawSceneExposureMath.MAX_POST_CAPTURE_GAIN} " +
+                         "tuningMaxOverallGain=${RawSceneExposureMath.MAX_OVERALL_GAIN} " +
+                         "sensorSensitivity=${measurement.sensorSensitivity} " +
+-                        "sensorSensitivitySource=MGC_9_7_V25_TUNING",
++                        "sensorSensitivitySource=${if (measurement.useLensSensitivity) "CAMERA_REF_ISO_OVER_F2" else "MGC_9_7_V25_TUNING"}",
+                 )
+                 RawSceneExposureEstimate(
+                     hdrRatio = fusion.finalHdrRatio,
+@@ -1697,7 +1717,7 @@ internal object RawSceneExposureEstimator {
+         appendLine("iso=${metadata.iso}")
+         appendLine("referenceIso=$referenceSensitivityIso")
+         appendLine("sensorSensitivity=${measurement.sensorSensitivity}")
+-        appendLine("sensorSensitivitySource=MGC_9_7_V25_TUNING")
++        appendLine("sensorSensitivitySource=${if (measurement.useLensSensitivity) "CAMERA_REF_ISO_OVER_F2" else "MGC_9_7_V25_TUNING"}")
+         appendLine("geometricSignal=${measurement.geometricSignal}")
+         appendLine("predictedImageBrightness=${measurement.predictedImageBrightness}")
+         appendLine("currentTetMs=${measurement.currentTetMs}")
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawSceneExposureMatcher.kt b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawSceneExposureMatcher.kt
+index 6ac187c496ce17effee6c5f4523151a6397ae6ca..504d2d22a4814c48a70b8348329e91f23b97ebe5 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawSceneExposureMatcher.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/experimentc/original129/raw/RawSceneExposureMatcher.kt
+@@ -22,37 +22,43 @@ internal object RawSceneExposureMatcher {
+         deviceLimits: RawSceneExposureDeviceLimits? = null,
+         portraitMask: PortraitMaskSnapshot? = null,
+         maxHdrRatio: Float = RawSceneExposureMath.FAST_MOMENTS_MAX_HDR_RATIO,
++        useLensSensitivity: Boolean = false,
+     ): RawSceneExposureRequest {
+         val faceMeteringMask = portraitMask?.let(RawSceneExposureMath::prepareFaceMeteringMask)
+-        return RawSceneExposureRequest { frame ->
+-            val result = RawSceneExposureEstimator.estimate(
+-                context = context.applicationContext,
+-                frame = frame,
+-                metadata = metadata,
+-                deviceLimits = deviceLimits,
+-                faceMask = faceMeteringMask,
+-                configuredMaxHdrRatio = maxHdrRatio,
+-            )
+-            if (result == null) {
+-                PLog.w(TAG, "RAW scene exposure unavailable; MGC AE result omitted")
+-            }
+-            result?.let { estimate ->
+-                RawSceneExposureResult(
+-                    hdrRatio = estimate.hdrRatio,
+-                    finalShortTetMs = estimate.finalShortTetMs,
+-                    finalLongTetMs = estimate.finalLongTetMs,
+-                    finalShortGain = estimate.finalShortGain,
+-                    safeUnderexposure = estimate.safeUnderexposure,
+-                    fractionPixelsClippedAtFinalShortTet =
+-                        estimate.fractionPixelsClippedAtFinalShortTet,
+-                    summaryText = estimate.summaryText,
++        return object : RawSceneExposureRequest {
++            override val useLensSensitivity: Boolean = useLensSensitivity
++            override fun solve(frame: RawSceneLinearFrame): RawSceneExposureResult? {
++                val result = RawSceneExposureEstimator.estimate(
++                    context = context.applicationContext,
++                    frame = frame,
++                    metadata = metadata,
++                    deviceLimits = deviceLimits,
++                    faceMask = faceMeteringMask,
++                    configuredMaxHdrRatio = maxHdrRatio,
++                    useLensSensitivity = useLensSensitivity,
+                 )
++                if (result == null) {
++                    PLog.w(TAG, "RAW scene exposure unavailable; MGC AE result omitted")
++                }
++                return result?.let { estimate ->
++                    RawSceneExposureResult(
++                        hdrRatio = estimate.hdrRatio,
++                        finalShortTetMs = estimate.finalShortTetMs,
++                        finalLongTetMs = estimate.finalLongTetMs,
++                        finalShortGain = estimate.finalShortGain,
++                        safeUnderexposure = estimate.safeUnderexposure,
++                        fractionPixelsClippedAtFinalShortTet =
++                            estimate.fractionPixelsClippedAtFinalShortTet,
++                        summaryText = estimate.summaryText,
++                    )
++                }
+             }
+         }
+     }
+ }
+ 
+ internal fun interface RawSceneExposureRequest {
++    val useLensSensitivity: Boolean get() = false
+     fun solve(frame: RawSceneLinearFrame): RawSceneExposureResult?
+ }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/Iris26998CAdvancedDenoisePreference.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/Iris26998CAdvancedDenoisePreference.java
+index 49d597ff89a78518a57c3eb905c7fd0d6a25ad4d..e85b564f7f407218125d0b6af46617b6418e2f85 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/Iris26998CAdvancedDenoisePreference.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/Iris26998CAdvancedDenoisePreference.java
+@@ -63,15 +63,14 @@ public final class Iris26998CAdvancedDenoisePreference extends ManagedSwitchPref
+                 public void onStartTrackingTouch(SeekBar s){} public void onStopTrackingTouch(SeekBar s){}
+             });
+             value.setOnClickListener(v->{
+-                EditText input=new EditText(c);input.setInputType(InputType.TYPE_CLASS_NUMBER|InputType.TYPE_NUMBER_FLAG_DECIMAL);input.setText(Float.toString(draft[band]));input.setSelectAllOnFocus(true);
+-                AlertDialog precise=new AlertDialog.Builder(c).setTitle("Level "+(band+1)).setMessage("Enter precise value (0–16)\nDefault: 1.00").setView(input).setPositiveButton("SET",null).setNegativeButton("CANCEL",null).setNeutralButton("RESET",null).create();
+-                precise.setOnShowListener(d->{precise.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(w->{try{float f=Float.parseFloat(input.getText().toString());if(!Iris26998CDenoiseSettings.valid(f))throw new NumberFormatException();draft[band]=f;slider.setProgress(Math.round(f*100f));value.setText(format(f));precise.dismiss();}catch(NumberFormatException e){input.setError("Enter a finite number from 0 to 16");}});precise.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(w->input.setText("1.00"));});precise.show();
++                EditText input=new EditText(c);input.setInputType(InputType.TYPE_CLASS_NUMBER|InputType.TYPE_NUMBER_FLAG_DECIMAL);final String initialDisplay=format(draft[band]);final boolean[] resetRequested={false};input.setText(initialDisplay);input.setSelectAllOnFocus(true);
++                AlertDialog precise=new AlertDialog.Builder(c).setTitle("Level "+(band+1)).setMessage("Enter precise value (0.00–16.00)\nDefault: 1.00").setView(input).setPositiveButton("SET",null).setNegativeButton("CANCEL",null).setNeutralButton("RESET",null).create();
++                precise.setOnShowListener(d->{precise.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(w->{try{if(!resetRequested[0]&&input.getText().toString().equals(initialDisplay)){precise.dismiss();return;}float f=Float.parseFloat(input.getText().toString());if(!Iris26998CDenoiseSettings.valid(f))throw new NumberFormatException();draft[band]=f;slider.setProgress(Math.round(f*100f));value.setText(format(f));precise.dismiss();}catch(NumberFormatException e){input.setError("Enter a finite number from 0.00 to 16.00");}});precise.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(w->{resetRequested[0]=true;input.setText("1.00");});});precise.show();
+             });rows.addView(row);
+         }
+         ScrollView scroll=new ScrollView(c);scroll.addView(rows);
+         AlertDialog dialog=new AlertDialog.Builder(c).setTitle(getTitle()).setView(scroll).setPositiveButton("SET",(d,w)->{if(selected.equals(lens)){Iris26998CDenoiseSettings.saveEnabledBands(c,selected,isChroma,draft);refresh();}}).setNegativeButton("CANCEL",(d,w)->refresh()).setNeutralButton("RESET",null).create();
+         dialog.setOnShowListener(d->dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v->{for(int i=0;i<5;i++){draft[i]=1f;sliders[i].setProgress(100);values[i].setText("1.00");}}));dialog.show();
+     }
+-    private static String format(float v){String exact=Float.toString(v);
+-        return exact.indexOf('E')>=0 || exact.indexOf('.')<exact.length()-2 ? exact : String.format(Locale.ROOT,"%.2f",v);}
++    private static String format(float v){return String.format(Locale.ROOT,"%.2f",v);}
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/MotionIqLabSeekBarPreference.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/MotionIqLabSeekBarPreference.java
+index 45a20e743a271e9941e03a930ee741d82e42d1cc..ec67606e8b5fe561f7b6d2b25420a80abeb27c97 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/MotionIqLabSeekBarPreference.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/MotionIqLabSeekBarPreference.java
+@@ -121,7 +121,7 @@ public final class MotionIqLabSeekBarPreference extends Preference
+         int progress = valueToProgress(value);
+         seekBarProgress = progress;
+         updateSeekbar(progress);
+-        updateLabel(formatExact(value));
++        updateLabel(formatDisplay(value));
+ 
+         if (seekBarValue != null) {
+             seekBarValue.setOnClickListener(v -> showPreciseValueDialog());
+@@ -158,6 +158,10 @@ public final class MotionIqLabSeekBarPreference extends Preference
+                 : Integer.toString((int) value);
+     }
+ 
++    private String formatDisplay(float value) {
++        return isFloat ? String.format(Locale.ROOT, "%.2f", value) : Integer.toString((int) value);
++    }
++
+     private String formatExact(float value) {
+         if (!isFloat) return Integer.toString((int) value);
+         return String.format(Locale.ROOT, "%.10f", value)
+@@ -172,7 +176,7 @@ public final class MotionIqLabSeekBarPreference extends Preference
+ 
+         seekBarProgress = progress;
+         updateSeekbar(progress);
+-        updateLabel(exact);
++        updateLabel(formatDisplay(value));
+         persistString(exact);
+     }
+ 
+@@ -211,15 +215,16 @@ public final class MotionIqLabSeekBarPreference extends Preference
+         AlertDialog.Builder builder = new AlertDialog.Builder(context);
+         builder.setTitle(getTitle());
+         builder.setMessage(
+-                "Enter precise value (" + formatExact(mMin) + " - " + formatExact(mMax)
+-                        + ")\nDefault: " + formatExact(defaultValue));
++                "Enter precise value (" + formatDisplay(mMin) + " - " + formatDisplay(mMax)
++                        + ")\nDefault: " + formatDisplay(defaultValue));
+ 
+         final EditText input = new EditText(context);
+         input.setInputType(
+                 InputType.TYPE_CLASS_NUMBER
+                         | (isFloat ? InputType.TYPE_NUMBER_FLAG_DECIMAL : 0)
+                         | InputType.TYPE_NUMBER_FLAG_SIGNED);
+-        input.setText(formatExact(currentValue));
++        final String initialDisplay = formatDisplay(currentValue);
++        input.setText(initialDisplay);
+         input.setSelectAllOnFocus(true);
+ 
+         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+@@ -235,6 +240,7 @@ public final class MotionIqLabSeekBarPreference extends Preference
+ 
+         builder.setPositiveButton("Set", (dialog, which) -> {
+             try {
++                if (input.getText().toString().equals(initialDisplay)) return;
+                 float value = Float.parseFloat(input.getText().toString());
+                 setDirectValue(value);
+             } catch (NumberFormatException e) {
+@@ -244,7 +250,7 @@ public final class MotionIqLabSeekBarPreference extends Preference
+ 
+         builder.setNeutralButton("Reset", (dialog, which) -> {
+             setDirectValue(defaultValue);
+-            PhotonCamera.showToast("Reset to default: " + formatExact(defaultValue));
++            PhotonCamera.showToast("Reset to default: " + formatDisplay(defaultValue));
+         });
+ 
+         builder.setNegativeButton("Cancel", (dialog, which) -> dialog.cancel());
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/TunableSeekBarPreference.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/TunableSeekBarPreference.java
+index 1e6aa7cd88f702d76924aaba5d171ec2e22c8f6d..ac9e0fa83bb73c46699b8dfcdc8bdbfe347b7f64 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/TunableSeekBarPreference.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/TunableSeekBarPreference.java
+@@ -122,17 +122,17 @@ public class TunableSeekBarPreference extends Preference implements SeekBar.OnSe
+         // Get current value as native type for full precision
+         float currentValue = getFloatValue();
+         String currentValueText = isFloat ? 
+-            String.format(Locale.ROOT, "%.10f", currentValue).replaceAll("0+$", "").replaceAll("\\.$", "") :
++            String.format(Locale.ROOT, "%.2f", currentValue) :
+             String.valueOf((int) currentValue);
+         
+         // Create input dialog
+         AlertDialog.Builder builder = new AlertDialog.Builder(context);
+         builder.setTitle(getTitle());
+         builder.setMessage("Enter precise value (" + 
+-            String.format(Locale.ROOT, isFloat ? "%.10f" : "%.0f", mMin).replaceAll("0+$", "").replaceAll("\\.$", "") + " - " +
+-            String.format(Locale.ROOT, isFloat ? "%.10f" : "%.0f", mMax).replaceAll("0+$", "").replaceAll("\\.$", "") + 
++            String.format(Locale.ROOT, isFloat ? "%.2f" : "%.0f", mMin) + " - " +
++            String.format(Locale.ROOT, isFloat ? "%.2f" : "%.0f", mMax) + 
+             ")\nDefault: " + 
+-            String.format(Locale.ROOT, isFloat ? "%.10f" : "%.0f", mDefaultValue).replaceAll("0+$", "").replaceAll("\\.$", ""));
++            String.format(Locale.ROOT, isFloat ? "%.2f" : "%.0f", mDefaultValue));
+         
+         // Create input field
+         final EditText input = new EditText(context);
+@@ -158,15 +158,16 @@ public class TunableSeekBarPreference extends Preference implements SeekBar.OnSe
+         builder.setPositiveButton("Set", (dialog, which) -> {
+             try {
+                 String valueStr = input.getText().toString();
++                if (valueStr.equals(currentValueText)) return;
+                 float value = Float.parseFloat(valueStr);
+                 
+                 // Clamp to min/max
+                 if (value < mMin) {
+                     value = mMin;
+-                    PhotonCamera.showToast("Value clamped to minimum: " + mMin);
++                    PhotonCamera.showToast("Value clamped to minimum: " + formatValue(mMin));
+                 } else if (value > mMax) {
+                     value = mMax;
+-                    PhotonCamera.showToast("Value clamped to maximum: " + mMax);
++                    PhotonCamera.showToast("Value clamped to maximum: " + formatValue(mMax));
+                 }
+                 
+                 // Just set the value - it will be persisted as native type
+@@ -205,7 +206,7 @@ public class TunableSeekBarPreference extends Preference implements SeekBar.OnSe
+             // Restore user interaction flag
+             isUserInteraction = wasUserInteraction;
+             
+-            PhotonCamera.showToast("Reset to default: " + mDefaultValue);
++            PhotonCamera.showToast("Reset to default: " + formatValue(mDefaultValue));
+             Log.d(TAG, "Reset to default (removed persisted value): " + mDefaultValue + " for " + getKey());
+         });
+         
+@@ -350,37 +351,7 @@ public class TunableSeekBarPreference extends Preference implements SeekBar.OnSe
+     }
+ 
+     private String formatValue(float value) {
+-        if (isFloat) {
+-            // For very small values < 0.01, use ellipsis format for display
+-            if (Math.abs(value) < 0.01f && Math.abs(value) > 0.0f) {
+-                String fullValue = String.format(Locale.ROOT, "%.10f", value);
+-                
+-                // Find position of first non-zero digit after decimal
+-                int firstNonZero = -1;
+-                boolean afterDecimal = false;
+-                for (int i = 0; i < fullValue.length(); i++) {
+-                    char c = fullValue.charAt(i);
+-                    if (c == '.') {
+-                        afterDecimal = true;
+-                        continue;
+-                    }
+-                    if (afterDecimal && c != '0') {
+-                        firstNonZero = i;
+-                        break;
+-                    }
+-                }
+-                
+-                if (firstNonZero > 4) {
+-                    // Show as "0.00...digits" format
+-                    String lastDigits = fullValue.substring(firstNonZero, Math.min(firstNonZero + 2, fullValue.length()));
+-                    return "0.00..." + lastDigits;
+-                }
+-            }
+-            
+-            return String.format(Locale.ROOT, "%.2f", value);
+-        } else {
+-            return String.valueOf((int) value);
+-        }
++        return isFloat ? String.format(Locale.ROOT, "%.2f", value) : String.valueOf((int) value);
+     }
+ 
+     public float getFloatValue() {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/UniversalSeekBarPreference.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/UniversalSeekBarPreference.java
+index a6b55eae71596d29bcd3d607ec1aeaa897b4799e..46ab42065e4cfc9e3fdd5445c6e6b0faf2fb1edf 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/UniversalSeekBarPreference.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/custompreferences/UniversalSeekBarPreference.java
+@@ -83,10 +83,8 @@ public class UniversalSeekBarPreference extends Preference implements SeekBar.On
+         final float effectiveMax = getEffectiveMax();
+         seekBar.setMax((int) ((effectiveMax - mMin) * mStepPerUnit));
+         seekBar.setOnSeekBarChangeListener(this);
+-        if (runtimeMaxValue == null) {
+-            set(convertToProgress(fallback_value));
+-        } else {
+-            // Render a mode-limited view without persisting the clamped display value.
++        {
++            // Render the stored value without rewriting it on bind or mode changes.
+             float persisted = Float.parseFloat(getPersistedString(fallback_value));
+             float display = Math.max(mMin, Math.min(effectiveMax, persisted));
+             int progress = (int) ((display - mMin) * mStepPerUnit);
+@@ -125,7 +123,9 @@ public class UniversalSeekBarPreference extends Preference implements SeekBar.On
+         if (defaultValue == null) {
+             defaultValue = fallback_value;
+         }
+-        set(convertToProgress(defaultValue.toString()));
++        // Initialization must not quantize an existing precise value.
++        if (getPersistedString(null) == null) persistString(defaultValue.toString());
++        seekBarProgress = convertToProgress(defaultValue.toString());
+     }
+ 
+     @Override
+@@ -155,7 +155,7 @@ public class UniversalSeekBarPreference extends Preference implements SeekBar.On
+ 
+     private String formatValue(float value) {
+         return isFloat
+-                ? String.format(Locale.ROOT, "%.10f", value).replaceAll("0+$", "").replaceAll("\\.$", "")
++                ? String.format(Locale.ROOT, "%.2f", value)
+                 : String.valueOf((int) value);
+     }
+ 
+@@ -175,20 +175,11 @@ public class UniversalSeekBarPreference extends Preference implements SeekBar.On
+         log("setDirectValue : " + valueToPersist);
+     }
+ 
+-    private boolean isCSharpeningBand() {
+-        String key = getKey();
+-        return key != null && (key.equals("pref_iris_26982_c_mgc_band_0")
+-                || key.equals("pref_iris_26982_c_mgc_band_1")
+-                || key.equals("pref_iris_26982_c_mgc_band_2"));
+-    }
+-
+     private void updateLabel(String valueToPersist) {
+         if (seekBarValue != null) {
+             if (showSeekBarValue) {
+                 seekBarValue.setVisibility(View.VISIBLE);
+-                seekBarValue.setText(isCSharpeningBand()
+-                        ? String.format(Locale.ROOT, "%.2f", Float.parseFloat(valueToPersist))
+-                        : valueToPersist);
++                seekBarValue.setText(formatValue(Float.parseFloat(valueToPersist)));
+             } else
+                 seekBarValue.setVisibility(View.GONE);
+         }
+@@ -231,7 +222,7 @@ public class UniversalSeekBarPreference extends Preference implements SeekBar.On
+         float currentValue = Math.max(mMin, Math.min(effectiveMax,
+                 Float.parseFloat(getPersistedString(fallback_value))));
+         String currentValueText = isFloat ? 
+-            String.format(Locale.ROOT, "%.10f", currentValue).replaceAll("0+$", "").replaceAll("\\.$", "") :
++            String.format(Locale.ROOT, "%.2f", currentValue) :
+             String.valueOf((int) currentValue);
+         
+         // Get default value
+@@ -242,10 +233,10 @@ public class UniversalSeekBarPreference extends Preference implements SeekBar.On
+         AlertDialog.Builder builder = new AlertDialog.Builder(context);
+         builder.setTitle(getTitle());
+         builder.setMessage("Enter precise value (" + 
+-            String.format(Locale.ROOT, isFloat ? "%.10f" : "%.0f", mMin).replaceAll("0+$", "").replaceAll("\\.$", "") + " - " +
+-            String.format(Locale.ROOT, isFloat ? "%.10f" : "%.0f", effectiveMax).replaceAll("0+$", "").replaceAll("\\.$", "") +
++            String.format(Locale.ROOT, isFloat ? "%.2f" : "%.0f", mMin) + " - " +
++            String.format(Locale.ROOT, isFloat ? "%.2f" : "%.0f", effectiveMax) +
+             ")\nDefault: " + 
+-            String.format(Locale.ROOT, isFloat ? "%.10f" : "%.0f", defaultValue).replaceAll("0+$", "").replaceAll("\\.$", ""));
++            String.format(Locale.ROOT, isFloat ? "%.2f" : "%.0f", defaultValue));
+         
+         // Create input field
+         final EditText input = new EditText(context);
+@@ -253,7 +244,7 @@ public class UniversalSeekBarPreference extends Preference implements SeekBar.On
+             (isFloat ? InputType.TYPE_NUMBER_FLAG_DECIMAL : 0) | 
+             InputType.TYPE_NUMBER_FLAG_SIGNED);
+         
+-        input.setText(isCSharpeningBand() ? String.format(Locale.ROOT, "%.2f", currentValue) : currentValueText);
++        input.setText(currentValueText);
+         input.setSelectAllOnFocus(true);
+         
+         // Add padding
+@@ -271,15 +262,16 @@ public class UniversalSeekBarPreference extends Preference implements SeekBar.On
+         builder.setPositiveButton("Set", (dialog, which) -> {
+             try {
+                 String valueStr = input.getText().toString();
++                if (valueStr.equals(currentValueText)) return;
+                 float value = Float.parseFloat(valueStr);
+                 
+                 // Clamp to min/max
+                 if (value < mMin) {
+                     value = mMin;
+-                    PhotonCamera.showToast("Value clamped to minimum: " + mMin);
++                    PhotonCamera.showToast("Value clamped to minimum: " + formatValue(mMin));
+                 } else if (value > effectiveMax) {
+                     value = effectiveMax;
+-                    PhotonCamera.showToast("Value clamped to maximum: " + effectiveMax);
++                    PhotonCamera.showToast("Value clamped to maximum: " + formatValue(effectiveMax));
+                 }
+                 
+                 // Set the exact value directly - bypasses step quantization
+@@ -296,7 +288,7 @@ public class UniversalSeekBarPreference extends Preference implements SeekBar.On
+             // Reset to exact default value - preserves precision
+             setDirectValue(defaultValue);
+             
+-            PhotonCamera.showToast("Reset to default: " + defaultValue);
++            PhotonCamera.showToast("Reset to default: " + formatValue(defaultValue));
+             Log.d(TAG, "Reset to default: " + defaultValue + " for " + getKey());
+         });
+         
+diff --git a/app/version.properties b/app/version.properties
+index 682ec52a557ad648b1ec54e46003ed5c8e9118ec..e355e9995b4e04e01dc2ae561baf93c4bf7ad269 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726999
+-VERSION_BUILD=26999
++VERSION_NAME=0.9727000
++VERSION_BUILD=27000

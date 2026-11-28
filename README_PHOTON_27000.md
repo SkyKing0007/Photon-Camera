@@ -1,0 +1,7 @@
+# Photon 27000 — Photo C OFF Sabre and lens sensitivity
+
+Prepared for Actions only if all local handoff gates pass. Upload Stage 1, Stage 2, Stage 3 in order to experimental-clean-photon-rebuild. Use 27000_COMMIT_MESSAGE.txt. No commits or pushes performed.
+
+Exact successful 26999 Actions run 46048295285, artifact 15223663522, commit 1fbec1b4b0a314b034026ed1a483f7bf6a77ba50. See authority JSON for all hashes. 12 modified files, 0 added, 2697 protected. Native/vendor/assets and capture controls unchanged. Sabre chroma uses co-sited merged RGB, not converted CFA, with matching half-float clipping thresholds. Spatial and Night keep prior routing. Dynamic lens sensitivity always active for Photo C OFF only, legacy constant retained for Night and other requests. WB gain normalization follows donor, scoped to that same request. Existing clipping safeguard logic retained, but derived HDR ratio and brightness can change. No Qualcomm ADRC, tone curve, new AE/capture control, or low-light changes. Two-decimal display across manually editable settings, integer fields remain integer, untouched precise values not rounded by display. Tiny values may display 0.00. No new runtime native or vendor changes. Device IQ and settings layout require testing.
+
+Historical preflight, pinned real GLSL/SPIR-V, real Android Kotlin/Java, two ABI NDK and assembleDebug all remain mandatory in Actions. Local results in 27000_LOCAL_VERIFICATION.log. No new APK produced. No device test performed.
